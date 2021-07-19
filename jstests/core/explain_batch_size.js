@@ -3,17 +3,21 @@
 // batch size is also tested in another smoke test jstest/explain1.js but that test
 // also covers the use of an indexed collection and includes a couple of test cases
 // using limit()
+//
+// @tags: [
+//   requires_fastcount,
+// ]
 
 t = db.explain_batch_size;
 t.drop();
 
-var n = 3
-for (i=0; i<n; i++) {
-    t.save( { x : i } );
+var n = 3;
+for (i = 0; i < n; i++) {
+    t.save({x: i});
 }
 
 var q = {};
 
-assert.eq( n , t.find( q ).count() , "A" );
-assert.eq( n , t.find( q ).itcount() , "B" );
-assert.eq( n , t.find( q ).batchSize(1).explain("executionStats").executionStats.nReturned , "C" );
+assert.eq(n, t.find(q).count(), "A");
+assert.eq(n, t.find(q).itcount(), "B");
+assert.eq(n, t.find(q).batchSize(1).explain("executionStats").executionStats.nReturned, "C");

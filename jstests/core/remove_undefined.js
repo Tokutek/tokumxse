@@ -1,28 +1,35 @@
+// @tags: [requires_non_retryable_writes, requires_fastcount]
 
-t = db.drop_undefined.js
+(function() {
+"use strict";
 
-t.insert( { _id : 1  } )
-t.insert( { _id : 2  } )
-t.insert( { _id : null } )
+const coll = db.remove_undefined;
+coll.drop();
 
-z = { foo : 1 , x : null }
+assert.commandWorked(coll.insert({_id: 1}));
+assert.commandWorked(coll.insert({_id: 2}));
+assert.commandWorked(coll.insert({_id: null}));
 
-t.remove( { x : z.bar } )
-assert.eq( 3 , t.count() , "A1" )
+const obj = {
+    foo: 1,
+    nullElem: null
+};
 
-t.remove( { x : undefined } )
-assert.eq( 3 , t.count() , "A2" )
+coll.remove({x: obj.bar});
+assert.eq(3, coll.count());
 
-assert.throws( function(){ t.remove( { _id : z.bar } ) } , null , "B1" ) 
-assert.throws( function(){ t.remove( { _id : undefined } ) } , null , "B2" )
+coll.remove({x: undefined});
+assert.eq(3, coll.count());
 
+assert.writeErrorWithCode(coll.remove({_id: obj.bar}), ErrorCodes.BadValue);
+assert.writeErrorWithCode(coll.remove({_id: undefined}), ErrorCodes.BadValue);
 
-t.remove( { _id : z.x } )
-assert.eq( 2 , t.count() , "C1" )
+coll.remove({_id: obj.nullElem});
+assert.eq(2, coll.count());
 
-t.insert( { _id : null } )
-assert.eq( 3 , t.count() , "C2" )
+assert.commandWorked(coll.insert({_id: null}));
+assert.eq(3, coll.count());
 
-assert.throws( function(){ t.remove( { _id : undefined } ) } , null, "C3" )
-assert.eq( 3 , t.count() , "C4" )
-
+assert.writeErrorWithCode(coll.remove({_id: undefined}), ErrorCodes.BadValue);
+assert.eq(3, coll.count());
+})();

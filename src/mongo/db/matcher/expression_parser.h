@@ -1,25 +1,24 @@
-// expression_parser.h
-
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,184 +29,114 @@
 
 #pragma once
 
+#include <functional>
+
 #include "mongo/base/status.h"
 #include "mongo/base/status_with.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_leaf.h"
 #include "mongo/db/matcher/expression_tree.h"
-#include "mongo/stdx/functional.h"
+#include "mongo/db/matcher/expression_type.h"
+#include "mongo/db/matcher/expression_with_placeholder.h"
+#include "mongo/db/matcher/extensions_callback.h"
+#include "mongo/db/matcher/extensions_callback_noop.h"
+#include "mongo/db/matcher/schema/expression_internal_schema_allowed_properties.h"
+#include "mongo/db/pipeline/expression.h"
+#include "mongo/db/pipeline/expression_context.h"
 
 namespace mongo {
 
-    class OperationContext;
+class OperationContext;
 
-    typedef StatusWith<MatchExpression*> StatusWithMatchExpression;
+enum class PathAcceptingKeyword {
+    ALL,
+    BITS_ALL_CLEAR,
+    BITS_ALL_SET,
+    BITS_ANY_CLEAR,
+    BITS_ANY_SET,
+    ELEM_MATCH,
+    EQUALITY,
+    EXISTS,
+    GEO_INTERSECTS,
+    GEO_NEAR,
+    GREATER_THAN,
+    GREATER_THAN_OR_EQUAL,
+    INTERNAL_EXPR_EQ,
+    INTERNAL_EXPR_GT,
+    INTERNAL_EXPR_GTE,
+    INTERNAL_EXPR_LT,
+    INTERNAL_EXPR_LTE,
+    INTERNAL_SCHEMA_ALL_ELEM_MATCH_FROM_INDEX,
+    INTERNAL_SCHEMA_BIN_DATA_ENCRYPTED_TYPE,
+    INTERNAL_SCHEMA_BIN_DATA_SUBTYPE,
+    INTERNAL_SCHEMA_EQ,
+    INTERNAL_SCHEMA_FMOD,
+    INTERNAL_SCHEMA_MATCH_ARRAY_INDEX,
+    INTERNAL_SCHEMA_MAX_ITEMS,
+    INTERNAL_SCHEMA_MAX_LENGTH,
+    INTERNAL_SCHEMA_MIN_ITEMS,
+    INTERNAL_SCHEMA_MIN_LENGTH,
+    INTERNAL_SCHEMA_OBJECT_MATCH,
+    INTERNAL_SCHEMA_TYPE,
+    INTERNAL_SCHEMA_UNIQUE_ITEMS,
+    IN_EXPR,
+    LESS_THAN,
+    LESS_THAN_OR_EQUAL,
+    MOD,
+    NOT_EQUAL,
+    NOT_IN,
+    OPTIONS,
+    REGEX,
+    SIZE,
+    TYPE,
+    WITHIN,
+};
 
-    class MatchExpressionParser {
-    public:
-
-        /**
-         * In general, expression parsing and matching should not require context, but the $where
-         * clause is an exception in that it needs to read the sys.js collection.
-         *
-         * The default behaviour is to return an error status that $where context is not present.
-         *
-         * Do not use this class to pass-in generic context as it should only be used for $where.
-         */
-        class WhereCallback {
-        public:
-            virtual StatusWithMatchExpression parseWhere(const BSONElement& where) const;
-
-            virtual ~WhereCallback() { }
-        };
-
-        /**
-         * caller has to maintain ownership obj
-         * the tree has views (BSONElement) into obj
-         */
-        static StatusWithMatchExpression parse(
-                                            const BSONObj& obj,
-                                            const WhereCallback& whereCallback = WhereCallback()) {
-            // The 0 initializes the match expression tree depth.
-            return MatchExpressionParser(&whereCallback)._parse(obj, 0);
-        }
-
-    private:
-
-        explicit MatchExpressionParser(const WhereCallback* whereCallback)
-            : _whereCallback(whereCallback) {
-
-        }
-
-        /**
-         * 5 = false
-         * { a : 5 } = false
-         * { $lt : 5 } = true
-         * { $ref: "s", $id: "x" } = false
-         * { $ref: "s", $id: "x", $db: "mydb" } = false
-         * { $ref : "s" } = false (if incomplete DBRef is allowed)
-         * { $id : "x" } = false (if incomplete DBRef is allowed)
-         * { $db : "mydb" } = false (if incomplete DBRef is allowed)
-         */
-        bool _isExpressionDocument( const BSONElement& e, bool allowIncompleteDBRef );
-
-        /**
-         * { $ref: "s", $id: "x" } = true
-         * { $ref : "s" } = true (if incomplete DBRef is allowed)
-         * { $id : "x" } = true (if incomplete DBRef is allowed)
-         * { $db : "x" } = true (if incomplete DBRef is allowed)
-         */
-        bool _isDBRefDocument( const BSONObj& obj, bool allowIncompleteDBRef );
-
-        /**
-         * Parse 'obj' and return either a MatchExpression or an error.
-         *
-         * 'level' tracks the current depth of the tree across recursive calls to this
-         * function. Used in order to apply special logic at the top-level and to return an
-         * error if the tree exceeds the maximum allowed depth.
-         */
-        StatusWithMatchExpression _parse( const BSONObj& obj, int level );
-
-        /**
-         * parses a field in a sub expression
-         * if the query is { x : { $gt : 5, $lt : 8 } }
-         * e is { $gt : 5, $lt : 8 }
-         */
-        Status _parseSub( const char* name,
-                                 const BSONObj& obj,
-                                 AndMatchExpression* root,
-                                 int level );
-
-        /**
-         * parses a single field in a sub expression
-         * if the query is { x : { $gt : 5, $lt : 8 } }
-         * e is $gt : 5
-         */
-        StatusWithMatchExpression _parseSubField( const BSONObj& context,
-                                                         const AndMatchExpression* andSoFar,
-                                                         const char* name,
-                                                         const BSONElement& e,
-                                                         int level );
-
-        StatusWithMatchExpression _parseComparison( const char* name,
-                                                           ComparisonMatchExpression* cmp,
-                                                           const BSONElement& e );
-
-        StatusWithMatchExpression _parseMOD( const char* name,
-                                               const BSONElement& e );
-
-        StatusWithMatchExpression _parseRegexElement( const char* name,
-                                                        const BSONElement& e );
-
-        StatusWithMatchExpression _parseRegexDocument( const char* name,
-                                                         const BSONObj& doc );
-
-
-        Status _parseArrayFilterEntries( ArrayFilterEntries* entries,
-                                                const BSONObj& theArray );
-
-        // arrays
-
-        StatusWithMatchExpression _parseElemMatch( const char* name,
-                                                          const BSONElement& e,
-                                                          int level );
-
-        StatusWithMatchExpression _parseAll( const char* name,
-                                                    const BSONElement& e,
-                                                    int level );
-
-        // tree
-
-        Status _parseTreeList( const BSONObj& arr, ListOfMatchExpression* out, int level );
-
-        StatusWithMatchExpression _parseNot( const char* name,
-                                                    const BSONElement& e,
-                                                    int level );
-
-        // The maximum allowed depth of a query tree. Just to guard against stack overflow.
-        static const int kMaximumTreeDepth;
-
-        // Performs parsing for the $where clause. We do not own this pointer - it has to live
-        // as long as the parser is active.
-        const WhereCallback* _whereCallback;
+class MatchExpressionParser {
+public:
+    /**
+     * Features allowed in match expression parsing.
+     */
+    enum AllowedFeatures {
+        kText = 1,
+        kGeoNear = 1 << 1,
+        kJavascript = 1 << 2,
+        kExpr = 1 << 3,
+        kJSONSchema = 1 << 4,
+        kEncryptKeywords = 1 << 5,
     };
+    using AllowedFeatureSet = unsigned long long;
+    static constexpr AllowedFeatureSet kBanAllSpecialFeatures = 0;
+    static constexpr AllowedFeatureSet kAllowAllSpecialFeatures =
+        std::numeric_limits<unsigned long long>::max();
+    static constexpr AllowedFeatureSet kDefaultSpecialFeatures =
+        AllowedFeatures::kExpr | AllowedFeatures::kJSONSchema | AllowedFeatures::kEncryptKeywords;
 
     /**
-     * This implementation is used for the server-side code.
+     * Parses PathAcceptingKeyword from 'typeElem'. Returns 'defaultKeyword' if 'typeElem'
+     * doesn't represent a known type.
      */
-    class WhereCallbackReal : public MatchExpressionParser::WhereCallback {
-    public:
-
-        /**
-         * The OperationContext passed here is not owned, but just referenced. It gets assigned to
-         * any $where parsers, which this callback generates. Therefore, the op context must only
-         * be destroyed after these parsers and their clones (shallowClone) have been destroyed.
-         */
-        WhereCallbackReal(OperationContext* txn, StringData dbName);
-
-        virtual StatusWithMatchExpression parseWhere(const BSONElement& where) const;
-
-    private:
-        // Not owned here
-        OperationContext* const _txn;
-        const StringData _dbName;
-    };
+    static boost::optional<PathAcceptingKeyword> parsePathAcceptingKeyword(
+        BSONElement typeElem, boost::optional<PathAcceptingKeyword> defaultKeyword = boost::none);
 
     /**
-     * This is just a pass-through implementation, used by sharding only.
+     * Caller has to maintain ownership of 'obj'.
+     * The tree has views (BSONElement) into 'obj'.
      */
-    class WhereCallbackNoop : public MatchExpressionParser::WhereCallback {
-    public:
-        WhereCallbackNoop();
+    static StatusWithMatchExpression parse(
+        const BSONObj& obj,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const ExtensionsCallback& extensionsCallback = ExtensionsCallbackNoop(),
+        AllowedFeatureSet allowedFeatures = kDefaultSpecialFeatures);
 
-        virtual StatusWithMatchExpression parseWhere(const BSONElement& where) const;
-    };
-
-
-    typedef stdx::function<StatusWithMatchExpression(const char* name, int type, const BSONObj& section)> MatchExpressionParserGeoCallback;
-    extern MatchExpressionParserGeoCallback expressionParserGeoCallback;
-
-    typedef stdx::function<StatusWithMatchExpression(const BSONObj& queryObj)> MatchExpressionParserTextCallback;
-    extern MatchExpressionParserTextCallback expressionParserTextCallback;
-
-}
+    /**
+     * Parse the given MatchExpression and normalize the resulting tree by optimizing and then
+     * sorting it. Throws if the given BSONObj fails to parse.
+     */
+    static std::unique_ptr<MatchExpression> parseAndNormalize(
+        const BSONObj& obj,
+        const boost::intrusive_ptr<ExpressionContext>& expCtx,
+        const ExtensionsCallback& extensionsCallback = ExtensionsCallbackNoop(),
+        AllowedFeatureSet allowedFeatures = kDefaultSpecialFeatures);
+};
+}  // namespace mongo

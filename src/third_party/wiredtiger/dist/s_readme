@@ -1,7 +1,7 @@
 #! /bin/sh
 
 t=__wt.$$
-trap 'rm -f $t; exit 0' 0 1 2 3 13 15
+trap 'rm -f $t' 0 1 2 3 13 15
 f=../README
 
 . ../RELEASE_INFO
@@ -33,22 +33,32 @@ This is version $WIREDTIGER_VERSION of WiredTiger.
 
 WiredTiger release packages and documentation can be found at:
 
-	http://source.wiredtiger.com/
+	https://source.wiredtiger.com/
 
-Information on configuring, building and installing WiredTiger can be
-found at:
+The documentation for this specific release can be found at:
 
-	http://source.wiredtiger.com/$WIREDTIGER_VERSION/install.html
+	https://source.wiredtiger.com/$WIREDTIGER_VERSION/index.html
+
+The WiredTiger source code can be found at:
+
+	https://github.com/wiredtiger/wiredtiger
+
+WiredTiger uses JIRA for issue management:
+
+	https://jira.mongodb.org/browse/WT
+
+Please do not report issues through GitHub.
 
 WiredTiger licensing information can be found at:
 
-	http://source.wiredtiger.com/license.html
+	https://source.wiredtiger.com/license.html
 
-For general questions and discussion, please use the WiredTiger mailing
-list:
+For general questions and discussion, there's a WiredTiger group:
 
-	http://groups.google.com/group/wiredtiger-users
+	https://groups.google.com/group/wiredtiger-users
 END_TEXT
 
 cmp $t $f > /dev/null 2>&1 ||
     (echo "Building $f" && rm -f $f && cp $t $f)
+
+exit 0

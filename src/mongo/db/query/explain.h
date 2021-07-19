@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,171 +29,105 @@
 
 #pragma once
 
-#include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/exec/plan_stats.h"
-#include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/explain_common.h"
+#include "mongo/db/query/explain_options.h"
+#include "mongo/db/query/plan_cache.h"
 #include "mongo/db/query/plan_executor.h"
-#include "mongo/db/query/query_planner_params.h"
-#include "mongo/db/query/query_solution.h"
+#include "mongo/db/query/plan_explainer.h"
 
 namespace mongo {
 
-    class Collection;
-    class OperationContext;
+class Collection;
+class CollectionPtr;
+class OperationContext;
+class PlanExecutorPipeline;
+struct PlanSummaryStats;
+
+/**
+ * Namespace for the collection of static methods used to generate explain information.
+ */
+class Explain {
+public:
+    /**
+     * Get explain BSON for the execution stages contained by 'exec'. Use this function if you
+     * have a PlanExecutor and want to convert it into a human readable explain format. Any
+     * operation which has a query component (e.g. find, update, group) can be explained via
+     * this function.
+     *
+     * The explain information is extracted from 'exec' and added to the out-parameter 'out'.
+     *
+     * The explain information is generated with the level of detail specified by 'verbosity'.
+     *
+     * The 'extraInfo' parameter specifies additional information to include into the output.
+     *
+     * The 'command' parameter represents the command object that is being explained.
+     *
+     * Does not take ownership of its arguments.
+     *
+     * During this call it may be required to execute the plan to collect statistics. If the
+     * PlanExecutor uses 'kLockExternally' lock policy, the caller should hold at least an IS lock
+     * on the collection the that the query runs on, even if 'collection' parameter is nullptr.
+     *
+     * If there is an error during the execution of the query, the error message and code are
+     * added to the "executionStats" section of the explain.
+     */
+    static void explainStages(PlanExecutor* exec,
+                              const CollectionPtr& collection,
+                              ExplainOptions::Verbosity verbosity,
+                              BSONObj extraInfo,
+                              const BSONObj& command,
+                              BSONObjBuilder* out);
+    /**
+     * Adds "queryPlanner" and "executionStats" (if requested in verbosity) fields to 'out'. Unlike
+     * the other overload of explainStages() above, this one does not add the "serverInfo" section.
+     *
+     * - 'exec' is the stage tree for the operation being explained.
+     * - 'collection' is the relevant collection. During this call it may be required to execute the
+     * plan to collect statistics. If the PlanExecutor uses 'kLockExternally' lock policy, the
+     * caller should hold at least an IS lock on the collection the that the query runs on, even if
+     * 'collection' parameter is nullptr.
+     * - 'verbosity' is the verbosity level of the explain.
+     * - 'extraInfo' specifies additional information to include into the output.
+     * - 'executePlanStatus' is the status returned after executing the query (Status::OK if the
+     * query wasn't executed).
+     * - 'winningPlanTrialStats' is the stats of the winning plan during the trial period. May be
+     * nullptr.
+     * - 'command' represents the command object that is being explained.
+     * - 'out' is the builder for the explain output.
+     */
+    static void explainStages(
+        PlanExecutor* exec,
+        const CollectionPtr& collection,
+        ExplainOptions::Verbosity verbosity,
+        Status executePlanStatus,
+        boost::optional<PlanExplainer::PlanStatsDetails> winningPlanTrialStats,
+        BSONObj extraInfo,
+        const BSONObj& command,
+        BSONObjBuilder* out);
 
     /**
-     * A container for the summary statistics that the profiler, slow query log, and
-     * other non-explain debug mechanisms may want to collect.
+     * Gets explain BSON for the document sources contained by 'exec'. Use this function if you have
+     * a PlanExecutor for a pipeline and want to turn it into a human readable explain format.
+     *
+     * The explain information is generated with the level of detail specified by 'verbosity'.
+     *
+     * If 'verbosity' >= 'kExecStats' the 'executePipeline' flag is used to indicate whether the
+     * pipeline needs to be executed first, before the stats is collected. Otherwise, it is assumed
+     * that the plan was already executed until EOF and the stats are ready for collection.
+     *
+     * The 'command' parameter represents the command object that is being explained.
      */
-    struct PlanSummaryStats {
-
-        PlanSummaryStats() : nReturned(0),
-                             totalKeysExamined(0),
-                             totalDocsExamined(0),
-                             executionTimeMillis(0),
-                             isIdhack(false),
-                             hasSortStage(false) { }
-
-        // The number of results returned by the plan.
-        size_t nReturned;
-
-        // The total number of index keys examined by the plan.
-        size_t totalKeysExamined;
-
-        // The total number of documents examined by the plan.
-        size_t totalDocsExamined;
-
-        // The number of milliseconds spent inside the root stage's work() method.
-        long long executionTimeMillis;
-
-        // Did this plan use the fast path for key-value retrievals on the _id index?
-        bool isIdhack;
-
-        // Did this plan use an in-memory sort stage?
-        bool hasSortStage;
-    };
+    static void explainPipeline(PlanExecutor* exec,
+                                bool executePipeline,
+                                ExplainOptions::Verbosity verbosity,
+                                const BSONObj& command,
+                                BSONObjBuilder* out);
 
     /**
-     * Namespace for the collection of static methods used to generate explain information.
+     * Serializes a PlanCacheEntry to the provided BSON object builder. The output format is
+     * intended to be human readable, and useful for debugging query performance problems related to
+     * the plan cache.
      */
-    class Explain {
-    public:
-        /**
-         * Get explain BSON for the execution stages contained by 'exec'. Use this function if you
-         * have a PlanExecutor and want to convert it into a human readable explain format. Any
-         * operation which has a query component (e.g. find, update, group) can be explained via
-         * this function.
-         *
-         * The explain information is extracted from 'exec' and added to the out-parameter 'out'.
-         *
-         * The explain information is generated with the level of detail specified by 'verbosity'.
-         *
-         * Does not take ownership of its arguments.
-         *
-         * If there is an error during the execution of the query, the error message and code are
-         * added to the "executionStats" section of the explain.
-         */
-        static void explainStages(PlanExecutor* exec,
-                                  ExplainCommon::Verbosity verbosity,
-                                  BSONObjBuilder* out);
+    static void planCacheEntryToBSON(const PlanCacheEntry& entry, BSONObjBuilder* out);
+};
 
-        /**
-         * Converts the stats tree 'stats' into a corresponding BSON object containing
-         * explain information.
-         *
-         * Generates the BSON stats at a verbosity specified by 'verbosity'. Defaults
-         * to execution stats verbosity.
-         */
-        static BSONObj statsToBSON(const PlanStageStats& stats,
-                                   ExplainCommon::Verbosity verbosity = ExplainCommon::EXEC_STATS);
-
-        /**
-         * This version of stats tree to BSON conversion returns the result through the
-         * out-parameter 'bob' rather than returning a BSONObj.
-         *
-         * Generates the BSON stats at a verbosity specified by 'verbosity'. Defaults
-         * to execution stats verbosity.
-         */
-        static void statsToBSON(const PlanStageStats& stats,
-                                BSONObjBuilder* bob,
-                                ExplainCommon::Verbosity verbosity = ExplainCommon::EXEC_STATS);
-
-        /**
-         * Returns a short plan summary std::string describing the leaves of the query plan.
-         */
-        static std::string getPlanSummary(PlanExecutor* exec);
-        static std::string getPlanSummary(PlanStage* root);
-
-        /**
-         * Fills out 'statsOut' with summary stats using the execution tree contained
-         * in 'exec'.
-         *
-         * The summary stats are consumed by debug mechanisms such as the profiler and
-         * the slow query log.
-         *
-         * This is a lightweight alternative for explainStages(...) above which is useful
-         * when operations want to request debug information without doing all the work
-         * to generate a full explain.
-         *
-         * Does not take ownership of its arguments.
-         */
-        static void getSummaryStats(PlanExecutor* exec, PlanSummaryStats* statsOut);
-
-    private:
-        /**
-         * Private helper that does the heavy-lifting for the public statsToBSON(...) functions
-         * declared above.
-         *
-         * Not used except as a helper to the public statsToBSON(...) functions.
-         */
-        static void statsToBSON(const PlanStageStats& stats,
-                                ExplainCommon::Verbosity verbosity,
-                                BSONObjBuilder* bob,
-                                BSONObjBuilder* topLevelBob);
-
-        /**
-         * Adds the 'queryPlanner' explain section to the BSON object being built
-         * by 'out'.
-         *
-         * This is a helper for generating explain BSON. It is used by explainStages(...).
-         *
-         * @param exec -- the stage tree for the operation being explained.
-         * @param winnerStats -- the stats tree for the winning plan.
-         * @param rejectedStats -- an array of stats trees, one per rejected plan
-         */
-        static void generatePlannerInfo(PlanExecutor* exec,
-                                        PlanStageStats* winnerStats,
-                                        const std::vector<PlanStageStats*>& rejectedStats,
-                                        BSONObjBuilder* out);
-
-        /**
-         * Generates the execution stats section for the stats tree 'stats',
-         * adding the resulting BSON to 'out'.
-         *
-         * The 'totalTimeMillis' value passed here will be added to the top level of
-         * the execution stats section, but will not affect the reporting of timing for
-         * individual stages. If 'totalTimeMillis' is not specified, then the default
-         * value of -1 indicates that we should only use the approximate timing information
-         * collected by the stages.
-         *
-         * Stats are generated at the verbosity specified by 'verbosity'.
-         *
-         * This is a helper for generating explain BSON. It is used by explainStages(...).
-         */
-        static void generateExecStats(PlanStageStats* stats,
-                                      ExplainCommon::Verbosity verbosity,
-                                      BSONObjBuilder* out,
-                                      long long totalTimeMillis = -1);
-
-        /**
-         * Adds the 'serverInfo' explain section to the BSON object being build
-         * by 'out'.
-         *
-         * This is a helper for generating explain BSON. It is used by explainStages(...).
-         */
-        static void generateServerInfo(BSONObjBuilder* out);
-
-    };
-
-} // namespace
+}  // namespace mongo

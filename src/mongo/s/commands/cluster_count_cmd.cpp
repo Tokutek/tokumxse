@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,20 +31,247 @@
 
 #include <vector>
 
+#include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/cluster_explain.h"
-#include "mongo/s/commands/cluster_commands_common.h"
-#include "mongo/s/strategy.h"
+#include "mongo/db/query/count_command_as_aggregation_command.h"
+#include "mongo/db/query/count_command_gen.h"
+#include "mongo/db/query/view_response_formatter.h"
+#include "mongo/db/views/resolved_view.h"
+#include "mongo/rpc/get_status_from_command_result.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/commands/cluster_explain.h"
+#include "mongo/s/commands/strategy.h"
+#include "mongo/s/grid.h"
+#include "mongo/s/query/cluster_aggregate.h"
 #include "mongo/util/timer.h"
 
 namespace mongo {
-
-    using std::string;
-    using std::vector;
-
 namespace {
 
-    long long applySkipLimit(long long num, const BSONObj& cmd) {
+class ClusterCountCmd : public ErrmsgCommandDeprecated {
+public:
+    ClusterCountCmd() : ErrmsgCommandDeprecated("count") {}
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool adminOnly() const override {
+        return false;
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    ReadConcernSupportResult supportsReadConcern(const BSONObj& cmdObj,
+                                                 repl::ReadConcernLevel level) const override {
+        static const Status kSnapshotNotSupported{ErrorCodes::InvalidOptions,
+                                                  "read concern snapshot not supported"};
+        return {{level == repl::ReadConcernLevel::kSnapshotReadConcern, kSnapshotNotSupported},
+                Status::OK()};
+    }
+
+    void addRequiredPrivileges(const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               std::vector<Privilege>* out) const override {
+        ActionSet actions;
+        actions.addAction(ActionType::find);
+        out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
+    }
+
+    bool errmsgRun(OperationContext* opCtx,
+                   const std::string& dbname,
+                   const BSONObj& cmdObj,
+                   std::string& errmsg,
+                   BSONObjBuilder& result) override {
+        CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
+                nss.isValid());
+
+        std::vector<AsyncRequestsSender::Response> shardResponses;
+        try {
+            auto countRequest = CountCommandRequest::parse(IDLParserErrorContext("count"), cmdObj);
+
+            // We only need to factor in the skip value when sending to the shards if we
+            // have a value for limit, otherwise, we apply it only once we have collected all
+            // counts.
+            if (countRequest.getLimit() && countRequest.getSkip()) {
+                const auto limit = countRequest.getLimit().get();
+                if (limit != 0) {
+                    countRequest.setLimit(limit + countRequest.getSkip().get());
+                }
+            }
+            countRequest.setSkip(boost::none);
+            const auto routingInfo = uassertStatusOK(
+                Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+            const auto collation = countRequest.getCollation().get_value_or(BSONObj());
+            shardResponses = scatterGatherVersionedTargetByRoutingTable(
+                opCtx,
+                nss.db(),
+                nss,
+                routingInfo,
+                applyReadWriteConcern(
+                    opCtx,
+                    this,
+                    countRequest.toBSON(
+                        CommandHelpers::filterCommandRequestForPassthrough(cmdObj))),
+                ReadPreferenceSetting::get(opCtx),
+                Shard::RetryPolicy::kIdempotent,
+                countRequest.getQuery(),
+                collation);
+        } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
+            // Rewrite the count command as an aggregation.
+            auto countRequest = CountCommandRequest::parse(IDLParserErrorContext("count"), cmdObj);
+            auto aggCmdOnView =
+                uassertStatusOK(countCommandAsAggregationCommand(countRequest, nss));
+            auto aggCmdOnViewObj = OpMsgRequest::fromDBAndBody(nss.db(), aggCmdOnView).body;
+            auto aggRequestOnView = aggregation_request_helper::parseFromBSON(
+                nss,
+                aggCmdOnViewObj,
+                boost::none,
+                APIParameters::get(opCtx).getAPIStrict().value_or(false));
+
+            auto resolvedAggRequest = ex->asExpandedViewAggregation(aggRequestOnView);
+            auto resolvedAggCmd =
+                aggregation_request_helper::serializeToCommandObj(resolvedAggRequest);
+
+            BSONObj aggResult = CommandHelpers::runCommandDirectly(
+                opCtx, OpMsgRequest::fromDBAndBody(dbname, std::move(resolvedAggCmd)));
+
+            result.resetToEmpty();
+            ViewResponseFormatter formatter(aggResult);
+            auto formatStatus = formatter.appendAsCountResponse(&result);
+            uassertStatusOK(formatStatus);
+
+            return true;
+        } catch (const ExceptionFor<ErrorCodes::NamespaceNotFound>&) {
+            // If there's no collection with this name, the count aggregation behavior below
+            // will produce a total count of 0.
+            shardResponses = {};
+        }
+
+        long long total = 0;
+        BSONObjBuilder shardSubTotal(result.subobjStart("shards"));
+
+        for (const auto& response : shardResponses) {
+            auto status = response.swResponse.getStatus();
+            if (status.isOK()) {
+                status = getStatusFromCommandResult(response.swResponse.getValue().data);
+                if (status.isOK()) {
+                    long long shardCount = response.swResponse.getValue().data["n"].numberLong();
+                    shardSubTotal.appendNumber(response.shardId.toString(), shardCount);
+                    total += shardCount;
+                    continue;
+                }
+            }
+
+            shardSubTotal.doneFast();
+            // Add error context so that you can see on which shard failed as well as details
+            // about that error.
+            uassertStatusOK(status.withContext(str::stream() << "failed on: " << response.shardId));
+        }
+
+        shardSubTotal.doneFast();
+        total = applySkipLimit(total, cmdObj);
+        result.appendNumber("n", total);
+        return true;
+    }
+
+    Status explain(OperationContext* opCtx,
+                   const OpMsgRequest& request,
+                   ExplainOptions::Verbosity verbosity,
+                   rpc::ReplyBuilderInterface* result) const override {
+        std::string dbname = request.getDatabase().toString();
+        const BSONObj& cmdObj = request.body;
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Invalid namespace specified '" << nss.ns() << "'",
+                nss.isValid());
+
+        // Extract the targeting query.
+        BSONObj targetingQuery;
+        if (Object == cmdObj["query"].type()) {
+            targetingQuery = cmdObj["query"].Obj();
+        }
+
+        // Extract the targeting collation.
+        BSONObj targetingCollation;
+        BSONElement targetingCollationElement;
+        auto status = bsonExtractTypedField(
+            cmdObj, "collation", BSONType::Object, &targetingCollationElement);
+        if (status.isOK()) {
+            targetingCollation = targetingCollationElement.Obj();
+        } else if (status != ErrorCodes::NoSuchKey) {
+            return status;
+        }
+
+        const auto explainCmd = ClusterExplain::wrapAsExplain(cmdObj, verbosity);
+
+        // We will time how long it takes to run the commands on the shards
+        Timer timer;
+
+        std::vector<AsyncRequestsSender::Response> shardResponses;
+        try {
+            const auto routingInfo = uassertStatusOK(
+                Grid::get(opCtx)->catalogCache()->getCollectionRoutingInfo(opCtx, nss));
+            shardResponses =
+                scatterGatherVersionedTargetByRoutingTable(opCtx,
+                                                           nss.db(),
+                                                           nss,
+                                                           routingInfo,
+                                                           explainCmd,
+                                                           ReadPreferenceSetting::get(opCtx),
+                                                           Shard::RetryPolicy::kIdempotent,
+                                                           targetingQuery,
+                                                           targetingCollation);
+        } catch (const ExceptionFor<ErrorCodes::CommandOnShardedViewNotSupportedOnMongod>& ex) {
+            CountCommandRequest countRequest(NamespaceStringOrUUID(NamespaceString{}));
+            try {
+                countRequest = CountCommandRequest::parse(IDLParserErrorContext("count"), cmdObj);
+            } catch (...) {
+                return exceptionToStatus();
+            }
+
+            auto aggCmdOnView = countCommandAsAggregationCommand(countRequest, nss);
+            if (!aggCmdOnView.isOK()) {
+                return aggCmdOnView.getStatus();
+            }
+
+            auto aggCmdOnViewObj =
+                OpMsgRequest::fromDBAndBody(nss.db(), aggCmdOnView.getValue()).body;
+            auto aggRequestOnView = aggregation_request_helper::parseFromBSON(
+                nss,
+                aggCmdOnViewObj,
+                verbosity,
+                APIParameters::get(opCtx).getAPIStrict().value_or(false));
+
+            auto bodyBuilder = result->getBodyBuilder();
+            // An empty PrivilegeVector is acceptable because these privileges are only checked on
+            // getMore and explain will not open a cursor.
+            return ClusterAggregate::retryOnViewError(opCtx,
+                                                      aggRequestOnView,
+                                                      *ex.extraInfo<ResolvedView>(),
+                                                      nss,
+                                                      PrivilegeVector(),
+                                                      &bodyBuilder);
+        }
+
+        long long millisElapsed = timer.millis();
+
+        const char* mongosStageName =
+            ClusterExplain::getStageNameForReadOp(shardResponses.size(), cmdObj);
+
+        auto bodyBuilder = result->getBodyBuilder();
+        return ClusterExplain::buildExplainResult(
+            opCtx, shardResponses, mongosStageName, millisElapsed, cmdObj, &bodyBuilder);
+    }
+
+private:
+    static long long applySkipLimit(long long num, const BSONObj& cmd) {
         BSONElement s = cmd["skip"];
         BSONElement l = cmd["limit"];
 
@@ -56,7 +284,7 @@ namespace {
 
         if (l.isNumber()) {
             long long limit = l.numberLong();
-            if (limit < 0){
+            if (limit < 0) {
                 limit = -limit;
             }
 
@@ -69,180 +297,7 @@ namespace {
         return num;
     }
 
+} clusterCountCmd;
 
-    class ClusterCountCmd : public Command {
-    public:
-        ClusterCountCmd() : Command("count", false) { }
-
-        virtual bool slaveOk() const {
-            return true;
-        }
-
-        virtual bool adminOnly() const {
-            return false;
-        }
-
-        virtual bool isWriteCommandForConfigServer() const {
-            return false;
-        }
-
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-
-            ActionSet actions;
-            actions.addAction(ActionType::find);
-            out->push_back(Privilege(parseResourcePattern(dbname, cmdObj), actions));
-        }
-
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
-
-            long long skip = 0;
-
-            if (cmdObj["skip"].isNumber()) {
-                skip = cmdObj["skip"].numberLong();
-                if (skip < 0) {
-                    errmsg = "skip value is negative in count query";
-                    return false;
-                }
-            }
-            else if (cmdObj["skip"].ok()) {
-                errmsg = "skip value is not a valid number";
-                return false;
-            }
-
-            const string collection = cmdObj.firstElement().valuestrsafe();
-            const string fullns = dbname + "." + collection;
-
-            BSONObjBuilder countCmdBuilder;
-            countCmdBuilder.append("count", collection);
-
-            BSONObj filter;
-            if (cmdObj["query"].isABSONObj()) {
-                countCmdBuilder.append("query", cmdObj["query"].Obj());
-                filter = cmdObj["query"].Obj();
-            }
-
-            if (cmdObj["limit"].isNumber()) {
-                long long limit = cmdObj["limit"].numberLong();
-
-                // We only need to factor in the skip value when sending to the shards if we
-                // have a value for limit, otherwise, we apply it only once we have collected all
-                // counts.
-                if (limit != 0 && cmdObj["skip"].isNumber()) {
-                    if (limit > 0)
-                        limit += skip;
-                    else
-                        limit -= skip;
-                }
-
-                countCmdBuilder.append("limit", limit);
-            }
-
-            if (cmdObj.hasField("hint")) {
-                countCmdBuilder.append(cmdObj["hint"]);
-            }
-
-            if (cmdObj.hasField("$queryOptions")) {
-                countCmdBuilder.append(cmdObj["$queryOptions"]);
-            }
-
-            if (cmdObj.hasField(LiteParsedQuery::cmdOptionMaxTimeMS)) {
-                countCmdBuilder.append(cmdObj[LiteParsedQuery::cmdOptionMaxTimeMS]);
-            }
-
-            vector<Strategy::CommandResult> countResult;
-            STRATEGY->commandOp(dbname,
-                                countCmdBuilder.done(),
-                                options,
-                                fullns,
-                                filter,
-                                &countResult);
-
-            long long total = 0;
-            BSONObjBuilder shardSubTotal(result.subobjStart("shards"));
-
-            for (vector<Strategy::CommandResult>::const_iterator iter = countResult.begin();
-                 iter != countResult.end();
-                 ++iter) {
-
-                const string& shardName = iter->shardTarget.getName();
-
-                if (iter->result["ok"].trueValue()) {
-                    long long shardCount = iter->result["n"].numberLong();
-
-                    shardSubTotal.appendNumber(shardName, shardCount);
-                    total += shardCount;
-                }
-                else {
-                    shardSubTotal.doneFast();
-                    errmsg = "failed on : " + shardName;
-                    result.append("cause", iter->result);
-
-                    // Add "code" to the top-level response, if the failure of the sharded command
-                    // can be accounted to a single error
-                    int code = getUniqueCodeFromCommandResults(countResult);
-                    if (code != 0) {
-                        result.append("code", code);
-                    }
-
-                    return false;
-                }
-            }
-
-            shardSubTotal.doneFast();
-            total = applySkipLimit(total, cmdObj);
-            result.appendNumber("n", total);
-
-            return true;
-        }
-
-        virtual Status explain(OperationContext* txn,
-                               const std::string& dbname,
-                               const BSONObj& cmdObj,
-                               ExplainCommon::Verbosity verbosity,
-                               BSONObjBuilder* out) const {
-
-            const string fullns = parseNs(dbname, cmdObj);
-
-            // Extract the targeting query.
-            BSONObj targetingQuery;
-            if (Object == cmdObj["query"].type()) {
-                targetingQuery = cmdObj["query"].Obj();
-            }
-
-            BSONObjBuilder explainCmdBob;
-            ClusterExplain::wrapAsExplain(cmdObj, verbosity, &explainCmdBob);
-
-            // We will time how long it takes to run the commands on the shards
-            Timer timer;
-
-            vector<Strategy::CommandResult> shardResults;
-            STRATEGY->commandOp(dbname,
-                explainCmdBob.obj(),
-                0,
-                fullns,
-                targetingQuery,
-                &shardResults);
-
-            long long millisElapsed = timer.millis();
-
-            const char* mongosStageName = ClusterExplain::getStageNameForReadOp(shardResults,
-                                                                                cmdObj);
-
-            return ClusterExplain::buildExplainResult(shardResults,
-                                                      mongosStageName,
-                                                      millisElapsed,
-                                                      out);
-        }
-
-    } clusterCountCmd;
-
-} // namespace
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

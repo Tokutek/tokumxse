@@ -1,177 +1,119 @@
-// update_index_data.cpp
-
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#include "mongo/bson/util/builder.h"
-#include "mongo/db/field_ref.h"
 #include "mongo/db/update_index_data.h"
+#include "mongo/bson/util/builder.h"
 
 namespace mongo {
 
-    using std::string;
+UpdateIndexData::UpdateIndexData() : _allPathsIndexed(false) {}
 
-    UpdateIndexData::UpdateIndexData() : _allPathsIndexed( false ) { }
+void UpdateIndexData::addPath(const FieldRef& path) {
+    _canonicalPaths.insert(getCanonicalIndexField(path));
+}
 
-    void UpdateIndexData::addPath( StringData path ) {
-        string s;
-        if ( getCanonicalIndexField( path, &s ) ) {
-            _canonicalPaths.insert( s );
-        }
-        else {
-            _canonicalPaths.insert( path.toString() );
-        }
-    }
+void UpdateIndexData::addPathComponent(StringData pathComponent) {
+    _pathComponents.insert(pathComponent.toString());
+}
 
-    void UpdateIndexData::addPathComponent( StringData pathComponent ) {
-        _pathComponents.insert( pathComponent.toString() );
-    }
+void UpdateIndexData::allPathsIndexed() {
+    _allPathsIndexed = true;
+}
 
-    void UpdateIndexData::allPathsIndexed() {
-        _allPathsIndexed = true;
-    }
+void UpdateIndexData::clear() {
+    _canonicalPaths.clear();
+    _pathComponents.clear();
+    _allPathsIndexed = false;
+}
 
-    void UpdateIndexData::clear() {
-        _canonicalPaths.clear();
-        _pathComponents.clear();
-        _allPathsIndexed = false;
-    }
-
-    bool UpdateIndexData::mightBeIndexed( StringData path ) const {
-        if ( _allPathsIndexed ) {
-            return true;
-        }
-
-        StringData use = path;
-        string x;
-        if ( getCanonicalIndexField( path, &x ) )
-            use = StringData( x );
-
-        for ( std::set<string>::const_iterator i = _canonicalPaths.begin();
-              i != _canonicalPaths.end();
-              ++i ) {
-
-            StringData idx( *i );
-
-            if ( _startsWith( use, idx ) )
-                return true;
-
-            if ( _startsWith( idx, use ) )
-                return true;
-        }
-
-        FieldRef pathFieldRef( path );
-        for ( std::set<string>::const_iterator i = _pathComponents.begin();
-              i != _pathComponents.end();
-              ++i ) {
-            const string& pathComponent = *i;
-            for ( size_t partIdx = 0; partIdx < pathFieldRef.numParts(); ++partIdx ) {
-                if ( pathComponent == pathFieldRef.getPart( partIdx ) ) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    bool UpdateIndexData::_startsWith( StringData a, StringData b ) const {
-        if ( !a.startsWith( b ) )
-            return false;
-
-        // make sure there is a dot or EOL right after
-
-        if ( a.size() == b.size() )
-            return true;
-
-        return a[b.size()] == '.';
-    }
-
-    bool getCanonicalIndexField( StringData fullName, string* out ) {
-        // check if fieldName contains ".$" or ".###" substrings (#=digit) and skip them
-        // however do not skip the first field even if it meets these criteria
-
-        if ( fullName.find( '.' ) == string::npos )
-            return false;
-
-        bool modified = false;
-
-        StringBuilder buf;
-        for ( size_t i=0; i<fullName.size(); i++ ) {
-
-            char c = fullName[i];
-
-            if ( c != '.' ) {
-                buf << c;
-                continue;
-            }
-
-            if ( i + 1 == fullName.size() ) {
-                // ends with '.'
-                buf << c;
-                continue;
-            }
-
-            // check for ".$", skip if present
-            if ( fullName[i+1] == '$' ) {
-                // only do this if its not something like $a
-                if ( i + 2 >= fullName.size() || fullName[i+2] == '.' ) {
-                    i++;
-                    modified = true;
-                    continue;
-                }
-            }
-
-            // check for ".###" for any number of digits (no letters)
-            if ( isdigit( fullName[i+1] ) ) {
-                size_t j = i;
-                // skip digits
-                while ( j+1 < fullName.size() && isdigit( fullName[j+1] ) )
-                    j++;
-
-                if ( j+1 == fullName.size() || fullName[j+1] == '.' ) {
-                    // only digits found, skip forward
-                    i = j;
-                    modified = true;
-                    continue;
-                }
-            }
-
-            buf << c;
-        }
-
-        if ( !modified )
-            return false;
-
-        *out = buf.str();
+bool UpdateIndexData::mightBeIndexed(const FieldRef& path) const {
+    if (_allPathsIndexed) {
         return true;
     }
 
+    FieldRef canonicalPath = getCanonicalIndexField(path);
 
+    for (const auto& idx : _canonicalPaths) {
+        if (_startsWith(canonicalPath, idx) || _startsWith(idx, canonicalPath))
+            return true;
+    }
+
+    for (const auto& pathComponent : _pathComponents) {
+        for (size_t partIdx = 0; partIdx < path.numParts(); ++partIdx) {
+            if (pathComponent == path.getPart(partIdx)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
 }
 
+bool UpdateIndexData::_startsWith(const FieldRef& a, const FieldRef& b) const {
+    return (a == b) || (b.isPrefixOf(a));
+}
+
+FieldRef UpdateIndexData::getCanonicalIndexField(const FieldRef& path) {
+    if (path.numParts() <= 1)
+        return path;
+
+    // The first part of the path must always be a valid field name, since it's not possible to
+    // store a top-level array or '$' field name in a document.
+    FieldRef buf(path.getPart(0));
+    for (size_t i = 1; i < path.numParts(); ++i) {
+        auto pathComponent = path.getPart(i);
+
+        if (pathComponent == "$"_sd) {
+            continue;
+        }
+
+        if (FieldRef::isNumericPathComponentLenient(pathComponent)) {
+            // Peek ahead to see if the next component is also all digits. This implies that the
+            // update is attempting to create a numeric field name which would violate the
+            // "ambiguous field name in array" constraint for multi-key indexes. Break early in this
+            // case and conservatively return that this path affects the prefix of the consecutive
+            // numerical path components. For instance, an input such as 'a.0.1.b.c' would return
+            // the canonical index path of 'a'.
+            if ((i + 1) < path.numParts() &&
+                FieldRef::isNumericPathComponentLenient(path.getPart(i + 1))) {
+                break;
+            }
+            continue;
+        }
+
+        buf.appendPart(pathComponent);
+    }
+
+    return buf;
+}
+
+bool UpdateIndexData::isComponentPartOfCanonicalizedIndexPath(StringData pathComponent) {
+    return pathComponent != "$"_sd && !FieldRef::isNumericPathComponentLenient(pathComponent);
+}
+}  // namespace mongo

@@ -1,0 +1,11 @@
+
+module mongod 1.0;
+
+require {
+	type var_run_t;
+	type mongod_t;
+	class file { write open };
+}
+
+#============= mongod_t ==============
+allow mongod_t var_run_t:file { write open };

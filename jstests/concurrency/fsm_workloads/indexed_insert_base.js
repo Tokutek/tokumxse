@@ -8,7 +8,6 @@
  * value is the thread's id.
  */
 var $config = (function() {
-
     function makeSortSpecFromIndexSpec(ixSpec) {
         var sort = {};
 
@@ -18,7 +17,7 @@ var $config = (function() {
             }
 
             var order = ixSpec[field];
-            if (order !== 1 && order !== -1) { // e.g. '2d' or '2dsphere'
+            if (order !== 1 && order !== -1) {  // e.g. '2d' or '2dsphere'
                 order = 1;
             }
 
@@ -36,23 +35,25 @@ var $config = (function() {
 
         insert: function insert(db, collName) {
             var res = db[collName].insert(this.getDoc());
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(1, res.nInserted, tojson(res));
             this.nInserted += this.docsPerInsert;
         },
 
         find: function find(db, collName) {
             // collection scan
-            var count = db[collName].find(this.getDoc()).sort({ $natural: 1 }).itcount();
+            var count = db[collName].find(this.getQuery()).sort({$natural: 1}).itcount();
             assertWhenOwnColl.eq(count, this.nInserted);
 
             // Use hint() to force an index scan, but only when an appropriate index exists.
             // We can only use hint() when the index exists and we know that the collection
             // is not being potentially modified by other workloads.
             var ownColl = false;
-            assertWhenOwnColl(function() { ownColl = true; });
+            assertWhenOwnColl(function() {
+                ownColl = true;
+            });
             if (this.indexExists && ownColl) {
-                count = db[collName].find(this.getDoc()).hint(this.getIndexSpec()).itcount();
+                count = db[collName].find(this.getQuery()).hint(this.getIndexSpec()).itcount();
                 assertWhenOwnColl.eq(count, this.nInserted);
             }
 
@@ -61,21 +62,21 @@ var $config = (function() {
                 // For single and compound-key indexes, the index specification is a
                 // valid sort spec; however, for geospatial and text indexes it is not
                 var sort = makeSortSpecFromIndexSpec(this.getIndexSpec());
-                count = db[collName].find(this.getDoc()).sort(sort).itcount();
+                count = db[collName].find(this.getQuery()).sort(sort).itcount();
                 assertWhenOwnColl.eq(count, this.nInserted);
             }
         }
     };
 
-    var transitions = {
-        init: { insert: 1 },
-        insert: { find: 1 },
-        find: { insert: 1 }
-    };
+    var transitions = {init: {insert: 1}, insert: {find: 1}, find: {insert: 1}};
 
     function setup(db, collName, cluster) {
-        var res = db[collName].ensureIndex(this.getIndexSpec());
-        assertAlways.commandWorked(res);
+        const spec = {name: this.getIndexName(), key: this.getIndexSpec()};
+        assertAlways.commandWorked(db.runCommand({
+            createIndexes: collName,
+            indexes: [spec],
+            writeConcern: {w: 'majority'},
+        }));
         this.indexExists = true;
     }
 
@@ -85,6 +86,9 @@ var $config = (function() {
         states: states,
         transitions: transitions,
         data: {
+            getIndexName: function getIndexName() {
+                return this.indexedField + '_1';
+            },
             getIndexSpec: function getIndexSpec() {
                 var ixSpec = {};
                 ixSpec[this.indexedField] = 1;
@@ -95,10 +99,13 @@ var $config = (function() {
                 doc[this.indexedField] = this.indexedValue;
                 return doc;
             },
+            getQuery: function getQuery() {
+                return this.getDoc();
+            },
             indexedField: 'x',
+            shardKey: {x: 1},
             docsPerInsert: 1
         },
         setup: setup
     };
-
 })();

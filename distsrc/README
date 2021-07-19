@@ -4,18 +4,17 @@ Welcome to MongoDB!
 
 COMPONENTS
 
-  bin/mongod - The database process.
-  bin/mongos - Sharding controller.
-  bin/mongo  - The database shell (uses interactive javascript).
+  mongod - The database server.
+  mongos - Sharding router.
+  mongo  - The database shell (uses interactive javascript).
 
 UTILITIES
 
-  bin/mongodump         - MongoDB dump tool - for backups, snapshots, etc..
-  bin/mongorestore      - MongoDB restore a dump
-  bin/mongoexport       - Export a single collection to test (JSON, CSV)
-  bin/mongoimport       - Import from JSON or CSV
-  bin/mongofiles        - Utility for putting and getting files from MongoDB GridFS
-  bin/mongostat         - Show performance statistics
+  install_compass   - Installs MongoDB Compass for your platform.
+
+BUILDING
+
+  See docs/building.md.
 
 RUNNING
 
@@ -25,28 +24,64 @@ RUNNING
 
   To run a single server database:
 
-    $ mkdir /data/db
+    $ sudo mkdir -p /data/db
     $ ./mongod
     $
     $ # The mongo javascript shell connects to localhost and test database by default:
-    $ ./mongo 
+    $ ./mongo
     > help
+
+INSTALLING COMPASS
+
+  You can install compass using the install_compass script packaged with MongoDB:
+
+    $ ./install_compass
+
+  This will download the appropriate MongoDB Compass package for your platform
+  and install it.
 
 DRIVERS
 
-  Client drivers for most programming languages are available at mongodb.org.  Use the 
-  shell ("mongo") for administrative tasks.
+  Client drivers for most programming languages are available at
+  https://docs.mongodb.com/manual/applications/drivers/. Use the shell
+  ("mongo") for administrative tasks.
+
+BUG REPORTS
+
+  See https://github.com/mongodb/mongo/wiki/Submit-Bug-Reports.
+
+PACKAGING
+
+  Packages are created dynamically by the package.py script located in the
+  buildscripts directory. This will generate RPM and Debian packages.
 
 DOCUMENTATION
 
-  http://www.mongodb.org/
+  https://docs.mongodb.com/manual/
 
-MAIL LISTS AND IRC
+CLOUD HOSTED MONGODB
 
-  http://dochub.mongodb.org/core/community
+  https://www.mongodb.com/cloud/atlas
 
-32 BIT BUILD NOTES
+FORUMS
 
-  MongoDB uses memory mapped files.  If built as a 32 bit executable, you will
-  not be able to work with large (multi-gigabyte) databases.  However, 32 bit
-  builds work fine with small development databases.
+  https://community.mongodb.com
+
+    A forum for technical questions about using MongoDB.
+
+  https://community.mongodb.com/c/server-dev
+
+    A forum for technical questions about building and developing MongoDB.
+
+LEARN MONGODB
+
+  https://university.mongodb.com/
+
+LICENSE
+
+  MongoDB is free and open-source. Versions released prior to October 16,
+  2018 are published under the AGPL. All versions released after October
+  16, 2018, including patch fixes for prior versions, are published under
+  the Server Side Public License (SSPL) v1. See individual files for
+  details.
+

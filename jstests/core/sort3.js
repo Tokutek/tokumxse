@@ -1,16 +1,13 @@
+(function() {
+"use strict";
 
-t = db.sort3;
-t.drop();
+const coll = db.sort3;
+coll.drop();
 
-t.save( { a : 1 } );
-t.save( { a : 5 } );
-t.save( { a : 3 } );
+assert.commandWorked(coll.insert({a: 1}));
+assert.commandWorked(coll.insert({a: 5}));
+assert.commandWorked(coll.insert({a: 3}));
 
-assert.eq( "1,5,3" , t.find().toArray().map( function(z){ return z.a; } ) );
-
-assert.eq( "1,3,5" , t.find().sort( { a : 1 } ).toArray().map( function(z){ return z.a; } ) );
-assert.eq( "5,3,1" , t.find().sort( { a : -1 } ).toArray().map( function(z){ return z.a; } ) );
-
-assert.eq( "1,3,5" , t.find( { query : {} , orderby : { a : 1 } } ).toArray().map( function(z){ return z.a; } ) );
-assert.eq( "5,3,1" , t.find( { query : {} , orderby : { a : -1 } } ).toArray().map( function(z){ return z.a; } ) );
-
+assert.eq([1, 3, 5], coll.find().sort({a: 1}).toArray().map(doc => doc.a));
+assert.eq([5, 3, 1], coll.find().sort({a: -1}).toArray().map(doc => doc.a));
+}());

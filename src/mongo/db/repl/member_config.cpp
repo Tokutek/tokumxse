@@ -1,23 +1,24 @@
 /**
- *    Copyright 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,285 +36,191 @@
 #include "mongo/bson/util/bson_check.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/repl/repl_server_parameters_gen.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 namespace repl {
 
-    const std::string MemberConfig::kIdFieldName = "_id";
-    const std::string MemberConfig::kVotesFieldName = "votes";
-    const std::string MemberConfig::kPriorityFieldName = "priority";
-    const std::string MemberConfig::kHostFieldName = "host";
-    const std::string MemberConfig::kHiddenFieldName = "hidden";
-    const std::string MemberConfig::kSlaveDelayFieldName = "slaveDelay";
-    const std::string MemberConfig::kArbiterOnlyFieldName = "arbiterOnly";
-    const std::string MemberConfig::kBuildIndexesFieldName = "buildIndexes";
-    const std::string MemberConfig::kTagsFieldName = "tags";
-    const std::string MemberConfig::kInternalVoterTagName = "$voter";
-    const std::string MemberConfig::kInternalElectableTagName = "$electable";
-    const std::string MemberConfig::kInternalAllTagName = "$all";
+const std::string MemberConfig::kInternalVoterTagName = "$voter";
+const std::string MemberConfig::kInternalElectableTagName = "$electable";
+const std::string MemberConfig::kInternalAllTagName = "$all";
+const std::string MemberConfig::kConfigAllTagName = "$configAll";
+const std::string MemberConfig::kConfigVoterTagName = "$configVoter";
 
-namespace {
-    const std::string kLegalMemberConfigFieldNames[] = {
-        MemberConfig::kIdFieldName,
-        MemberConfig::kVotesFieldName,
-        MemberConfig::kPriorityFieldName,
-        MemberConfig::kHostFieldName,
-        MemberConfig::kHiddenFieldName,
-        MemberConfig::kSlaveDelayFieldName,
-        MemberConfig::kArbiterOnlyFieldName,
-        MemberConfig::kBuildIndexesFieldName,
-        MemberConfig::kTagsFieldName
-    };
+/* static */
+MemberConfig MemberConfig::parseFromBSON(const BSONObj& mcfg) {
+    try {
+        return MemberConfig(mcfg);
+    } catch (const DBException& e) {
+        uassertStatusOK(e.toStatus().withContext(str::stream() << "member: " << mcfg));
+        MONGO_UNREACHABLE;
+    }
+}
 
-    const int kVotesFieldDefault = 1;
-    const double kPriorityFieldDefault = 1.0;
-    const Seconds kSlaveDelayFieldDefault(0);
-    const bool kArbiterOnlyFieldDefault = false;
-    const bool kHiddenFieldDefault = false;
-    const bool kBuildIndexesFieldDefault = true;
+MemberConfig::MemberConfig(const BSONObj& mcfg) {
+    parseProtected(IDLParserErrorContext("MemberConfig"), mcfg);
 
-    const Seconds kMaxSlaveDelay(3600 * 24 * 366);
-
-}  // namespace
-
-    Status MemberConfig::initialize(const BSONObj& mcfg, ReplicaSetTagConfig* tagConfig) {
-        Status status = bsonCheckOnlyHasFields(
-            "replica set member configuration", mcfg, kLegalMemberConfigFieldNames);
-        if (!status.isOK())
-            return status;
-
-        //
-        // Parse _id field.
-        //
-        BSONElement idElement = mcfg[kIdFieldName];
-        if (idElement.eoo()) {
-            return Status(ErrorCodes::NoSuchKey, str::stream() << kIdFieldName <<
-                          " field is missing");
-        }
-        if (!idElement.isNumber()) {
-            return Status(ErrorCodes::TypeMismatch, str::stream() << kIdFieldName <<
-                          " field has non-numeric type " << typeName(idElement.type()));
-        }
-        _id = idElement.numberInt();
-
-        //
-        // Parse h field.
-        //
-        std::string hostAndPortString;
-        status = bsonExtractStringField(mcfg, kHostFieldName, &hostAndPortString);
-        if (!status.isOK())
-            return status;
-        boost::trim(hostAndPortString);
-        status = _host.initialize(hostAndPortString);
-        if (!status.isOK())
-            return status;
-        if (!_host.hasPort()) {
-            // make port explicit even if default.
-            _host = HostAndPort(_host.host(), _host.port());
-        }
-
-        //
-        // Parse votes field.
-        //
-        BSONElement votesElement = mcfg[kVotesFieldName];
-        if (votesElement.eoo()) {
-            _votes = kVotesFieldDefault;
-        }
-        else if (votesElement.isNumber()) {
-            _votes = votesElement.numberInt();
-        }
-        else {
-            return Status(ErrorCodes::TypeMismatch, str::stream() << kVotesFieldName <<
-                          " field value has non-numeric type " <<
-                          typeName(votesElement.type()));
-        }
-
-        //
-        // Parse priority field.
-        //
-        BSONElement priorityElement = mcfg[kPriorityFieldName];
-        if (priorityElement.eoo()) {
-            _priority = kPriorityFieldDefault;
-        }
-        else if (priorityElement.isNumber()) {
-            _priority = priorityElement.numberDouble();
-        }
-        else {
-            return Status(ErrorCodes::TypeMismatch, str::stream() << kPriorityFieldName <<
-                          " field has non-numeric type " << typeName(priorityElement.type()));
-        }
-
-        //
-        // Parse arbiterOnly field.
-        //
-        status = bsonExtractBooleanFieldWithDefault(mcfg,
-                                                    kArbiterOnlyFieldName,
-                                                    kArbiterOnlyFieldDefault,
-                                                    &_arbiterOnly);
-        if (!status.isOK())
-            return status;
-
-        //
-        // Parse slaveDelay field.
-        //
-        BSONElement slaveDelayElement = mcfg[kSlaveDelayFieldName];
-        if (slaveDelayElement.eoo()) {
-            _slaveDelay = kSlaveDelayFieldDefault;
-        }
-        else if (slaveDelayElement.isNumber()) {
-            _slaveDelay = Seconds(slaveDelayElement.numberInt());
-        }
-        else {
-            return Status(ErrorCodes::TypeMismatch, str::stream() << kSlaveDelayFieldName <<
-                          " field value has non-numeric type " <<
-                          typeName(slaveDelayElement.type()));
-        }
-
-        //
-        // Parse hidden field.
-        //
-        status = bsonExtractBooleanFieldWithDefault(mcfg,
-                                                    kHiddenFieldName,
-                                                    kHiddenFieldDefault,
-                                                    &_hidden);
-        if (!status.isOK())
-            return status;
-
-        //
-        // Parse buildIndexes field.
-        //
-        status = bsonExtractBooleanFieldWithDefault(mcfg,
-                                                    kBuildIndexesFieldName,
-                                                    kBuildIndexesFieldDefault,
-                                                    &_buildIndexes);
-        if (!status.isOK())
-            return status;
-
-        //
-        // Parse "tags" field.
-        //
-        _tags.clear();
-        BSONElement tagsElement;
-        status = bsonExtractTypedField(mcfg, kTagsFieldName, Object, &tagsElement);
-        if (status.isOK()) {
-            for (BSONObj::iterator tagIter(tagsElement.Obj()); tagIter.more();) {
-                const BSONElement& tag = tagIter.next();
-                if (tag.type() != String) {
-                    return Status(ErrorCodes::TypeMismatch, str::stream() << "tags." <<
-                                  tag.fieldName() << " field has non-string value of type " <<
-                                  typeName(tag.type()));
-                }
-                _tags.push_back(tagConfig->makeTag(tag.fieldNameStringData(),
-                                                   tag.valueStringData()));
-            }
-        }
-        else if (ErrorCodes::NoSuchKey != status) {
-            return status;
-        }
-
-        //
-        // Add internal tags based on other member properties.
-        //
-        
-        // Add a voter tag if this non-arbiter member votes; use _id for uniquity.
-        const std::string id = str::stream() << _id;
-        if (isVoter() && !_arbiterOnly) {
-            _tags.push_back(tagConfig->makeTag(kInternalVoterTagName, id));
-        }
-
-        // Add an electable tag if this member is electable.
-        if (isElectable()) {
-            _tags.push_back(tagConfig->makeTag(kInternalElectableTagName, id));
-        }
-
-        // Add a tag for generic counting of this node.
-        if (!_arbiterOnly) {
-            _tags.push_back(tagConfig->makeTag(kInternalAllTagName, id));
-        }
-
-        return Status::OK();
+    std::string hostAndPortString = getHost().toString();
+    boost::trim(hostAndPortString);
+    HostAndPort host;
+    uassertStatusOK(host.initialize(hostAndPortString));
+    if (!host.hasPort()) {
+        // Make port explicit even if default.
+        host = HostAndPort(host.host(), host.port());
     }
 
-    Status MemberConfig::validate() const {
-        if (_id < 0 || _id > 255) {
-            return Status(ErrorCodes::BadValue, str::stream() << kIdFieldName <<
-                          " field value of " << _id << " is out of range.");
+    _splitHorizon = SplitHorizon(host, getHorizons());
+
+    if (isArbiter()) {
+        if (MemberConfigBase::getPriority() == 1.0) {
+            setPriority(0);
         }
 
-        if (_priority < 0 || _priority > 1000) {
-            return Status(ErrorCodes::BadValue, str::stream() << kPriorityFieldName <<
-                          " field value of " << _priority << " is out of range");
+        if (!isVoter()) {
+            uasserted(ErrorCodes::BadValue, "Arbiter must vote (cannot have 0 votes)");
         }
-        if (_votes != 0 && _votes != 1) {
-            return Status(ErrorCodes::BadValue, str::stream() << kVotesFieldName <<
-                          " field value is " << _votes << " but must be 0 or 1");
+
+        if (isNewlyAdded()) {
+            uasserted(ErrorCodes::BadValue, "Arbiter cannot have newlyAdded field set");
         }
-        if (_arbiterOnly) {
-            if (!_tags.empty()) {
-                return Status(ErrorCodes::BadValue, "Cannot set tags on arbiters.");
-            }
-            if (!isVoter()) {
-                return Status(ErrorCodes::BadValue, "Arbiter must vote (cannot have 0 votes)");
-            }
-        }
-        if (_slaveDelay < Seconds(0) || _slaveDelay > kMaxSlaveDelay) {
-            return Status(ErrorCodes::BadValue, str::stream() << kSlaveDelayFieldName <<
-                          " field value of " << _slaveDelay.total_seconds() <<
-                          " seconds is out of range");
-        }
-        if (_slaveDelay > Seconds(0) && _priority != 0) {
-            return Status(ErrorCodes::BadValue, "slaveDelay requires priority be zero");
-        }
-        if (_hidden && _priority != 0) {
-            return Status(ErrorCodes::BadValue, "priority must be 0 when hidden=true");
-        }
-        if (!_buildIndexes && _priority != 0) {
-            return Status(ErrorCodes::BadValue, "priority must be 0 when buildIndexes=false");
-        }
-        return Status::OK();
     }
 
-    bool MemberConfig::hasTags(const ReplicaSetTagConfig& tagConfig) const {
-        for (std::vector<ReplicaSetTag>::const_iterator tag = _tags.begin();
-                tag != _tags.end();
-                tag++) {
-            std::string tagKey = tagConfig.getTagKey(*tag);
-            if (tagKey[0] == '$') {
-                // Filter out internal tags
-                continue;
-            }
-            return true;
+    // Check for additional electable requirements, when priority is non zero.
+    if (getPriority() != 0) {
+        if (!isVoter()) {
+            uasserted(ErrorCodes::BadValue, "priority must be 0 when non-voting (votes:0)");
         }
-        return false;
+        if (getSecondaryDelay() > Seconds(0)) {
+            uasserted(ErrorCodes::BadValue, "priority must be 0 when slaveDelay is used");
+        }
+        if (isHidden()) {
+            uasserted(ErrorCodes::BadValue, "priority must be 0 when hidden=true");
+        }
+        if (!shouldBuildIndexes()) {
+            uasserted(ErrorCodes::BadValue, "priority must be 0 when buildIndexes=false");
+        }
+    }
+}
+
+MemberConfig::MemberConfig(const BSONObj& mcfg, ReplSetTagConfig* tagConfig) : MemberConfig(mcfg) {
+    addTagInfo(tagConfig);
+}
+
+void MemberConfig::addTagInfo(ReplSetTagConfig* tagConfig) {
+    // When a ReplSetConfig is created from a MutableReplSetConfig, the MemberConfig objects
+    // may have tags from the original configuration, so we need to clear them before adding
+    // the tags from the modified configuration.
+    _tags.clear();
+    //
+    // Parse "tags" field.
+    //
+    if (getTags()) {
+        for (auto&& tag : getTags().get()) {
+            if (tag.type() != String) {
+                uasserted(ErrorCodes::TypeMismatch,
+                          str::stream()
+                              << "tags." << tag.fieldName()
+                              << " field has non-string value of type " << typeName(tag.type()));
+            }
+            _tags.push_back(tagConfig->makeTag(tag.fieldNameStringData(), tag.valueStringData()));
+        }
     }
 
-    BSONObj MemberConfig::toBSON(const ReplicaSetTagConfig& tagConfig) const {
-        BSONObjBuilder configBuilder;
-        configBuilder.append("_id", _id);
-        configBuilder.append("host", _host.toString());
-        configBuilder.append("arbiterOnly", _arbiterOnly);
-        configBuilder.append("buildIndexes", _buildIndexes);
-        configBuilder.append("hidden", _hidden);
-        configBuilder.append("priority", _priority);
+    //
+    // Add internal tags based on other member properties.
+    //
 
-        BSONObjBuilder tags(configBuilder.subobjStart("tags"));
-        for (std::vector<ReplicaSetTag>::const_iterator tag = _tags.begin();
-                tag != _tags.end();
-                tag++) {
-            std::string tagKey = tagConfig.getTagKey(*tag);
-            if (tagKey[0] == '$') {
-                // Filter out internal tags
-                continue;
-            }
-            tags.append(tagKey, tagConfig.getTagValue(*tag));
-        }
-        tags.done();
-
-        configBuilder.append("slaveDelay", _slaveDelay.total_seconds());
-        configBuilder.append("votes", getNumVotes());
-        return configBuilder.obj();
+    // Add a voter tag if this non-arbiter member votes; use _id for uniquity.
+    const std::string id = std::to_string(getId().getData());
+    if (isVoter() && !isArbiter()) {
+        _tags.push_back(tagConfig->makeTag(kInternalVoterTagName, id));
     }
+
+    // Add an electable tag if this member is electable.
+    if (isElectable()) {
+        _tags.push_back(tagConfig->makeTag(kInternalElectableTagName, id));
+    }
+
+    // Add a tag for generic counting of this node.
+    if (!isArbiter()) {
+        _tags.push_back(tagConfig->makeTag(kInternalAllTagName, id));
+    }
+
+    // Add a config voter tag if this node counts towards the config majority for reconfig.
+    // This excludes non-voting members but does include arbiters.
+    if (isVoter()) {
+        _tags.push_back(tagConfig->makeTag(kConfigVoterTagName, id));
+    }
+
+    // Add a tag for every node, including arbiters.
+    _tags.push_back(tagConfig->makeTag(kConfigAllTagName, id));
+
+    if (isArbiter()) {
+        // Arbiters have two internal tags.
+        if (_tags.size() != 2) {
+            uasserted(ErrorCodes::BadValue, "Cannot set tags on arbiters.");
+        }
+    }
+}
+
+bool MemberConfig::hasTags() const {
+    return getTags() && !getTags()->isEmpty();
+}
+
+// Changing these members may change the tags, so invalidate them.  The tags will be rebuilt
+// when addTagInfo is called.
+void MemberConfig::setNewlyAdded(boost::optional<bool> newlyAdded) {
+    _tags.clear();
+    MemberConfigBase::setNewlyAdded(newlyAdded);
+}
+
+void MemberConfig::setArbiterOnly(bool arbiterOnly) {
+    _tags.clear();
+    MemberConfigBase::setArbiterOnly(arbiterOnly);
+}
+
+void MemberConfig::setVotes(int64_t votes) {
+    _tags.clear();
+    MemberConfigBase::setVotes(votes);
+}
+
+void MemberConfig::setPriority(double priority) {
+    _tags.clear();
+    MemberConfigBase::setPriority(priority);
+}
+
+BSONObj MemberConfig::toBSON(bool omitNewlyAddedField) const {
+    BSONObjBuilder configBuilder;
+    configBuilder.append(kIdFieldName, getId().getData());
+    configBuilder.append(kHostFieldName, _host().toString());
+    configBuilder.append(kArbiterOnlyFieldName, getArbiterOnly());
+
+    if (!omitNewlyAddedField && getNewlyAdded()) {
+        // We should never have _newlyAdded if automatic reconfigs aren't enabled.
+        invariant(getNewlyAdded().get());
+        configBuilder.append(kNewlyAddedFieldName, getNewlyAdded().get());
+    }
+
+    configBuilder.append(kBuildIndexesFieldName, getBuildIndexes());
+    configBuilder.append(kHiddenFieldName, getHidden());
+    configBuilder.append(kPriorityFieldName, MemberConfigBase::getPriority());
+
+    // For historical reasons we always emit a tag field; some jstests expect it.
+    configBuilder.append(kTagsFieldName, getTags() ? *getTags() : BSONObj());
+
+    _splitHorizon.toBSON(configBuilder);
+
+    if (getSecondaryDelaySecs()) {
+        configBuilder.append(kSecondaryDelaySecsFieldName, getSecondaryDelaySecs().get());
+    }
+    if (getSlaveDelaySecs()) {
+        configBuilder.append(kSlaveDelaySecsFieldName, getSlaveDelaySecs().get());
+    }
+
+    configBuilder.append(kVotesFieldName, MemberConfigBase::getVotes() ? 1 : 0);
+    return configBuilder.obj();
+}
 
 }  // namespace repl
 }  // namespace mongo

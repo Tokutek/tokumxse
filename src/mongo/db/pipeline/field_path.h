@@ -1,128 +1,165 @@
 /**
- * Copyright (c) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include "mongo/platform/basic.h"
+#include <string>
+#include <vector>
+
+#include "mongo/base/string_data.h"
 #include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-    class FieldPath {
-    public:
+/**
+ * Utility class which represents a field path with nested paths separated by dots.
+ */
+class FieldPath {
+public:
+    /**
+     * Throws a AssertionException if a field name does not pass validation.
+     */
+    static void uassertValidFieldName(StringData fieldName);
 
-        /**
-         * Constructor.
-         *
-         * @param fieldPath the dotted field path std::string or non empty pre-split vector.
-         * The constructed object will have getPathLength() > 0.
-         * Uassert if any component field names do not pass validation.
-         */
-        FieldPath(const std::string& fieldPath);
-        FieldPath(const std::vector<std::string>& fieldPath);
+    /**
+     * Concatenates 'prefix' and 'suffix' using dotted path notation. 'prefix' is allowed to be
+     * empty.
+     */
+    static std::string getFullyQualifiedPath(StringData prefix, StringData suffix);
 
-        /**
-          Get the number of path elements in the field path.
-
-          @returns the number of path elements
-         */
-        size_t getPathLength() const;
-
-        /**
-          Get a particular path element from the path.
-
-          @param i the zero based index of the path element.
-          @returns the path element
-         */
-        const std::string& getFieldName(size_t i) const;
-
-        /**
-          Get the full path.
-
-          @param fieldPrefix whether or not to include the field prefix
-          @returns the complete field path
-         */
-        std::string getPath(bool fieldPrefix) const;
-
-        /**
-          Write the full path.
-
-          @param outStream where to write the path to
-          @param fieldPrefix whether or not to include the field prefix
-        */
-        void writePath(std::ostream &outStream, bool fieldPrefix) const;
-
-        /**
-           Get the prefix string.
-
-           @returns the prefix string
-         */
-        static const char *getPrefix();
-
-        static const char prefix[];
-
-        /**
-         * A FieldPath like this but missing the first element (useful for recursion).
-         * Precondition getPathLength() > 1.
-         */
-        FieldPath tail() const;
-
-    private:
-        /** Uassert if a field name does not pass validation. */
-        static void uassertValidFieldName(const std::string& fieldName);
-
-        /**
-         * Push a new field name to the back of the vector of names comprising the field path.
-         * Uassert if 'fieldName' does not pass validation.
-         */
-        void pushFieldName(const std::string& fieldName);
-
-        std::vector<std::string> vFieldName;
-    };
-}
-
-
-/* ======================= INLINED IMPLEMENTATIONS ========================== */
-
-namespace mongo {
-
-    inline size_t FieldPath::getPathLength() const {
-        return vFieldName.size();
+    /**
+     * Returns the substring of 'path' until the first '.', or the entire string if there is no '.'.
+     */
+    static StringData extractFirstFieldFromDottedPath(StringData path) {
+        return path.substr(0, path.find('.'));
     }
 
-    inline const std::string& FieldPath::getFieldName(size_t i) const {
+    /**
+     * Throws a AssertionException if the string is empty or if any of the field names fail
+     * validation.
+     *
+     * Field names are validated using uassertValidFieldName().
+     */
+    /* implicit */ FieldPath(std::string inputPath);
+    /* implicit */ FieldPath(StringData inputPath) : FieldPath(inputPath.toString()) {}
+    /* implicit */ FieldPath(const char* inputPath) : FieldPath(std::string(inputPath)) {}
+
+    /**
+     * Returns the number of path elements in the field path.
+     */
+    size_t getPathLength() const {
+        return _fieldPathDotPosition.size() - 1;
+    }
+
+    /**
+     * Get the subpath including path elements [0, n].
+     */
+    StringData getSubpath(size_t n) const {
+        invariant(n + 1 < _fieldPathDotPosition.size());
+        return StringData(_fieldPath.c_str(), _fieldPathDotPosition[n + 1]);
+    }
+
+    /**
+     * Return the first path component.
+     */
+    StringData front() const {
+        return getFieldName(0);
+    }
+
+    /**
+     * Return the last path component.
+     */
+    StringData back() const {
+        return getFieldName(getPathLength() - 1);
+    }
+
+    /**
+     * Return the ith field name from this path using zero-based indexes.
+     */
+    StringData getFieldName(size_t i) const {
         dassert(i < getPathLength());
-        return vFieldName[i];
+        const auto begin = _fieldPathDotPosition[i] + 1;
+        const auto end = _fieldPathDotPosition[i + 1];
+        return StringData(&_fieldPath[begin], end - begin);
     }
 
-    inline const char *FieldPath::getPrefix() {
-        return prefix;
+    /**
+     * Returns the full path, not including the prefix 'FieldPath::prefix'.
+     */
+    const std::string& fullPath() const {
+        return _fieldPath;
     }
 
+    /**
+     * Returns the full path, including the prefix 'FieldPath::prefix'.
+     */
+    std::string fullPathWithPrefix() const {
+        return prefix + _fieldPath;
+    }
+    /**
+     * A FieldPath like this but missing the first element (useful for recursion).
+     * Precondition getPathLength() > 1.
+     */
+    FieldPath tail() const {
+        massert(16409, "FieldPath::tail() called on single element path", getPathLength() > 1);
+        return {_fieldPath.substr(_fieldPathDotPosition[1] + 1)};
+    }
+
+    /**
+     * Returns a FieldPath like this, but missing the last element.
+     */
+    FieldPath withoutLastElement() const {
+        return FieldPath(getSubpath(getPathLength() - 2));
+    }
+
+    FieldPath concat(const FieldPath& tail) const;
+
+private:
+    FieldPath(std::string string, std::vector<size_t> dots)
+        : _fieldPath(std::move(string)), _fieldPathDotPosition(std::move(dots)) {}
+
+    static const char prefix = '$';
+
+    // Contains the full field path, with each field delimited by a '.' character.
+    std::string _fieldPath;
+
+    // Contains the position of field delimiter dots in '_fieldPath'. The first element contains
+    // string::npos (which evaluates to -1) and the last contains _fieldPath.size() to facilitate
+    // lookup.
+    std::vector<size_t> _fieldPathDotPosition;
+};
+
+inline bool operator<(const FieldPath& lhs, const FieldPath& rhs) {
+    return lhs.fullPath() < rhs.fullPath();
 }
 
+inline bool operator==(const FieldPath& lhs, const FieldPath& rhs) {
+    return lhs.fullPath() == rhs.fullPath();
+}
+}  // namespace mongo

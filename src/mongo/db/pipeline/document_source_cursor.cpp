@@ -1,220 +1,342 @@
 /**
- * Copyright 2011 (c) 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/document_source.h"
+#include "mongo/db/pipeline/document_source_cursor.h"
 
-#include <boost/shared_ptr.hpp>
-
-#include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/db_raii.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/instance.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/query/collection_query_info.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/db/query/find_constants.h"
-#include "mongo/db/storage_options.h"
-#include "mongo/s/d_state.h"
+#include "mongo/db/query/find_common.h"
+#include "mongo/db/storage/storage_options.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/resharding/resume_token_gen.h"
+#include "mongo/util/fail_point.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
-    using boost::shared_ptr;
-    using std::string;
+MONGO_FAIL_POINT_DEFINE(hangBeforeDocumentSourceCursorLoadBatch);
 
-    DocumentSourceCursor::~DocumentSourceCursor() {
-        dispose();
+using boost::intrusive_ptr;
+using std::shared_ptr;
+using std::string;
+
+const char* DocumentSourceCursor::getSourceName() const {
+    return kStageName.rawData();
+}
+
+bool DocumentSourceCursor::Batch::isEmpty() const {
+    switch (_type) {
+        case CursorType::kRegular:
+            return _batchOfDocs.empty();
+        case CursorType::kEmptyDocuments:
+            return !_count;
     }
+    MONGO_UNREACHABLE;
+}
 
-    const char *DocumentSourceCursor::getSourceName() const {
-        return "$cursor";
-    }
-
-    boost::optional<Document> DocumentSourceCursor::getNext() {
-        pExpCtx->checkForInterrupt();
-
-        if (_currentBatch.empty()) {
-            loadBatch();
-
-            if (_currentBatch.empty()) // exhausted the cursor
-                return boost::none;
+void DocumentSourceCursor::Batch::enqueue(Document&& doc) {
+    switch (_type) {
+        case CursorType::kRegular: {
+            invariant(doc.isOwned());
+            _batchOfDocs.push_back(std::move(doc));
+            _memUsageBytes += _batchOfDocs.back().getApproximateSize();
+            break;
         }
-
-        Document out = _currentBatch.front();
-        _currentBatch.pop_front();
-        return out;
-    }
-
-    void DocumentSourceCursor::dispose() {
-        // Can't call in to PlanExecutor or ClientCursor registries from this function since it
-        // will be called when an agg cursor is killed which would cause a deadlock.
-        _exec.reset();
-        _currentBatch.clear();
-    }
-
-    void DocumentSourceCursor::loadBatch() {
-        if (!_exec) {
-            dispose();
-            return;
+        case CursorType::kEmptyDocuments: {
+            ++_count;
+            break;
         }
+    }
+}
 
-        // We have already validated the sharding version when we constructed the PlanExecutor
-        // so we shouldn't check it again.
-        const NamespaceString nss(_ns);
-        AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
-
-        _exec->restoreState(pExpCtx->opCtx);
-
-        int memUsageBytes = 0;
-        BSONObj obj;
-        PlanExecutor::ExecState state;
-        while ((state = _exec->getNext(&obj, NULL)) == PlanExecutor::ADVANCED) {
-            if (_dependencies) {
-                _currentBatch.push_back(_dependencies->extractFields(obj));
+Document DocumentSourceCursor::Batch::dequeue() {
+    invariant(!isEmpty());
+    switch (_type) {
+        case CursorType::kRegular: {
+            Document out = std::move(_batchOfDocs.front());
+            _batchOfDocs.pop_front();
+            if (_batchOfDocs.empty()) {
+                _memUsageBytes = 0;
             }
-            else {
-                _currentBatch.push_back(Document::fromBsonWithMetaData(obj));
-            }
+            return out;
+        }
+        case CursorType::kEmptyDocuments: {
+            --_count;
+            return Document{};
+        }
+    }
+    MONGO_UNREACHABLE;
+}
 
-            if (_limit) {
-                if (++_docsAddedToBatches == _limit->getLimit()) {
-                    break;
-                }
-                verify(_docsAddedToBatches < _limit->getLimit());
-            }
+void DocumentSourceCursor::Batch::clear() {
+    _batchOfDocs.clear();
+    _count = 0;
+    _memUsageBytes = 0;
+}
 
-            memUsageBytes += _currentBatch.back().getApproximateSize();
+DocumentSource::GetNextResult DocumentSourceCursor::doGetNext() {
+    if (_currentBatch.isEmpty()) {
+        loadBatch();
+    }
 
-            if (memUsageBytes > MaxBytesToReturnToClientAtOnce) {
+    // If we are tracking the oplog timestamp, update our cached latest optime.
+    if (_trackOplogTS && _exec)
+        _updateOplogTimestamp();
+
+    if (_currentBatch.isEmpty())
+        return GetNextResult::makeEOF();
+
+    return _currentBatch.dequeue();
+}
+
+void DocumentSourceCursor::loadBatch() {
+    if (!_exec || _exec->isDisposed()) {
+        // No more documents.
+        return;
+    }
+
+    while (MONGO_unlikely(hangBeforeDocumentSourceCursorLoadBatch.shouldFail())) {
+        LOGV2(20895,
+              "Hanging aggregation due to 'hangBeforeDocumentSourceCursorLoadBatch' failpoint");
+        sleepmillis(10);
+    }
+
+    PlanExecutor::ExecState state;
+    Document resultObj;
+
+    boost::optional<AutoGetCollectionForReadMaybeLockFree> autoColl;
+    tassert(5565800,
+            "Expected PlanExecutor to use an external lock policy",
+            _exec->lockPolicy() == PlanExecutor::LockPolicy::kLockExternally);
+    autoColl.emplace(pExpCtx->opCtx, _exec->nss());
+    uassertStatusOK(repl::ReplicationCoordinator::get(pExpCtx->opCtx)
+                        ->checkCanServeReadsFor(pExpCtx->opCtx, _exec->nss(), true));
+
+    _exec->restoreState(autoColl ? &autoColl->getCollection() : nullptr);
+
+    try {
+        ON_BLOCK_EXIT([this] { recordPlanSummaryStats(); });
+
+        while ((state = _exec->getNextDocument(&resultObj, nullptr)) == PlanExecutor::ADVANCED) {
+            _currentBatch.enqueue(transformDoc(std::move(resultObj)));
+
+            // As long as we're waiting for inserts, we shouldn't do any batching at this level we
+            // need the whole pipeline to see each document to see if we should stop waiting.
+            if (awaitDataState(pExpCtx->opCtx).shouldWaitForInserts ||
+                static_cast<long long>(_currentBatch.memUsageBytes()) >
+                    internalDocumentSourceCursorBatchSizeBytes.load()) {
                 // End this batch and prepare PlanExecutor for yielding.
                 _exec->saveState();
                 return;
             }
         }
 
-        // If we got here, there won't be any more documents, so destroy the executor. Can't use
-        // dispose since we want to keep the _currentBatch.
-        _exec.reset();
+        invariant(state == PlanExecutor::IS_EOF);
 
-        uassert(16028, "collection or index disappeared when cursor yielded",
-                state != PlanExecutor::DEAD);
-
-        uassert(17285, "cursor encountered an error: " + WorkingSetCommon::toStatusString(obj),
-                state != PlanExecutor::FAILURE);
-
-        massert(17286, str::stream() << "Unexpected return from PlanExecutor::getNext: " << state,
-                state == PlanExecutor::IS_EOF || state == PlanExecutor::ADVANCED);
-    }
-
-    void DocumentSourceCursor::setSource(DocumentSource *pSource) {
-        /* this doesn't take a source */
-        verify(false);
-    }
-
-    long long DocumentSourceCursor::getLimit() const {
-        return _limit ? _limit->getLimit() : -1;
-    }
-
-    bool DocumentSourceCursor::coalesce(const intrusive_ptr<DocumentSource>& nextSource) {
-        // Note: Currently we assume the $limit is logically after any $sort or
-        // $match. If we ever pull in $match or $sort using this method, we
-        // will need to keep track of the order of the sub-stages.
-
-        if (!_limit) {
-            _limit = dynamic_cast<DocumentSourceLimit*>(nextSource.get());
-            return _limit.get(); // false if next is not a $limit
-        }
-        else {
-            return _limit->coalesce(nextSource);
-        }
-
-        return false;
-    }
-
-    Value DocumentSourceCursor::serialize(bool explain) const {
-        // we never parse a documentSourceCursor, so we only serialize for explain
-        if (!explain)
-            return Value();
-
-        // Get planner-level explain info from the underlying PlanExecutor.
-        BSONObjBuilder explainBuilder;
-        {
-            const NamespaceString nss(_ns);
-            AutoGetCollectionForRead autoColl(pExpCtx->opCtx, nss);
-
-            massert(17392, "No _exec. Were we disposed before explained?", _exec);
-
-            _exec->restoreState(pExpCtx->opCtx);
-            Explain::explainStages(_exec.get(), ExplainCommon::QUERY_PLANNER, &explainBuilder);
+        // Keep the inner PlanExecutor alive if the cursor is tailable, since more results may
+        // become available in the future, or if we are tracking the latest oplog timestamp, since
+        // we will need to retrieve the last timestamp the executor observed before hitting EOF.
+        if (_trackOplogTS || pExpCtx->isTailableAwaitData()) {
             _exec->saveState();
+            return;
         }
-
-        MutableDocument out;
-        out["query"] = Value(_query);
-
-        if (!_sort.isEmpty())
-            out["sort"] = Value(_sort);
-
-        if (_limit)
-            out["limit"] = Value(_limit->getLimit());
-
-        if (!_projection.isEmpty())
-            out["fields"] = Value(_projection);
-
-        // Add explain results from the query system into the agg explain output.
-        BSONObj explainObj = explainBuilder.obj();
-        invariant(explainObj.hasField("queryPlanner"));
-        out["queryPlanner"] = Value(explainObj["queryPlanner"]);
-
-        return Value(DOC(getSourceName() << out.freezeToValue()));
+    } catch (...) {
+        // Record error details before re-throwing the exception.
+        _execStatus = exceptionToStatus().withContext("Error in $cursor stage");
+        throw;
     }
 
-    DocumentSourceCursor::DocumentSourceCursor(const string& ns,
-                                               const boost::shared_ptr<PlanExecutor>& exec,
-                                               const intrusive_ptr<ExpressionContext> &pCtx)
-        : DocumentSource(pCtx)
-        , _docsAddedToBatches(0)
-        , _ns(ns)
-        , _exec(exec)
-    {}
+    // If we got here, there won't be any more documents and we no longer need our PlanExecutor, so
+    // destroy it.
+    cleanupExecutor();
+}
 
-    intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
-            const string& ns,
-            const boost::shared_ptr<PlanExecutor>& exec,
-            const intrusive_ptr<ExpressionContext> &pExpCtx) {
-        return new DocumentSourceCursor(ns, exec, pExpCtx);
+void DocumentSourceCursor::_updateOplogTimestamp() {
+    // If we are about to return a result, set our oplog timestamp to the optime of that result.
+    if (!_currentBatch.isEmpty()) {
+        const auto& ts = _currentBatch.peekFront().getField(repl::OpTime::kTimestampFieldName);
+        invariant(ts.getType() == BSONType::bsonTimestamp);
+        _latestOplogTimestamp = ts.getTimestamp();
+        return;
     }
 
-    void DocumentSourceCursor::setProjection(
-            const BSONObj& projection,
-            const boost::optional<ParsedDeps>& deps) {
-        _projection = projection;
-        _dependencies = deps;
+    // If we have no more results to return, advance to the latest oplog timestamp.
+    _latestOplogTimestamp = _exec->getLatestOplogTimestamp();
+}
+
+void DocumentSourceCursor::recordPlanSummaryStats() {
+    invariant(_exec);
+    _exec->getPlanExplainer().getSummaryStats(&_stats.planSummaryStats);
+}
+
+Value DocumentSourceCursor::serialize(boost::optional<ExplainOptions::Verbosity> verbosity) const {
+    // We never parse a DocumentSourceCursor, so we only serialize for explain.
+    if (!verbosity)
+        return Value();
+
+    invariant(_exec);
+
+    uassert(50660,
+            "Mismatch between verbosity passed to serialize() and expression context verbosity",
+            verbosity == pExpCtx->explain);
+
+    MutableDocument out;
+
+    BSONObjBuilder explainStatsBuilder;
+
+    {
+        auto opCtx = pExpCtx->opCtx;
+        auto lockMode = getLockModeForQuery(opCtx, _exec->nss());
+        AutoGetDb dbLock(opCtx, _exec->nss().db(), lockMode);
+        Lock::CollectionLock collLock(opCtx, _exec->nss(), lockMode);
+        auto collection = dbLock.getDb()
+            ? CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, _exec->nss())
+            : nullptr;
+
+        Explain::explainStages(_exec.get(),
+                               collection,
+                               verbosity.get(),
+                               _execStatus,
+                               _winningPlanTrialStats,
+                               BSONObj(),
+                               BSONObj(),
+                               &explainStatsBuilder);
+    }
+
+    BSONObj explainStats = explainStatsBuilder.obj();
+    invariant(explainStats["queryPlanner"]);
+    out["queryPlanner"] = Value(explainStats["queryPlanner"]);
+
+    if (verbosity.get() >= ExplainOptions::Verbosity::kExecStats) {
+        invariant(explainStats["executionStats"]);
+        out["executionStats"] = Value(explainStats["executionStats"]);
+    }
+
+    return Value(DOC(getSourceName() << out.freezeToValue()));
+}
+
+void DocumentSourceCursor::detachFromOperationContext() {
+    // Only detach the underlying executor if it hasn't been detached already.
+    if (_exec && _exec->getOpCtx()) {
+        _exec->detachFromOperationContext();
     }
 }
+
+void DocumentSourceCursor::reattachToOperationContext(OperationContext* opCtx) {
+    if (_exec) {
+        _exec->reattachToOperationContext(opCtx);
+    }
+}
+
+void DocumentSourceCursor::doDispose() {
+    _currentBatch.clear();
+    if (!_exec || _exec->isDisposed()) {
+        // We've already properly disposed of our PlanExecutor.
+        return;
+    }
+    cleanupExecutor();
+}
+
+void DocumentSourceCursor::cleanupExecutor() {
+    invariant(_exec);
+    _exec->dispose(pExpCtx->opCtx);
+
+    // Not freeing _exec if we're in explain mode since it will be used in serialize() to gather
+    // execution stats.
+    if (!pExpCtx->explain) {
+        _exec.reset();
+    }
+}
+
+BSONObj DocumentSourceCursor::getPostBatchResumeToken() const {
+    if (_trackOplogTS) {
+        return ResumeTokenOplogTimestamp{getLatestOplogTimestamp()}.toBSON();
+    }
+    return BSONObj{};
+}
+
+DocumentSourceCursor::~DocumentSourceCursor() {
+    if (pExpCtx->explain) {
+        invariant(_exec->isDisposed());  // _exec should have at least been disposed.
+    } else {
+        invariant(!_exec);  // '_exec' should have been cleaned up via dispose() before destruction.
+    }
+}
+
+DocumentSourceCursor::DocumentSourceCursor(
+    const CollectionPtr& collection,
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+    const intrusive_ptr<ExpressionContext>& pCtx,
+    CursorType cursorType,
+    bool trackOplogTimestamp)
+    : DocumentSource(kStageName, pCtx),
+      _currentBatch(cursorType),
+      _exec(std::move(exec)),
+      _trackOplogTS(trackOplogTimestamp) {
+    // It is illegal for both 'kEmptyDocuments' and 'trackOplogTimestamp' to be set.
+    invariant(!(cursorType == CursorType::kEmptyDocuments && trackOplogTimestamp));
+
+    // Later code in the DocumentSourceCursor lifecycle expects that '_exec' is in a saved state.
+    _exec->saveState();
+
+    auto&& explainer = _exec->getPlanExplainer();
+    _planSummary = explainer.getPlanSummary();
+    recordPlanSummaryStats();
+
+    if (pExpCtx->explain) {
+        // It's safe to access the executor even if we don't have the collection lock since we're
+        // just going to call getStats() on it.
+        _winningPlanTrialStats =
+            explainer.getWinningPlanStats(ExplainOptions::Verbosity::kExecStats);
+    }
+
+    if (collection) {
+        CollectionQueryInfo::get(collection)
+            .notifyOfQuery(pExpCtx->opCtx, collection, _stats.planSummaryStats);
+    }
+}
+
+intrusive_ptr<DocumentSourceCursor> DocumentSourceCursor::create(
+    const CollectionPtr& collection,
+    std::unique_ptr<PlanExecutor, PlanExecutor::Deleter> exec,
+    const intrusive_ptr<ExpressionContext>& pExpCtx,
+    CursorType cursorType,
+    bool trackOplogTimestamp) {
+    intrusive_ptr<DocumentSourceCursor> source(new DocumentSourceCursor(
+        collection, std::move(exec), pExpCtx, cursorType, trackOplogTimestamp));
+    return source;
+}
+}  // namespace mongo

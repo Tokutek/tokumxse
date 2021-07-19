@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,50 +29,31 @@
 
 #pragma once
 
-#include "mongo/base/status.h"
-#include "mongo/bson/bsonobj.h"
+#include "mongo/bson/bsonobjbuilder.h"
 
-namespace mongo {
+/**
+ * Namespace for static methods that are shared between explain on mongod and on mongos.
+ */
+namespace mongo::explain_common {
 
-    /**
-     * Utilities used for explain implementations on both mongod and mongos.
-     */
-    class ExplainCommon {
-    public:
-        /**
-         * The various supported verbosity levels for explain. The order is
-         * significant: the enum values are assigned in order of increasing verbosity.
-         */
-        enum Verbosity {
-            // At all verbosities greater than or equal to QUERY_PLANNER, we display information
-            // about the plan selected and alternate rejected plans. Does not include any execution-
-            // related info. String alias is "queryPlanner".
-            QUERY_PLANNER = 0,
+/**
+ * Adds the 'serverInfo' explain section to the BSON object being built by 'out'.
+ *
+ * This section include the host, port, version, and gitVersion.
+ */
+void generateServerInfo(BSONObjBuilder* out);
 
-            // At all verbosities greater than or equal to EXEC_STATS, we display a section of
-            // output containing both overall execution stats, and stats per stage in the
-            // execution tree. String alias is "execStats".
-            EXEC_STATS = 1,
+/**
+ * Adds the 'serverParameters' explain section to the BSON object being built by 'out'.
+ *
+ * This section includes various server-wide internal limits/knobs.
+ */
+void generateServerParameters(BSONObjBuilder* out);
 
-            // At this second-highest verbosity level, we generate the execution stats for each
-            // rejected plan as well as the winning plan. String alias is "allPlansExecution".
-            EXEC_ALL_PLANS = 2,
-        };
+/**
+ * Conditionally appends a BSONObj to 'bob' depending on whether or not the maximum user size for a
+ * BSON object will be exceeded.
+ */
+bool appendIfRoom(const BSONObj& toAppend, StringData fieldName, BSONObjBuilder* out);
 
-        /**
-         * Converts an explain verbosity to its string representation.
-         */
-        static const char* verbosityString(ExplainCommon::Verbosity verbosity);
-
-        /**
-         * Does some basic validation of the command BSON, and retrieves the explain verbosity.
-         *
-         * Returns a non-OK status if parsing fails.
-         *
-         * On success, populates "verbosity".
-         */
-        static Status parseCmdBSON(const BSONObj& cmdObj, ExplainCommon::Verbosity* verbosity);
-
-    };
-
-} // namespace
+}  // namespace mongo::explain_common

@@ -1,59 +1,17 @@
+/**
+ * Test interactions with big index keys. There should be no size limit for index keys.
+ *
+ * assumes_no_implicit_index_creation: Cannot implicitly shard accessed collections because of extra
+ * shard key index in sharded collection.
+ * requires_non_retryable_writes: This test uses delete which is not retryable
+ * @tags: [assumes_no_implicit_index_creation, requires_non_retryable_writes]
+ */
+(function() {
+"use strict";
 
-t = db.bigkeysidxtest;
+load("jstests/libs/index_bigkeys.js");
 
-var keys = []
+const collName = "index_bigkeys_foreground_test";
 
-var str = "aaaabbbbccccddddeeeeffffgggghhhh";
-
-while ( str.length < 20000 ) {
-    keys.push( str );
-    str = str + str;
-}
-
-function doInsert( order ) {
-    if (order == 1) {
-        for (var i = 0; i < 10; i++) {
-            t.insert({ _id: i, k: keys[i] });
-        }
-    }
-    else {
-        for (var i = 9; i >= 0; i--) {
-            t.insert({ _id: i, k: keys[i] });
-        }
-    }
-}
-
-var expect = null;
-
-function check() {
-    assert(t.validate().valid);
-    assert.eq( 5, t.count() );
-
-    var c = t.find({ k: /^a/ }).count();
-    assert.eq( 5, c );
-}
-
-function runTest( order ) {
-    t.drop();
-    t.ensureIndex({ k: 1 });
-    doInsert( order );
-    check(); // check incremental addition
-
-    t.reIndex();
-    check(); // check bottom up
-
-    t.drop();
-    doInsert( order );
-    assert.eq( 1, t.getIndexes().length );
-    t.ensureIndex({ k: 1 });
-    assert.eq( 1, t.getIndexes().length );
-
-    t.drop();
-    doInsert( order );
-    assert.eq( 1, t.getIndexes().length );
-    t.ensureIndex({ k: 1 }, { background: true });
-    assert.eq( 1, t.getIndexes().length );
-}
-
-runTest( 1 );
-runTest( 2 );
+testAllInteractionsWithBigIndexKeys(db, collName);
+}());

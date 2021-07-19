@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2008 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,7 +27,7 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kDefault
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
@@ -37,136 +38,136 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/user_set.h"
 #include "mongo/db/catalog/collection.h"
+#include "mongo/db/client.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/util/log.h"
+#include "mongo/db/stats/resource_consumption_metrics.h"
+#include "mongo/logv2/log.h"
+#include "mongo/rpc/metadata/client_metadata.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
 
-    using boost::scoped_ptr;
-    using std::endl;
-    using std::string;
+using std::endl;
+using std::string;
+using std::unique_ptr;
 
-namespace {
+void profile(OperationContext* opCtx, NetworkOp op) {
+    // Initialize with 1kb at start in order to avoid realloc later
+    BufBuilder profileBufBuilder(1024);
 
-    void _appendUserInfo(const CurOp& c,
-                         BSONObjBuilder& builder,
-                         AuthorizationSession* authSession) {
-        UserNameIterator nameIter = authSession->getAuthenticatedUserNames();
+    BSONObjBuilder b(profileBufBuilder);
 
-        UserName bestUser;
-        if (nameIter.more())
-            bestUser = *nameIter;
-
-        std::string opdb( nsToDatabase( c.getNS() ) );
-
-        BSONArrayBuilder allUsers(builder.subarrayStart("allUsers"));
-        for ( ; nameIter.more(); nameIter.next()) {
-            BSONObjBuilder nextUser(allUsers.subobjStart());
-            nextUser.append(AuthorizationManager::USER_NAME_FIELD_NAME, nameIter->getUser());
-            nextUser.append(AuthorizationManager::USER_DB_FIELD_NAME, nameIter->getDB());
-            nextUser.doneFast();
-
-            if (nameIter->getDB() == opdb) {
-                bestUser = *nameIter;
-            }
-        }
-        allUsers.doneFast();
-
-        builder.append("user", bestUser.getUser().empty() ? "" : bestUser.getFullName());
-
+    {
+        Locker::LockerInfo lockerInfo;
+        opCtx->lockState()->getLockerInfo(&lockerInfo, CurOp::get(opCtx)->getLockStatsBase());
+        CurOp::get(opCtx)->debug().append(
+            opCtx, lockerInfo.stats, opCtx->lockState()->getFlowControlStats(), b);
     }
 
-} // namespace
+    auto& metricsCollector = ResourceConsumption::MetricsCollector::get(opCtx);
+    if (metricsCollector.hasCollectedMetrics()) {
+        BSONObjBuilder metricsBuilder = b.subobjStart("operationMetrics");
+        const auto& metrics = metricsCollector.getMetrics();
+        metrics.toBson(&metricsBuilder);
+        metricsBuilder.done();
+    }
 
+    b.appendDate("ts", jsTime());
+    b.append("client", opCtx->getClient()->clientAddress());
 
-    void profile(OperationContext* txn, int op) {
-        // Initialize with 1kb at start in order to avoid realloc later
-        BufBuilder profileBufBuilder(1024);
-
-        BSONObjBuilder b(profileBufBuilder);
-
-        {
-            Locker::LockerInfo lockerInfo;
-            txn->lockState()->getLockerInfo(&lockerInfo);
-            txn->getCurOp()->debug().append(*txn->getCurOp(), lockerInfo.stats, b);
-        }
-
-        b.appendDate("ts", jsTime());
-        b.append("client", txn->getClient()->clientAddress());
-
-        AuthorizationSession * authSession = txn->getClient()->getAuthorizationSession();
-        _appendUserInfo(*txn->getCurOp(), b, authSession);
-
-        const BSONObj p = b.done();
-
-        const bool wasLocked = txn->lockState()->isLocked();
-
-        const string dbName(nsToDatabase(txn->getCurOp()->getNS()));
-
-        try {
-            bool acquireDbXLock = false;
-            while (true) {
-                ScopedTransaction scopedXact(txn, MODE_IX);
-
-                boost::scoped_ptr<AutoGetDb> autoGetDb;
-                if (acquireDbXLock) {
-                    autoGetDb.reset(new AutoGetDb(txn, dbName, MODE_X));
-                    if (autoGetDb->getDb()) {
-                        createProfileCollection(txn, autoGetDb->getDb());
-                    }
-                }
-                else {
-                    autoGetDb.reset(new AutoGetDb(txn, dbName, MODE_IX));
-                }
-
-                Database* const db = autoGetDb->getDb();
-                if (!db) {
-                    // Database disappeared
-                    log() << "note: not profiling because db went away for "
-                          << txn->getCurOp()->getNS();
-                    break;
-                }
-
-                Lock::CollectionLock collLock(txn->lockState(), db->getProfilingNS(), MODE_IX);
-
-                Collection* const coll = db->getCollection(db->getProfilingNS());
-                if (coll) {
-                    WriteUnitOfWork wuow(txn);
-                    coll->insertDocument(txn, p, false);
-                    wuow.commit();
-
-                    break;
-                }
-                else if (!acquireDbXLock &&
-                            (!wasLocked || txn->lockState()->isDbLockedForMode(dbName, MODE_X))) {
-                    // Try to create the collection only if we are not under lock, in order to
-                    // avoid deadlocks due to lock conversion. This would only be hit if someone
-                    // deletes the profiler collection after setting profile level.
-                    acquireDbXLock = true;
-                }
-                else {
-                    // Cannot write the profile information
-                    break;
-                }
-            }
-        }
-        catch (const AssertionException& assertionEx) {
-            warning() << "Caught Assertion while trying to profile "
-                      << opToString(op)
-                      << " against " << txn->getCurOp()->getNS()
-                      << ": " << assertionEx.toString() << endl;
+    if (auto clientMetadata = ClientMetadata::get(opCtx->getClient())) {
+        auto appName = clientMetadata->getApplicationName();
+        if (!appName.empty()) {
+            b.append("appName", appName);
         }
     }
 
+    AuthorizationSession* authSession = AuthorizationSession::get(opCtx->getClient());
+    OpDebug::appendUserInfo(*CurOp::get(opCtx), b, authSession);
 
-    Status createProfileCollection(OperationContext* txn, Database *db) {
-        invariant(txn->lockState()->isDbLockedForMode(db->name(), MODE_X));
+    const BSONObj p = b.done();
 
-        const std::string dbProfilingNS(db->getProfilingNS());
+    const string dbName(nsToDatabase(CurOp::get(opCtx)->getNS()));
 
-        Collection* const collection = db->getCollection(dbProfilingNS);
+    auto origFlowControl = opCtx->shouldParticipateInFlowControl();
+
+    // The system.profile collection is non-replicated, so writes to it do not cause
+    // replication lag. As such, they should be excluded from Flow Control.
+    opCtx->setShouldParticipateInFlowControl(false);
+
+    // IX lock acquisitions beyond this block will not be related to writes to system.profile.
+    ON_BLOCK_EXIT(
+        [opCtx, origFlowControl] { opCtx->setShouldParticipateInFlowControl(origFlowControl); });
+
+    try {
+
+        // Even if the operation we are profiling was interrupted, we still want to output the
+        // profiler entry.  This lock guard will prevent lock acquisitions from throwing exceptions
+        // before we finish writing the entry. However, our maximum lock timeout overrides
+        // uninterruptibility.
+        boost::optional<UninterruptibleLockGuard> noInterrupt;
+        if (!opCtx->lockState()->hasMaxLockTimeout()) {
+            noInterrupt.emplace(opCtx->lockState());
+        }
+
+        const auto dbProfilingNS = NamespaceString(dbName, "system.profile");
+        AutoGetCollection autoColl(opCtx, dbProfilingNS, MODE_IX);
+        Database* const db = autoColl.getDb();
+        if (!db) {
+            // Database disappeared.
+            LOGV2(20700,
+                  "note: not profiling because db went away for {namespace}",
+                  "note: not profiling because db went away for namespace",
+                  "namespace"_attr = CurOp::get(opCtx)->getNS());
+            return;
+        }
+
+        // We are about to enforce prepare conflicts for the OperationContext. But it is illegal
+        // to change the behavior of ignoring prepare conflicts while any storage transaction is
+        // still active. So we need to call abandonSnapshot() to close any open transactions.
+        // This call is also harmless because any previous reads or writes should have already
+        // completed, as profile() is called at the end of an operation.
+        opCtx->recoveryUnit()->abandonSnapshot();
+        // The profiler performs writes even after read commands. Ignoring prepare conflicts is
+        // not allowed while performing writes, so temporarily enforce prepare conflicts.
+        EnforcePrepareConflictsBlock enforcePrepare(opCtx);
+
+        uassertStatusOK(createProfileCollection(opCtx, db));
+        auto coll =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, dbProfilingNS);
+
+        invariant(!opCtx->shouldParticipateInFlowControl());
+        WriteUnitOfWork wuow(opCtx);
+        OpDebug* const nullOpDebug = nullptr;
+        uassertStatusOK(coll->insertDocument(opCtx, InsertStatement(p), nullOpDebug, false));
+        wuow.commit();
+    } catch (const AssertionException& assertionEx) {
+        LOGV2_WARNING(20703,
+                      "Caught Assertion while trying to profile {operation} against "
+                      "{namespace}: {assertion}",
+                      "Caught Assertion while trying to profile operation",
+                      "operation"_attr = networkOpToString(op),
+                      "namespace"_attr = CurOp::get(opCtx)->getNS(),
+                      "assertion"_attr = redact(assertionEx));
+    }
+}
+
+
+Status createProfileCollection(OperationContext* opCtx, Database* db) {
+    invariant(opCtx->lockState()->isDbLockedForMode(db->name(), MODE_IX));
+    invariant(!opCtx->shouldParticipateInFlowControl());
+
+    const auto dbProfilingNS = NamespaceString(db->name(), "system.profile");
+
+    // Checking the collection exists must also be done in the WCE retry loop. Only retrying
+    // collection creation would endlessly throw errors because the collection exists: must check
+    // and see the collection exists in order to break free.
+    return writeConflictRetry(opCtx, "createProfileCollection", dbProfilingNS.ns(), [&] {
+        const CollectionPtr collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, dbProfilingNS);
         if (collection) {
             if (!collection->isCapped()) {
                 return Status(ErrorCodes::NamespaceExists,
@@ -177,17 +178,22 @@ namespace {
         }
 
         // system.profile namespace doesn't exist; create it
-        log() << "Creating profile collection: " << dbProfilingNS << endl;
+        LOGV2(20701,
+              "Creating profile collection: {namespace}",
+              "Creating profile collection",
+              "namespace"_attr = dbProfilingNS);
 
         CollectionOptions collectionOptions;
         collectionOptions.capped = true;
         collectionOptions.cappedSize = 1024 * 1024;
 
-        WriteUnitOfWork wunit(txn);
-        invariant(db->createCollection(txn, dbProfilingNS, collectionOptions));
+        WriteUnitOfWork wunit(opCtx);
+        repl::UnreplicatedWritesBlock uwb(opCtx);
+        invariant(db->createCollection(opCtx, dbProfilingNS, collectionOptions));
         wunit.commit();
 
         return Status::OK();
-    }
+    });
+}
 
-} // namespace mongo
+}  // namespace mongo

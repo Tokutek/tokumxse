@@ -1,174 +1,221 @@
-// random.cpp
-
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#include "mongo/platform/random.h"
-
-#include <stdio.h>
-#include <string.h>
-
-#ifndef _WIN32
-#include <errno.h>
-#endif
-
-#define _CRT_RAND_S
-#include <cstdlib>
-#include <iostream>
-#include <fstream>
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kDefault
 
 #include "mongo/platform/basic.h"
 
-namespace mongo {
+#include "mongo/platform/random.h"
 
-    // ---- PseudoRandom  -----
-
-    int32_t PseudoRandom::nextInt32() {
-        int32_t t = _x ^ (_x << 11);
-        _x = _y;
-        _y = _z;
-        _z = _w;
-        return _w = _w ^ (_w >> 19) ^ (t ^ (t >> 8));
-    }
-
-    namespace {
-        const int32_t default_y = 362436069;
-        const int32_t default_z = 521288629;
-        const int32_t default_w = 88675123;
-    }
-
-    PseudoRandom::PseudoRandom( int32_t seed ) {
-        _x = seed;
-        _y = default_y;
-        _z = default_z;
-        _w = default_w;
-    }
-
-
-    PseudoRandom::PseudoRandom( uint32_t seed ) {
-        _x = static_cast<int32_t>(seed);
-        _y = default_y;
-        _z = default_z;
-        _w = default_w;
-    }
-
-
-    PseudoRandom::PseudoRandom( int64_t seed ) {
-        int32_t high = seed >> 32;
-        int32_t low = seed & 0xFFFFFFFF;
-
-        _x = high ^ low;
-        _y = default_y;
-        _z = default_z;
-        _w = default_w;
-    }
-
-    int64_t PseudoRandom::nextInt64() {
-        int64_t a = nextInt32();
-        int64_t b = nextInt32();
-        return ( a << 32 ) | b;
-    }
-
-    // --- SecureRandom ----
-
-    SecureRandom::~SecureRandom() {
-    }
+#include <string.h>
 
 #ifdef _WIN32
-    class WinSecureRandom : public SecureRandom {
-        virtual ~WinSecureRandom(){}
-        int64_t nextInt64() {
-            uint32_t a, b;
-            if ( rand_s(&a) ) {
-                abort();
-            }
-            if ( rand_s(&b) ) {
-                abort();
-            }
-            return ( static_cast<int64_t>(a) << 32 ) | b;
-        }
-    };
-
-    SecureRandom* SecureRandom::create() {
-        return new WinSecureRandom();
-    }
-
-#elif defined(__linux__) || defined(__sun) || defined(__APPLE__) || defined(__FreeBSD__)
-
-    class InputStreamSecureRandom : public SecureRandom {
-    public:
-        InputStreamSecureRandom( const char* fn ) {
-            _in = new std::ifstream( fn, std::ios::binary | std::ios::in );
-            if ( !_in->is_open() ) {
-                std::cerr << "can't open " << fn << " " << strerror(errno) << std::endl;
-                abort();
-            }
-        }
-
-        ~InputStreamSecureRandom() {
-            delete _in;
-        }
-
-        int64_t nextInt64() {
-            int64_t r;
-            _in->read( reinterpret_cast<char*>( &r ), sizeof(r) );
-            if ( _in->fail() ) {
-                abort();
-            }
-            return r;
-        }
-
-    private:
-        std::ifstream* _in;
-    };
-
-    SecureRandom* SecureRandom::create() {
-        return new InputStreamSecureRandom( "/dev/urandom" );
-    }
-
-#elif defined(__OpenBSD__)
-
-    class Arc4SecureRandom : public SecureRandom {
-    public:
-        int64_t nextInt64() {
-            int64_t value;
-            arc4random_buf(&value, sizeof(value));
-            return value;
-        }
-    };
-
-    SecureRandom* SecureRandom::create() {
-        return new Arc4SecureRandom();
-    }
-
+#include <bcrypt.h>
 #else
-
-#error Must implement SecureRandom for platform
-
+#include <errno.h>
+#include <fcntl.h>
 #endif
 
+#define _CRT_RAND_S
+#include <array>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <random>
+
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
+
+#ifdef _WIN32
+#define SECURE_RANDOM_BCRYPT
+#elif defined(__linux__) || defined(__sun) || defined(__APPLE__) || defined(__FreeBSD__) || \
+    defined(__EMSCRIPTEN__)
+#define SECURE_RANDOM_URANDOM
+#elif defined(__OpenBSD__)
+#define SECURE_RANDOM_ARCFOUR
+#else
+#error "Must implement SecureRandom for platform"
+#endif
+
+namespace mongo {
+
+namespace {
+
+template <size_t Bytes>
+struct Buffer {
+    static constexpr size_t kArraySize = Bytes / sizeof(uint64_t);
+
+    uint64_t pop() {
+        return arr[--avail];
+    }
+    uint8_t* fillPtr() {
+        return reinterpret_cast<uint8_t*>(arr.data() + avail);
+    }
+    size_t fillSize() {
+        return sizeof(uint64_t) * (arr.size() - avail);
+    }
+    void setFilled() {
+        avail = arr.size();
+    }
+
+    std::array<uint64_t, kArraySize> arr;
+    size_t avail = 0;
+};
+
+#if defined(SECURE_RANDOM_BCRYPT)
+class Source {
+public:
+    Source() {
+        auto ntstatus = ::BCryptOpenAlgorithmProvider(
+            &_algHandle, BCRYPT_RNG_ALGORITHM, MS_PRIMITIVE_PROVIDER, 0);
+        if (ntstatus != STATUS_SUCCESS) {
+            LOGV2_ERROR(23822,
+                        "Failed to open crypto algorithm provider while creating secure random "
+                        "object; NTSTATUS: {ntstatus}",
+                        "ntstatus"_attr = ntstatus);
+            fassertFailed(28815);
+        }
+    }
+
+    ~Source() {
+        auto ntstatus = ::BCryptCloseAlgorithmProvider(_algHandle, 0);
+        if (ntstatus != STATUS_SUCCESS) {
+            LOGV2_WARNING(23821,
+                          "Failed to close crypto algorithm provider destroying secure random "
+                          "object; NTSTATUS: {ntstatus}",
+                          "ntstatus"_attr = ntstatus);
+        }
+    }
+
+    size_t refill(uint8_t* buf, size_t n) {
+        auto ntstatus = ::BCryptGenRandom(_algHandle, reinterpret_cast<PUCHAR>(buf), n, 0);
+        if (ntstatus != STATUS_SUCCESS) {
+            LOGV2_ERROR(
+                23823,
+                "Failed to generate random number from secure random object; NTSTATUS: {ntstatus}",
+                "ntstatus"_attr = ntstatus);
+            fassertFailed(28814);
+        }
+        return n;
+    }
+
+private:
+    BCRYPT_ALG_HANDLE _algHandle;
+};
+#endif  // SECURE_RANDOM_BCRYPT
+
+#if defined(SECURE_RANDOM_URANDOM)
+class Source {
+public:
+    size_t refill(uint8_t* buf, size_t n) {
+        size_t i = 0;
+        while (i < n) {
+            ssize_t r;
+            while ((r = read(sharedFd(), buf + i, n - i)) == -1) {
+                if (errno == EINTR) {
+                    continue;
+                } else {
+                    auto errSave = errno;
+                    LOGV2_ERROR(23824,
+                                "SecureRandom: read `{kFn}`: {strerror_errSave}",
+                                "kFn"_attr = kFn,
+                                "strerror_errSave"_attr = strerror(errSave));
+                    fassertFailed(28840);
+                }
+            }
+            i += r;
+        }
+        return i;
+    }
+
+private:
+    static constexpr const char* kFn = "/dev/urandom";
+    static int sharedFd() {
+        // Retain the urandom fd forever.
+        // Kernel ensures that concurrent `read` calls don't mingle their data.
+        // http://lkml.iu.edu//hypermail/linux/kernel/0412.1/0181.html
+        static const int fd = [] {
+            int f;
+            while ((f = open(kFn, 0)) == -1) {
+                if (errno == EINTR) {
+                    continue;
+                } else {
+                    auto errSave = errno;
+                    LOGV2_ERROR(23825,
+                                "SecureRandom: open `{kFn}`: {strerror_errSave}",
+                                "kFn"_attr = kFn,
+                                "strerror_errSave"_attr = strerror(errSave));
+                    fassertFailed(28839);
+                }
+            }
+            return f;
+        }();
+        return fd;
+    }
+};
+#endif  // SECURE_RANDOM_URANDOM
+
+#if defined(SECURE_RANDOM_ARCFOUR)
+class Source {
+public:
+    size_t refill(uint8_t* buf, size_t n) {
+        arc4random_buf(buf, n);
+        return n;
+    }
+};
+#endif  // SECURE_RANDOM_ARCFOUR
+
+}  // namespace
+
+class SecureUrbg::State {
+public:
+    uint64_t get() {
+        if (!_buffer.avail) {
+            size_t n = _source.refill(_buffer.fillPtr(), _buffer.fillSize());
+            _buffer.avail += n / sizeof(uint64_t);
+        }
+        return _buffer.pop();
+    }
+
+private:
+    Source _source;
+    Buffer<4096> _buffer;
+};
+
+SecureUrbg::SecureUrbg() : _state{std::make_unique<State>()} {}
+
+SecureUrbg::~SecureUrbg() = default;
+
+uint64_t SecureUrbg::operator()() {
+    return _state->get();
 }
+
+}  // namespace mongo

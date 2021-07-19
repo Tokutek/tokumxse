@@ -1,40 +1,68 @@
+(function() {
+"use strict";
+const collName = "distinct1";
+const coll = db.getCollection(collName);
+coll.drop();
 
-t = db.distinct1;
-t.drop();
+assert.eq(0, coll.distinct("a").length, "test empty");
 
-assert.eq( 0 , t.distinct( "a" ).length , "test empty" );
+assert.commandWorked(coll.insert({a: 1}));
+assert.commandWorked(coll.insert({a: 2}));
+assert.commandWorked(coll.insert({a: 2}));
+assert.commandWorked(coll.insert({a: 2}));
+assert.commandWorked(coll.insert({a: 3}));
 
-t.save( { a : 1 } )
-t.save( { a : 2 } )
-t.save( { a : 2 } )
-t.save( { a : 2 } )
-t.save( { a : 3 } )
+// Test that distinct returns all the distinct values.
+assert.eq([1, 2, 3], coll.distinct("a").sort(), "distinct returned unexpected results");
 
+// Test that distinct respects the query condition.
+assert.eq([1, 2],
+          coll.distinct("a", {a: {$lt: 3}}).sort(),
+          "distinct with query returned unexpected results");
 
-res = t.distinct( "a" );
-assert.eq( "1,2,3" , res.toString() , "A1" );
+assert(coll.drop());
 
-assert.eq( "1,2" , t.distinct( "a" , { a : { $lt : 3 } } ) , "A2" );
+assert.commandWorked(coll.insert({a: {b: "a"}, c: 12}));
+assert.commandWorked(coll.insert({a: {b: "b"}, c: 12}));
+assert.commandWorked(coll.insert({a: {b: "c"}, c: 12}));
+assert.commandWorked(coll.insert({a: {b: "c"}, c: 12}));
 
-t.drop();
+// Test that distinct works on fields in embedded documents.
+assert.eq(["a", "b", "c"],
+          coll.distinct("a.b").sort(),
+          "distinct on dotted field returned unexpected results");
 
-t.save( { a : { b : "a" } , c : 12 } );
-t.save( { a : { b : "b" } , c : 12 } );
-t.save( { a : { b : "c" } , c : 12 } );
-t.save( { a : { b : "c" } , c : 12 } );
+assert(coll.drop());
 
-res = t.distinct( "a.b" );
-assert.eq( "a,b,c" , res.toString() , "B1" );
-printjson(t._distinct( "a.b" ).stats);
-assert.eq( "COLLSCAN" , t._distinct( "a.b" ).stats.planSummary , "B2" )
+assert.commandWorked(coll.insert({_id: 1, a: 1}));
+assert.commandWorked(coll.insert({_id: 2, a: 2}));
 
-t.drop();
+// Test that distinct works on the _id field.
+assert.eq([1, 2], coll.distinct("_id").sort(), "distinct on _id returned unexpected results");
 
-t.save({_id: 1, a: 1});
-t.save({_id: 2, a: 2});
+// Test that distinct works with a query on the _id field.
+assert.eq(
+    [1], coll.distinct("a", {_id: 1}), "distinct with query on _id returned unexpected results");
 
-// Test distinct with _id.
-res = t.distinct( "_id" );
-assert.eq( "1,2", res.toString(), "C1" );
-res = t.distinct( "a", {_id: 1} );
-assert.eq( "1", res.toString(), "C2" );
+assert(coll.drop());
+
+assert.commandWorked(coll.insert({a: 1, b: 2}));
+assert.commandWorked(coll.insert({a: 2, b: 2}));
+assert.commandWorked(coll.insert({a: 2, b: 1}));
+assert.commandWorked(coll.insert({a: 2, b: 2}));
+assert.commandWorked(coll.insert({a: 3, b: 2}));
+assert.commandWorked(coll.insert({a: 4, b: 1}));
+assert.commandWorked(coll.insert({a: 4, b: 1}));
+
+// Test running the distinct command directly, rather than via shell helper.
+let res = assert.commandWorked(db.runCommand({distinct: collName, key: "a"}));
+assert.eq([1, 2, 3, 4], res.values.sort());
+
+res = assert.commandWorked(db.runCommand({distinct: collName, key: "a", query: null}));
+assert.eq([1, 2, 3, 4], res.values.sort());
+
+res = assert.commandWorked(db.runCommand({distinct: collName, key: "a", query: {b: 2}}));
+assert.eq([1, 2, 3], res.values.sort());
+
+assert.commandFailed(db.runCommand({distinct: collName, key: "a", query: 1}));
+}());

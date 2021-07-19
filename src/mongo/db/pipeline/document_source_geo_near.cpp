@@ -1,223 +1,249 @@
 /**
- * Copyright 2011 (c) 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/document.h"
+#include "mongo/db/pipeline/document_source_geo_near.h"
+
+#include "mongo/db/exec/document_value/document.h"
+#include "mongo/db/pipeline/document_source_sort.h"
+#include "mongo/db/pipeline/lite_parsed_document_source.h"
+#include "mongo/logv2/log.h"
 
 namespace mongo {
 
-    using boost::intrusive_ptr;
-    using std::min;
+using boost::intrusive_ptr;
 
-    char DocumentSourceGeoNear::geoNearName[] = "$geoNear";
-    const char *DocumentSourceGeoNear::getSourceName() const { return geoNearName; }
+constexpr StringData DocumentSourceGeoNear::kKeyFieldName;
 
-    boost::optional<Document> DocumentSourceGeoNear::getNext() {
-        pExpCtx->checkForInterrupt();
+REGISTER_DOCUMENT_SOURCE(geoNear,
+                         LiteParsedDocumentSourceDefault::parse,
+                         DocumentSourceGeoNear::createFromBson,
+                         LiteParsedDocumentSource::AllowedWithApiStrict::kAlways);
 
-        if (!resultsIterator)
-            runCommand();
+Value DocumentSourceGeoNear::serialize(boost::optional<ExplainOptions::Verbosity> explain) const {
+    MutableDocument result;
 
-        if (!resultsIterator->more())
-            return boost::none;
-
-        // each result from the geoNear command is wrapped in a wrapper object with "obj",
-        // "dis" and maybe "loc" fields. We want to take the object from "obj" and inject the
-        // other fields into it.
-        Document result (resultsIterator->next().embeddedObject());
-        MutableDocument output (result["obj"].getDocument());
-        output.setNestedField(*distanceField, result["dis"]);
-        if (includeLocs)
-            output.setNestedField(*includeLocs, result["loc"]);
-
-        return output.freeze();
+    if (keyFieldPath) {
+        result.setField(kKeyFieldName, Value(keyFieldPath->fullPath()));
     }
 
-    void DocumentSourceGeoNear::setSource(DocumentSource*) {
-        uasserted(16602, "$geoNear is only allowed as the first pipeline stage");
+    if (coordsIsArray) {
+        result.setField("near", Value(BSONArray(coords)));
+    } else {
+        result.setField("near", Value(coords));
     }
 
-    bool DocumentSourceGeoNear::coalesce(const intrusive_ptr<DocumentSource> &pNextSource) {
-        DocumentSourceLimit* limitSrc = dynamic_cast<DocumentSourceLimit*>(pNextSource.get());
-        if (limitSrc) {
-            limit = min(limit, limitSrc->getLimit());
-            return true;
-        }
+    result.setField("distanceField", Value(distanceField->fullPath()));
 
-        return false;
+    if (maxDistance) {
+        result.setField("maxDistance", Value(*maxDistance));
     }
 
-    // This command is sent as-is to the shards.
-    // On router this becomes a sort by distance (nearest-first) with limit.
-    intrusive_ptr<DocumentSource> DocumentSourceGeoNear::getShardSource() { return this; }
-    intrusive_ptr<DocumentSource> DocumentSourceGeoNear::getMergeSource() {
-        return DocumentSourceSort::create(pExpCtx,
-                                          BSON(distanceField->getPath(false) << 1),
-                                          limit);
+    if (minDistance) {
+        result.setField("minDistance", Value(*minDistance));
     }
 
-    Value DocumentSourceGeoNear::serialize(bool explain) const {
-        MutableDocument result;
-
-        if (coordsIsArray) {
-            result.setField("near", Value(BSONArray(coords)));
-        }
-        else {
-            result.setField("near", Value(coords));
-        }
-
-        // not in buildGeoNearCmd
-        result.setField("distanceField", Value(distanceField->getPath(false)));
-
-        result.setField("limit", Value(limit));
-
-        if (maxDistance > 0)
-            result.setField("maxDistance", Value(maxDistance));
-
-        result.setField("query", Value(query));
-        result.setField("spherical", Value(spherical));
-        result.setField("distanceMultiplier", Value(distanceMultiplier));
-
-        if (includeLocs)
-            result.setField("includeLocs", Value(includeLocs->getPath(false)));
-
-        result.setField("uniqueDocs", Value(uniqueDocs));
-
-        return Value(DOC(getSourceName() << result.freeze()));
+    result.setField("query", Value(query));
+    result.setField("spherical", Value(spherical));
+    if (distanceMultiplier) {
+        result.setField("distanceMultiplier", Value(*distanceMultiplier));
     }
 
-    BSONObj DocumentSourceGeoNear::buildGeoNearCmd() const {
-        // this is very similar to sourceToBson, but slightly different.
-        // differences will be noted.
+    if (includeLocs)
+        result.setField("includeLocs", Value(includeLocs->fullPath()));
 
-        BSONObjBuilder geoNear; // not building a subField
-
-        geoNear.append("geoNear", pExpCtx->ns.coll()); // not in toBson
-
-        if (coordsIsArray) {
-            geoNear.appendArray("near", coords);
-        }
-        else {
-            geoNear.append("near", coords);
-        }
-
-        geoNear.append("num", limit); // called limit in toBson
-
-        if (maxDistance > 0)
-            geoNear.append("maxDistance", maxDistance);
-
-        geoNear.append("query", query);
-        geoNear.append("spherical", spherical);
-        geoNear.append("distanceMultiplier", distanceMultiplier);
-
-        if (includeLocs)
-            geoNear.append("includeLocs", true); // String in toBson
-
-        geoNear.append("uniqueDocs", uniqueDocs);
-
-        return geoNear.obj();
-    }
-
-    void DocumentSourceGeoNear::runCommand() {
-        massert(16603, "Already ran geoNearCommand",
-                !resultsIterator);
-
-        bool ok = _mongod->directClient()->runCommand(pExpCtx->ns.db().toString(),
-                                                      buildGeoNearCmd(),
-                                                      cmdOutput);
-        uassert(16604, "geoNear command failed: " + cmdOutput.toString(),
-                ok);
-
-        resultsIterator.reset(new BSONObjIterator(cmdOutput["results"].embeddedObject()));
-    }
-
-    intrusive_ptr<DocumentSourceGeoNear> DocumentSourceGeoNear::create(
-            const intrusive_ptr<ExpressionContext> &pCtx) {
-        return new DocumentSourceGeoNear(pCtx);
-    }
-
-    intrusive_ptr<DocumentSource> DocumentSourceGeoNear::createFromBson(
-            BSONElement elem,
-            const intrusive_ptr<ExpressionContext> &pCtx) {
-        intrusive_ptr<DocumentSourceGeoNear> out = new DocumentSourceGeoNear(pCtx);
-        out->parseOptions(elem.embeddedObjectUserCheck());
-        return out;
-    }
-
-    void DocumentSourceGeoNear::parseOptions(BSONObj options) {
-        // near and distanceField are required
-
-        uassert(16605, "$geoNear requires a 'near' option as an Array",
-                options["near"].isABSONObj()); // Array or Object (Object is deprecated)
-        coordsIsArray = options["near"].type() == Array;
-        coords = options["near"].embeddedObject().getOwned();
-
-        uassert(16606, "$geoNear requires a 'distanceField' option as a String",
-                options["distanceField"].type() == String);
-        distanceField.reset(new FieldPath(options["distanceField"].str()));
-
-        // remaining fields are optional
-
-        // num and limit are synonyms
-        if (options["limit"].isNumber())
-            limit = options["limit"].numberLong();
-        if (options["num"].isNumber())
-            limit = options["num"].numberLong();
-
-        if (options["maxDistance"].isNumber())
-            maxDistance = options["maxDistance"].numberDouble();
-
-        if (options["query"].type() == Object)
-            query = options["query"].embeddedObject().getOwned();
-
-        spherical = options["spherical"].trueValue();
-
-        if (options["distanceMultiplier"].isNumber())
-            distanceMultiplier = options["distanceMultiplier"].numberDouble();
-
-        if (options.hasField("includeLocs")) {
-            uassert(16607, "$geoNear requires that 'includeLocs' option is a String",
-                    options["includeLocs"].type() == String);
-            includeLocs.reset(new FieldPath(options["includeLocs"].str()));
-        }
-
-        uniqueDocs = options["uniqueDocs"].trueValue();
-    }
-
-    DocumentSourceGeoNear::DocumentSourceGeoNear(const intrusive_ptr<ExpressionContext> &pExpCtx)
-        : DocumentSource(pExpCtx)
-        , coordsIsArray(false)
-        , limit(100)
-        , maxDistance(-1.0)
-        , spherical(false)
-        , distanceMultiplier(1.0)
-        , uniqueDocs(true)
-    {}
+    return Value(DOC(getSourceName() << result.freeze()));
 }
+
+intrusive_ptr<DocumentSourceGeoNear> DocumentSourceGeoNear::create(
+    const intrusive_ptr<ExpressionContext>& pCtx) {
+    intrusive_ptr<DocumentSourceGeoNear> source(new DocumentSourceGeoNear(pCtx));
+    return source;
+}
+
+intrusive_ptr<DocumentSource> DocumentSourceGeoNear::createFromBson(
+    BSONElement elem, const intrusive_ptr<ExpressionContext>& pCtx) {
+    intrusive_ptr<DocumentSourceGeoNear> out = new DocumentSourceGeoNear(pCtx);
+    out->parseOptions(elem.embeddedObjectUserCheck());
+    return out;
+}
+
+bool DocumentSourceGeoNear::hasQuery() const {
+    return true;
+}
+
+void DocumentSourceGeoNear::parseOptions(BSONObj options) {
+    // First, check for explicitly-disallowed fields.
+
+    // The old geoNear command used to accept a collation. We explicitly ban it here, since the
+    // $geoNear stage should respect the collation associated with the entire pipeline.
+    uassert(40227,
+            "$geoNear does not accept the 'collation' parameter. Instead, specify a collation "
+            "for the entire aggregation command.",
+            !options["collation"]);
+
+    // The following fields were present in older versions but are no longer supported.
+    uassert(50858,
+            "$geoNear no longer supports the 'limit' parameter. Use a $limit stage instead.",
+            !options["limit"]);
+    uassert(50857,
+            "$geoNear no longer supports the 'num' parameter. Use a $limit stage instead.",
+            !options["num"]);
+    uassert(50856, "$geoNear no longer supports the 'start' argument.", !options["start"]);
+
+    // The "near" and "distanceField" parameters are required.
+    uassert(16605,
+            "$geoNear requires a 'near' option as an Array",
+            options["near"].isABSONObj());  // Array or Object (Object is deprecated)
+    coordsIsArray = options["near"].type() == Array;
+    coords = options["near"].embeddedObject().getOwned();
+
+    uassert(16606,
+            "$geoNear requires a 'distanceField' option as a String",
+            options["distanceField"].type() == String);
+    distanceField.reset(new FieldPath(options["distanceField"].str()));
+
+    // The remaining fields are optional.
+    if (auto maxDistElem = options["maxDistance"]) {
+        uassert(ErrorCodes::TypeMismatch,
+                "maxDistance must be a number",
+                isNumericBSONType(maxDistElem.type()));
+        maxDistance = options["maxDistance"].numberDouble();
+        uassert(ErrorCodes::BadValue, "maxDistance must be nonnegative", *maxDistance >= 0);
+    }
+
+    if (auto minDistElem = options["minDistance"]) {
+        uassert(ErrorCodes::TypeMismatch,
+                "minDistance must be a number",
+                isNumericBSONType(minDistElem.type()));
+        minDistance = options["minDistance"].numberDouble();
+        uassert(ErrorCodes::BadValue, "minDistance must be nonnegative", *minDistance >= 0);
+    }
+
+    if (auto distMultElem = options["distanceMultiplier"]) {
+        uassert(ErrorCodes::TypeMismatch,
+                "distanceMultiplier must be a number",
+                isNumericBSONType(distMultElem.type()));
+        distanceMultiplier = options["distanceMultiplier"].numberDouble();
+        uassert(ErrorCodes::BadValue,
+                "distanceMultiplier must be nonnegative",
+                *distanceMultiplier >= 0);
+    }
+
+    if (auto queryElem = options["query"]) {
+        uassert(ErrorCodes::TypeMismatch,
+                "query must be an object",
+                queryElem.type() == BSONType::Object);
+        query = queryElem.embeddedObject().getOwned();
+    }
+
+    spherical = options["spherical"].trueValue();
+
+    if (options.hasField("includeLocs")) {
+        uassert(16607,
+                "$geoNear requires that 'includeLocs' option is a String",
+                options["includeLocs"].type() == String);
+        includeLocs = FieldPath(options["includeLocs"].str());
+    }
+
+    if (options.hasField("uniqueDocs"))
+        LOGV2_WARNING(23758, "ignoring deprecated uniqueDocs option in $geoNear aggregation stage");
+
+    if (auto keyElt = options[kKeyFieldName]) {
+        uassert(ErrorCodes::TypeMismatch,
+                str::stream() << "$geoNear parameter '" << DocumentSourceGeoNear::kKeyFieldName
+                              << "' must be of type string but found type: "
+                              << typeName(keyElt.type()),
+                keyElt.type() == BSONType::String);
+        const auto keyFieldStr = keyElt.valueStringData();
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "$geoNear parameter '" << DocumentSourceGeoNear::kKeyFieldName
+                              << "' cannot be the empty string",
+                !keyFieldStr.empty());
+        keyFieldPath = FieldPath(keyFieldStr);
+    }
+}
+
+BSONObj DocumentSourceGeoNear::asNearQuery(StringData nearFieldName) const {
+    BSONObjBuilder queryBuilder;
+    queryBuilder.appendElements(query);
+
+    BSONObjBuilder nearBuilder(queryBuilder.subobjStart(nearFieldName));
+    if (spherical) {
+        if (coordsIsArray) {
+            nearBuilder.appendArray("$nearSphere", coords);
+        } else {
+            nearBuilder.append("$nearSphere", coords);
+        }
+    } else {
+        if (coordsIsArray) {
+            nearBuilder.appendArray("$near", coords);
+        } else {
+            nearBuilder.append("$near", coords);
+        }
+    }
+    if (minDistance) {
+        nearBuilder.append("$minDistance", *minDistance);
+    }
+    if (maxDistance) {
+        nearBuilder.append("$maxDistance", *maxDistance);
+    }
+    nearBuilder.doneFast();
+    return queryBuilder.obj();
+}
+
+bool DocumentSourceGeoNear::needsGeoNearPoint() const {
+    return static_cast<bool>(includeLocs);
+}
+
+DepsTracker::State DocumentSourceGeoNear::getDependencies(DepsTracker* deps) const {
+    // TODO (SERVER-35424): Implement better dependency tracking. For example, 'distanceField' is
+    // produced by this stage, and we could inform the query system that it need not include it in
+    // its response. For now, assume that we require the entire document as well as the appropriate
+    // geoNear metadata.
+    deps->setNeedsMetadata(DocumentMetadataFields::kGeoNearDist, true);
+    deps->setNeedsMetadata(DocumentMetadataFields::kGeoNearPoint, needsGeoNearPoint());
+
+    deps->needWholeDocument = true;
+    return DepsTracker::State::EXHAUSTIVE_FIELDS;
+}
+
+DocumentSourceGeoNear::DocumentSourceGeoNear(const intrusive_ptr<ExpressionContext>& pExpCtx)
+    : DocumentSource(kStageName, pExpCtx), coordsIsArray(false), spherical(false) {}
+
+boost::optional<DocumentSource::DistributedPlanLogic>
+DocumentSourceGeoNear::distributedPlanLogic() {
+    // {shardsStage, mergingStage, sortPattern}
+    return DistributedPlanLogic{this, nullptr, BSON(distanceField->fullPath() << 1)};
+}
+
+}  // namespace mongo

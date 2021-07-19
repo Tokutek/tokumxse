@@ -1,535 +1,368 @@
 /**
- *    Copyright (C) 2014 10gen Inc.
+ *    Copyright (C) 2020-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
-
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kSharding
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/json.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/db/query/canonical_query.h"
-#include "mongo/s/chunk_manager.h"
-#include "mongo/s/shard_key_pattern.h"
+#include "mongo/db/hasher.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/service_context_test_fixture.h"
+#include "mongo/s/catalog_cache_test_fixture.h"
+#include "mongo/s/chunk_manager_targeter.h"
+#include "mongo/s/session_catalog_router.h"
+#include "mongo/s/transaction_router.h"
+#include "mongo/s/write_ops/batched_command_request.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/log.h"
 
+namespace mongo {
 namespace {
 
-    using namespace mongo;
+using unittest::assertGet;
 
-    using std::auto_ptr;
-    using std::make_pair;
+const NamespaceString kNss("TestDB", "TestColl");
 
-    /**
-     * ChunkManager targeting test
-     *
-     * TODO:
-     *   Pull the implementation out of chunk.cpp
-     */
+auto buildUpdate(const NamespaceString& nss, BSONObj query, BSONObj update, bool upsert) {
+    write_ops::UpdateCommandRequest updateOp(nss);
+    write_ops::UpdateOpEntry entry;
+    entry.setQ(query);
+    entry.setU(write_ops::UpdateModification::parseFromClassicUpdate(update));
+    entry.setUpsert(upsert);
+    updateOp.setUpdates(std::vector{entry});
+    return BatchedCommandRequest{std::move(updateOp)};
+}
 
-    // Utility function to create a CanonicalQuery
-    CanonicalQuery* canonicalize(const char* queryStr) {
-        BSONObj queryObj = fromjson(queryStr);
-        CanonicalQuery* cq;
-        Status result = CanonicalQuery::canonicalize(
-                            "test.foo", queryObj, &cq, WhereCallbackNoop());
-        ASSERT_OK(result);
-        return cq;
+auto buildDelete(const NamespaceString& nss, BSONObj query) {
+    write_ops::DeleteCommandRequest deleteOp(nss);
+    write_ops::DeleteOpEntry entry;
+    entry.setQ(query);
+    entry.setMulti(false);
+    deleteOp.setDeletes(std::vector{entry});
+    return BatchedCommandRequest{std::move(deleteOp)};
+}
+
+class ChunkManagerTargeterTest : public CatalogCacheTestFixture {
+public:
+    ChunkManagerTargeter prepare(BSONObj shardKeyPattern, const std::vector<BSONObj>& splitPoints) {
+        chunkManager =
+            makeChunkManager(kNss, ShardKeyPattern(shardKeyPattern), nullptr, false, splitPoints);
+        return ChunkManagerTargeter(operationContext(), kNss);
+    }
+    boost::optional<ChunkManager> chunkManager;
+};
+
+TEST_F(ChunkManagerTargeterTest, TargetInsertWithRangePrefixHashedShardKey) {
+    // Create 5 chunks and 5 shards such that shardId '0' has chunk [MinKey, null), '1' has chunk
+    // [null, -100), '2' has chunk [-100, 0), '3' has chunk ['0', 100) and '4' has chunk
+    // [100, MaxKey).
+    std::vector<BSONObj> splitPoints = {
+        BSON("a.b" << BSONNULL), BSON("a.b" << -100), BSON("a.b" << 0), BSON("a.b" << 100)};
+    auto cmTargeter = prepare(BSON("a.b" << 1 << "c.d"
+                                         << "hashed"),
+                              splitPoints);
+
+    auto res = cmTargeter.targetInsert(operationContext(), fromjson("{a: {b: -111}, c: {d: '1'}}"));
+    ASSERT_EQUALS(res.shardName, "1");
+
+    res = cmTargeter.targetInsert(operationContext(), fromjson("{a: {b: -10}}"));
+    ASSERT_EQUALS(res.shardName, "2");
+
+    res = cmTargeter.targetInsert(operationContext(), fromjson("{a: {b: 0}, c: {d: 4}}"));
+    ASSERT_EQUALS(res.shardName, "3");
+
+    res = cmTargeter.targetInsert(operationContext(), fromjson("{a: {b: 1000}, c: null, d: {}}"));
+    ASSERT_EQUALS(res.shardName, "4");
+
+    // Missing field will be treated as null and will be targeted to the chunk which holds null,
+    // which is shard '1'.
+    res = cmTargeter.targetInsert(operationContext(), BSONObj());
+    ASSERT_EQUALS(res.shardName, "1");
+
+    res = cmTargeter.targetInsert(operationContext(), BSON("a" << 10));
+    ASSERT_EQUALS(res.shardName, "1");
+
+    // Arrays along shard key path are not allowed.
+    ASSERT_THROWS_CODE(cmTargeter.targetInsert(operationContext(), fromjson("{a: [1,2]}")),
+                       DBException,
+                       ErrorCodes::ShardKeyNotFound);
+    ASSERT_THROWS_CODE(cmTargeter.targetInsert(operationContext(), fromjson("{c: [1,2]}")),
+                       DBException,
+                       ErrorCodes::ShardKeyNotFound);
+    ASSERT_THROWS_CODE(cmTargeter.targetInsert(operationContext(), fromjson("{c: {d: [1,2]}}")),
+                       DBException,
+                       ErrorCodes::ShardKeyNotFound);
+}
+
+TEST_F(ChunkManagerTargeterTest, TargetInsertsWithVaryingHashedPrefixAndConstantRangedSuffix) {
+    // Create 4 chunks and 4 shards such that shardId '0' has chunk [MinKey, -2^62), '1' has chunk
+    // [-2^62, 0), '2' has chunk ['0', 2^62) and '3' has chunk [2^62, MaxKey).
+    std::vector<BSONObj> splitPoints = {
+        BSON("a.b" << -(1LL << 62)), BSON("a.b" << 0LL), BSON("a.b" << (1LL << 62))};
+    auto cmTargeter = prepare(BSON("a.b"
+                                   << "hashed"
+                                   << "c.d" << 1),
+                              splitPoints);
+
+    for (int i = 0; i < 1000; i++) {
+        auto insertObj = BSON("a" << BSON("b" << i) << "c" << BSON("d" << 10));
+        auto res = cmTargeter.targetInsert(operationContext(), insertObj);
+
+        // Verify that the given document is being routed based on hashed value of 'i'.
+        auto chunk = chunkManager->findIntersectingChunkWithSimpleCollation(
+            BSON("a.b" << BSONElementHasher::hash64(insertObj["a"]["b"],
+                                                    BSONElementHasher::DEFAULT_HASH_SEED)));
+        ASSERT_EQUALS(res.shardName, chunk.getShardId());
     }
 
-    void checkIndexBoundsWithKey(const char* keyStr,
-                                 const char* queryStr,
-                                 const IndexBounds& expectedBounds) {
+    // Arrays along shard key path are not allowed.
+    ASSERT_THROWS_CODE(cmTargeter.targetInsert(operationContext(), fromjson("{a: [1,2]}")),
+                       DBException,
+                       ErrorCodes::ShardKeyNotFound);
+}
 
-        auto_ptr<CanonicalQuery> query(canonicalize(queryStr));
-        ASSERT(query.get() != NULL);
+TEST_F(ChunkManagerTargeterTest, TargetInsertsWithConstantHashedPrefixAndVaryingRangedSuffix) {
+    // For the purpose of this test, we will keep the hashed field constant to 0 so that we can
+    // correctly test the targeting based on range field.
+    auto hashedValueOfZero = BSONElementHasher::hash64(BSON("" << 0).firstElement(),
+                                                       BSONElementHasher::DEFAULT_HASH_SEED);
+    // Create 5 chunks and 5 shards such that shardId
+    // '0' has chunk [{'a.b': hash(0), 'c.d': MinKey}, {'a.b': hash(0), 'c.d': null}),
+    // '1' has chunk [{'a.b': hash(0), 'c.d': null},   {'a.b': hash(0), 'c.d': -100}),
+    // '2' has chunk [{'a.b': hash(0), 'c.d': -100},   {'a.b': hash(0), 'c.d':  0}),
+    // '3' has chunk [{'a.b': hash(0), 'c.d':0},       {'a.b': hash(0), 'c.d': 100}) and
+    // '4' has chunk [{'a.b': hash(0), 'c.d': 100},    {'a.b': hash(0), 'c.d': MaxKey}).
+    std::vector<BSONObj> splitPoints = {BSON("a.b" << hashedValueOfZero << "c.d" << BSONNULL),
+                                        BSON("a.b" << hashedValueOfZero << "c.d" << -100),
+                                        BSON("a.b" << hashedValueOfZero << "c.d" << 0),
+                                        BSON("a.b" << hashedValueOfZero << "c.d" << 100)};
+    auto cmTargeter = prepare(BSON("a.b"
+                                   << "hashed"
+                                   << "c.d" << 1),
+                              splitPoints);
 
-        BSONObj key = fromjson(keyStr);
+    auto res = cmTargeter.targetInsert(operationContext(), fromjson("{a: {b: 0}, c: {d: -111}}"));
+    ASSERT_EQUALS(res.shardName, "1");
 
-        IndexBounds indexBounds = ChunkManager::getIndexBoundsForQuery(key, query.get());
-        ASSERT_EQUALS(indexBounds.size(), expectedBounds.size());
-        for (size_t i = 0; i < indexBounds.size(); i++) {
-            const OrderedIntervalList& oil = indexBounds.fields[i];
-            const OrderedIntervalList& expectedOil = expectedBounds.fields[i];
-            ASSERT_EQUALS(oil.intervals.size(), expectedOil.intervals.size());
-            for (size_t i = 0; i < oil.intervals.size(); i++) {
-                if (Interval::INTERVAL_EQUALS != oil.intervals[i].compare(expectedOil.intervals[i])) {
-                    log() << oil.intervals[i] << " != " << expectedOil.intervals[i];
-                }
-                ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[i].compare(expectedOil.intervals[i]));
-            }
-        }
+    res = cmTargeter.targetInsert(operationContext(), fromjson("{a: {b: 0}, c: {d: -11}}"));
+    ASSERT_EQUALS(res.shardName, "2");
+
+    res = cmTargeter.targetInsert(operationContext(), fromjson("{a: {b: 0}, c: {d: 0}}"));
+    ASSERT_EQUALS(res.shardName, "3");
+
+    res = cmTargeter.targetInsert(operationContext(), fromjson("{a: {b: 0}, c: {d: 111}}"));
+    ASSERT_EQUALS(res.shardName, "4");
+
+    // Missing field will be treated as null and will be targeted to the chunk which holds null,
+    // which is shard '1'.
+    res = cmTargeter.targetInsert(operationContext(), fromjson("{a: {b: 0}}"));
+    ASSERT_EQUALS(res.shardName, "1");
+
+    res = cmTargeter.targetInsert(operationContext(), fromjson("{a: {b: 0}}, c: 5}"));
+    ASSERT_EQUALS(res.shardName, "1");
+}
+
+TEST_F(ChunkManagerTargeterTest, TargetUpdateWithRangePrefixHashedShardKey) {
+    // Create 5 chunks and 5 shards such that shardId '0' has chunk [MinKey, null), '1' has chunk
+    // [null, -100), '2' has chunk [-100, 0), '3' has chunk ['0', 100) and '4' has chunk
+    // [100, MaxKey).
+    std::vector<BSONObj> splitPoints = {
+        BSON("a.b" << BSONNULL), BSON("a.b" << -100LL), BSON("a.b" << 0LL), BSON("a.b" << 100LL)};
+    auto cmTargeter = prepare(BSON("a.b" << 1 << "c.d"
+                                         << "hashed"),
+                              splitPoints);
+
+    // When update targets using replacement object.
+    auto request =
+        buildUpdate(kNss, fromjson("{'a.b': {$gt : 2}}"), fromjson("{a: {b: -1}}"), false);
+    auto res = cmTargeter.targetUpdate(operationContext(), BatchItemRef(&request, 0));
+    ASSERT_EQUALS(res.size(), 1);
+    ASSERT_EQUALS(res[0].shardName, "2");
+
+    // When update targets using query.
+    auto requestAndSet = buildUpdate(kNss,
+                                     fromjson("{$and: [{'a.b': {$gte : 0}}, {'a.b': {$lt: 99}}]}}"),
+                                     fromjson("{$set: {p : 1}}"),
+                                     false);
+    res = cmTargeter.targetUpdate(operationContext(), BatchItemRef(&requestAndSet, 0));
+    ASSERT_EQUALS(res.size(), 1);
+    ASSERT_EQUALS(res[0].shardName, "3");
+
+    auto requestLT =
+        buildUpdate(kNss, fromjson("{'a.b': {$lt : -101}}"), fromjson("{a: {b: 111}}"), false);
+    res = cmTargeter.targetUpdate(operationContext(), BatchItemRef(&requestLT, 0));
+    ASSERT_EQUALS(res.size(), 1);
+    ASSERT_EQUALS(res[0].shardName, "1");
+
+    // For op-style updates, query on _id gets targeted to all shards.
+    auto requestOpUpdate =
+        buildUpdate(kNss, fromjson("{_id: 1}"), fromjson("{$set: {p: 111}}"), false);
+    res = cmTargeter.targetUpdate(operationContext(), BatchItemRef(&requestOpUpdate, 0));
+    ASSERT_EQUALS(res.size(), 5);
+
+    // For replacement style updates, query on _id uses replacement doc to target. If the
+    // replacement doc doesn't have shard key fields, then update should be routed to the shard
+    // holding 'null' shard key documents.
+    auto requestReplUpdate = buildUpdate(kNss, fromjson("{_id: 1}"), fromjson("{p: 111}}"), false);
+    res = cmTargeter.targetUpdate(operationContext(), BatchItemRef(&requestReplUpdate, 0));
+    ASSERT_EQUALS(res.size(), 1);
+    ASSERT_EQUALS(res[0].shardName, "1");
+
+
+    // Upsert requires full shard key in query, even if the query can target a single shard.
+    auto requestFullKey = buildUpdate(kNss,
+                                      fromjson("{'a.b':  100, 'c.d' : {$exists: false}}}"),
+                                      fromjson("{a: {b: -111}}"),
+                                      true);
+    ASSERT_THROWS_CODE(
+        cmTargeter.targetUpdate(operationContext(), BatchItemRef(&requestFullKey, 0)),
+        DBException,
+        ErrorCodes::ShardKeyNotFound);
+
+    // Upsert success case.
+    auto requestSuccess =
+        buildUpdate(kNss, fromjson("{'a.b': 100, 'c.d': 'val'}"), fromjson("{a: {b: -111}}"), true);
+    res = cmTargeter.targetUpdate(operationContext(), BatchItemRef(&requestSuccess, 0));
+    ASSERT_EQUALS(res.size(), 1);
+    ASSERT_EQUALS(res[0].shardName, "4");
+}
+
+TEST_F(ChunkManagerTargeterTest, TargetUpdateWithHashedPrefixHashedShardKey) {
+    auto findChunk = [&](BSONElement elem) {
+        return chunkManager->findIntersectingChunkWithSimpleCollation(
+            BSON("a.b" << BSONElementHasher::hash64(elem, BSONElementHasher::DEFAULT_HASH_SEED)));
+    };
+
+    // Create 4 chunks and 4 shards such that shardId '0' has chunk [MinKey, -2^62), '1' has chunk
+    // [-2^62, 0), '2' has chunk ['0', 2^62) and '3' has chunk [2^62, MaxKey).
+    std::vector<BSONObj> splitPoints = {
+        BSON("a.b" << -(1LL << 62)), BSON("a.b" << 0LL), BSON("a.b" << (1LL << 62))};
+    auto cmTargeter = prepare(BSON("a.b"
+                                   << "hashed"
+                                   << "c.d" << 1),
+                              splitPoints);
+
+    for (int i = 0; i < 1000; i++) {
+        auto updateQueryObj = BSON("a" << BSON("b" << i) << "c" << BSON("d" << 10));
+
+        // Verify that the given document is being routed based on hashed value of 'i' in
+        // 'updateQueryObj'.
+        auto request = buildUpdate(kNss, updateQueryObj, fromjson("{$set: {p: 1}}"), false);
+        const auto res = cmTargeter.targetUpdate(operationContext(), BatchItemRef(&request, 0));
+        ASSERT_EQUALS(res.size(), 1);
+        ASSERT_EQUALS(res[0].shardName, findChunk(updateQueryObj["a"]["b"]).getShardId());
     }
 
-    // Assume shard key is { a: 1 }
-    void checkIndexBounds(const char* queryStr, const OrderedIntervalList& expectedOil) {
-        auto_ptr<CanonicalQuery> query(canonicalize(queryStr));
-        ASSERT(query.get() != NULL);
+    // Range queries on hashed field cannot be used for targeting. In this case, update will be
+    // targeted based on update document.
+    const auto updateObj = fromjson("{a: {b: -1}}");
+    auto requestUpdate = buildUpdate(kNss, fromjson("{'a.b': {$gt : 101}}"), updateObj, false);
+    auto res = cmTargeter.targetUpdate(operationContext(), BatchItemRef(&requestUpdate, 0));
+    ASSERT_EQUALS(res.size(), 1);
+    ASSERT_EQUALS(res[0].shardName, findChunk(updateObj["a"]["b"]).getShardId());
+    auto requestErr =
+        buildUpdate(kNss, fromjson("{'a.b': {$gt : 101}}"), fromjson("{$set: {p: 1}}"), false);
+    ASSERT_THROWS_CODE(cmTargeter.targetUpdate(operationContext(), BatchItemRef(&requestErr, 0)),
+                       DBException,
+                       ErrorCodes::InvalidOptions);
+}
 
-        BSONObj key = fromjson("{a: 1}");
+TEST_F(ChunkManagerTargeterTest, TargetDeleteWithRangePrefixHashedShardKey) {
+    // Create 5 chunks and 5 shards such that shardId '0' has chunk [MinKey, null), '1' has chunk
+    // [null, -100), '2' has chunk [-100, 0), '3' has chunk ['0', 100) and '4' has chunk
+    // [100, MaxKey).
+    std::vector<BSONObj> splitPoints = {
+        BSON("a.b" << BSONNULL), BSON("a.b" << -100LL), BSON("a.b" << 0LL), BSON("a.b" << 100LL)};
+    auto cmTargeter = prepare(BSON("a.b" << 1 << "c.d"
+                                         << "hashed"),
+                              splitPoints);
 
-        IndexBounds indexBounds = ChunkManager::getIndexBoundsForQuery(key, query.get());
-        ASSERT_EQUALS(indexBounds.size(), 1U);
-        const OrderedIntervalList& oil = indexBounds.fields.front();
+    // Cannot delete without full shardkey in the query.
+    auto requestPartialKey = buildDelete(kNss, fromjson("{'a.b': {$gt : 2}}"));
+    ASSERT_THROWS_CODE(
+        cmTargeter.targetDelete(operationContext(), BatchItemRef(&requestPartialKey, 0)),
+        DBException,
+        ErrorCodes::ShardKeyNotFound);
 
-        if (oil.intervals.size() != expectedOil.intervals.size()) {
-            for (size_t i = 0; i < oil.intervals.size(); i++) {
-                log() << oil.intervals[i];
-            }
-        }
+    auto requestPartialKey2 = buildDelete(kNss, fromjson("{'a.b': -101}"));
+    ASSERT_THROWS_CODE(
+        cmTargeter.targetDelete(operationContext(), BatchItemRef(&requestPartialKey2, 0)),
+        DBException,
+        ErrorCodes::ShardKeyNotFound);
 
-        ASSERT_EQUALS(oil.intervals.size(), expectedOil.intervals.size());
-        for (size_t i = 0; i < oil.intervals.size(); i++) {
-            ASSERT_EQUALS(Interval::INTERVAL_EQUALS, oil.intervals[i].compare(expectedOil.intervals[i]));
-        }
+    // Delete targeted correctly with full shard key in query.
+    auto requestFullKey = buildDelete(kNss, fromjson("{'a.b': -101, 'c.d': 5}"));
+    auto res = cmTargeter.targetDelete(operationContext(), BatchItemRef(&requestFullKey, 0));
+    ASSERT_EQUALS(res.size(), 1);
+    ASSERT_EQUALS(res[0].shardName, "1");
+
+    // Query with MinKey value should go to chunk '0' because MinKey is smaller than BSONNULL.
+    auto requestMinKey =
+        buildDelete(kNss, BSONObjBuilder().appendMinKey("a.b").append("c.d", 4).obj());
+    res = cmTargeter.targetDelete(operationContext(), BatchItemRef(&requestMinKey, 0));
+    ASSERT_EQUALS(res.size(), 1);
+    ASSERT_EQUALS(res[0].shardName, "0");
+
+    auto requestMinKey2 = buildDelete(kNss, fromjson("{'a.b':  0, 'c.d': 5}"));
+    res = cmTargeter.targetDelete(operationContext(), BatchItemRef(&requestMinKey2, 0));
+    ASSERT_EQUALS(res.size(), 1);
+    ASSERT_EQUALS(res[0].shardName, "3");
+}
+
+TEST_F(ChunkManagerTargeterTest, TargetDeleteWithHashedPrefixHashedShardKey) {
+    auto findChunk = [&](BSONElement elem) {
+        return chunkManager->findIntersectingChunkWithSimpleCollation(
+            BSON("a.b" << BSONElementHasher::hash64(elem, BSONElementHasher::DEFAULT_HASH_SEED)));
+    };
+
+    // Create 4 chunks and 4 shards such that shardId '0' has chunk [MinKey, -2^62), '1' has chunk
+    // [-2^62, 0), '2' has chunk ['0', 2^62) and '3' has chunk [2^62, MaxKey).
+    std::vector<BSONObj> splitPoints = {
+        BSON("a.b" << -(1LL << 62)), BSON("a.b" << 0LL), BSON("a.b" << (1LL << 62))};
+    auto cmTargeter = prepare(BSON("a.b"
+                                   << "hashed"
+                                   << "c.d" << 1),
+                              splitPoints);
+
+    for (int i = 0; i < 1000; i++) {
+        auto queryObj = BSON("a" << BSON("b" << i) << "c" << BSON("d" << 10));
+        // Verify that the given document is being routed based on hashed value of 'i' in
+        // 'queryObj'.
+        auto request = buildDelete(kNss, queryObj);
+        const auto res = cmTargeter.targetDelete(operationContext(), BatchItemRef(&request, 0));
+        ASSERT_EQUALS(res.size(), 1);
+        ASSERT_EQUALS(res[0].shardName, findChunk(queryObj["a"]["b"]).getShardId());
     }
 
-    const double INF = std::numeric_limits<double>::infinity();
-
-    // { a: 2 } -> a: [2, 2]
-    TEST(CMCollapseTreeTest, Basic) {
-        OrderedIntervalList expected;
-        expected.intervals.push_back(Interval(BSON("" << 2 << "" << 2), true, true));
-        checkIndexBounds("{a: 2}", expected);
-    }
-
-    // { b: 2 } -> a: [MinKey, MaxKey]
-    TEST(CMCollapseTreeTest, AllValue) {
-        OrderedIntervalList expected;
-        BSONObjBuilder builder;
-        builder.appendMinKey("");
-        builder.appendMaxKey("");
-        expected.intervals.push_back(Interval(builder.obj(), true, true));
-        checkIndexBounds("{b: 2}", expected);
-    }
-
-    // { 'a' : { '$not' : { '$gt' : 1 } } } -> a: [MinKey, 1.0], (inf.0, MaxKey]
-    TEST(CMCollapseTreeTest, NegativeGT) {
-        OrderedIntervalList expected;
-        {
-            BSONObjBuilder builder;
-            builder.appendMinKey("");
-            builder.appendNumber("", 1.0);
-            expected.intervals.push_back(Interval(builder.obj(), true, true));
-        }
-        {
-            BSONObjBuilder builder;
-            builder.append("", std::numeric_limits<double>::infinity());
-            builder.appendMaxKey("");
-            expected.intervals.push_back(Interval(builder.obj(), false, true));
-        }
-        checkIndexBounds("{ 'a' : { '$not' : { '$gt' : 1 } } }", expected);
-    }
-
-    // {$or: [{a: 20}, {$and: [{a:1}, {b:7}]}]} -> a: [1.0, 1.0], [20.0, 20.0]
-    TEST(CMCollapseTreeTest, OrWithAndChild) {
-        OrderedIntervalList expected;
-        expected.intervals.push_back(Interval(BSON("" << 1.0 << "" << 1.0), true, true));
-        expected.intervals.push_back(Interval(BSON("" << 20.0 << "" << 20.0), true, true));
-        checkIndexBounds("{$or: [{a: 20}, {$and: [{a:1}, {b:7}]}]}", expected);
-    }
-
-    // {a:20, $or: [{b:1}, {c:7}]} -> a: [20.0, 20.0]
-    TEST(CMCollapseTreeTest, AndWithUnindexedOrChild) {
-        // Logic rewrite could give a tree with root OR.
-        OrderedIntervalList expected;
-        expected.intervals.push_back(Interval(BSON("" << 20.0 << "" << 20.0), true, true));
-        checkIndexBounds("{a:20, $or: [{b:1}, {c:7}]}", expected);
-    }
-
-    // {$or: [{a:{$gt:2,$lt:10}}, {a:{$gt:0,$lt:5}}]} -> a: (0.0, 10.0)
-    TEST(CMCollapseTreeTest, OrOfAnd) {
-        OrderedIntervalList expected;
-        expected.intervals.push_back(Interval(BSON("" << 0.0 << "" << 10.0), false, false));
-        checkIndexBounds("{$or: [{a:{$gt:2,$lt:10}}, {a:{$gt:0,$lt:5}}]}", expected);
-    }
-
-    // {$or: [{a:{$gt:2,$lt:10}}, {a:{$gt:0,$lt:15}}, {a:{$gt:20}}]}
-    //   -> a: (0.0, 15.0), (20.0, inf.0]
-    TEST(CMCollapseTreeTest, OrOfAnd2) {
-        OrderedIntervalList expected;
-        expected.intervals.push_back(Interval(BSON("" << 0.0 << "" << 15.0), false, false));
-        expected.intervals.push_back(Interval(BSON("" << 20.0 << "" << INF), false, true));
-        checkIndexBounds("{$or: [{a:{$gt:2,$lt:10}}, {a:{$gt:0,$lt:15}}, {a:{$gt:20}}]}", expected);
-    }
-
-    // "{$or: [{a:{$gt:1,$lt:5},b:6}, {a:3,b:{$gt:0,$lt:10}}]}" -> a: (1.0, 5.0)
-    TEST(CMCollapseTreeTest, OrOfAnd3) {
-        OrderedIntervalList expected;
-        expected.intervals.push_back(Interval(BSON("" << 1.0 << "" << 5.0), false, false));
-        checkIndexBounds("{$or: [{a:{$gt:1,$lt:5},b:6}, {a:3,b:{$gt:0,$lt:10}}]}", expected);
-    }
-
-    //
-    //  Compound shard key
-    //
-
-    // "{$or: [{a:{$gt:1,$lt:5}, b:{$gt:0,$lt:3}, c:6}, "
-    //        "{a:3, b:{$gt:1,$lt:2}, c:{$gt:0,$lt:10}}]}",
-    // -> a: (1.0, 5.0), b: (0.0, 3.0)
-    TEST(CMCollapseTreeTest, OrOfAnd4) {
-        IndexBounds expectedBounds;
-        expectedBounds.fields.push_back(OrderedIntervalList());
-        expectedBounds.fields.push_back(OrderedIntervalList());
-
-        expectedBounds.fields[0].intervals.push_back(
-            Interval(BSON("" << 1.0 << "" << 5.0), false, false));
-        expectedBounds.fields[1].intervals.push_back(
-            Interval(BSON("" << 0.0 << "" << 3.0), false, false));
-
-        checkIndexBoundsWithKey(
-            "{a: 1, b: 1}", // shard key
-            "{$or: [{a:{$gt:1,$lt:5}, b:{$gt:0,$lt:3}, c:6}, "
-                   "{a:3, b:{$gt:1,$lt:2}, c:{$gt:0,$lt:10}}]}",
-            expectedBounds);
-    }
-
-    // "{$or: [{a:{$gt:1,$lt:5}, c:6}, "
-    //        "{a:3, b:{$gt:1,$lt:2}, c:{$gt:0,$lt:10}}]}"));
-    // ->
-    TEST(CMCollapseTreeTest, OrOfAnd5) {
-        IndexBounds expectedBounds;
-        expectedBounds.fields.push_back(OrderedIntervalList());
-        expectedBounds.fields.push_back(OrderedIntervalList());
-
-        expectedBounds.fields[0].intervals.push_back(
-            Interval(BSON("" << 1.0 << "" << 5.0), false, false));
-        BSONObjBuilder builder;
-        builder.appendMinKey("");
-        builder.appendMaxKey("");
-        expectedBounds.fields[1].intervals.push_back(
-            Interval(builder.obj(), true, true));
-
-        checkIndexBoundsWithKey(
-            "{a: 1, b: 1}", // shard key
-            "{$or: [{a:{$gt:1,$lt:5}, c:6}, "
-                   "{a:3, b:{$gt:1,$lt:2}, c:{$gt:0,$lt:10}}]}",
-            expectedBounds);
-    }
-
-    // {$or: [{a:{$in:[1]},b:{$in:[1]}}, {a:{$in:[1,5]},b:{$in:[1,5]}}]}
-    // -> a: [1], [5]; b: [1], [5]
-    TEST(CMCollapseTreeTest, OrOfAnd6) {
-        IndexBounds expectedBounds;
-        expectedBounds.fields.push_back(OrderedIntervalList());
-        expectedBounds.fields.push_back(OrderedIntervalList());
-
-        // a: [1], [5]
-        expectedBounds.fields[0].intervals.push_back(
-            Interval(BSON("" << 1.0 << "" << 1.0), true, true));
-        expectedBounds.fields[0].intervals.push_back(
-            Interval(BSON("" << 5.0 << "" << 5.0), true, true));
-
-        // b: [1], [5]
-        expectedBounds.fields[1].intervals.push_back(
-            Interval(BSON("" << 1.0 << "" << 1.0), true, true));
-        expectedBounds.fields[1].intervals.push_back(
-            Interval(BSON("" << 5.0 << "" << 5.0), true, true));
-
-        checkIndexBoundsWithKey(
-            "{a: 1, b: 1}", // shard key
-            "{$or: [{a:{$in:[1]},b:{$in:[1]}}, {a:{$in:[1,5]},b:{$in:[1,5]}}]}",
-            expectedBounds);
-    }
-
-    //
-    // Array operators
-    //
-
-    // {a : {$elemMatch: {b:1}}} -> a.b: [MinKey, MaxKey]
-    // Shard key doesn't allow multikey, but query on array should succeed without error.
-    TEST(CMCollapseTreeTest, ElemMatchOneField) {
-        IndexBounds expectedBounds;
-        expectedBounds.fields.push_back(OrderedIntervalList());
-        OrderedIntervalList& oil = expectedBounds.fields.front();
-        oil.intervals.push_back(Interval(BSON("" << 1 << "" << 1), true, true));
-        checkIndexBoundsWithKey("{'a.b': 1}", "{a : {$elemMatch: {b:1}}}", expectedBounds);
-    }
-
-    // {foo: {$all: [ {$elemMatch: {a:1, b:1}}, {$elemMatch: {a:2, b:2}}]}}
-    //    -> foo.a: [1, 1]
-    // Or -> foo.a: [2, 2]
-    TEST(CMCollapseTreeTest, BasicAllElemMatch) {
-        Interval expectedInterval(BSON("" << 1 << "" << 1), true, true);
-
-        const char* queryStr = "{foo: {$all: [ {$elemMatch: {a:1, b:1}} ]}}";
-        auto_ptr<CanonicalQuery> query(canonicalize(queryStr));
-        ASSERT(query.get() != NULL);
-
-        BSONObj key = fromjson("{'foo.a': 1}");
-
-        IndexBounds indexBounds = ChunkManager::getIndexBoundsForQuery(key, query.get());
-        ASSERT_EQUALS(indexBounds.size(), 1U);
-        const OrderedIntervalList& oil = indexBounds.fields.front();
-        ASSERT_EQUALS(oil.intervals.size(), 1U);
-        const Interval& interval = oil.intervals.front();
-
-        // Choose one of the two possible solutions.
-        // Two solutions differ only by assignment of index tags.
-        ASSERT(Interval::INTERVAL_EQUALS == interval.compare(expectedInterval));
-    }
-
-    // {a : [1, 2, 3]} -> a: [1, 1], [[1, 2, 3], [1, 2, 3]]
-    TEST(CMCollapseTreeTest, ArrayEquality) {
-        OrderedIntervalList expected;
-        expected.intervals.push_back(Interval(BSON("" << 1 << "" << 1),  true, true));
-        BSONArray array(BSON_ARRAY(1 << 2 << 3));
-
-        Interval interval(BSON("" << array << "" << array),  true, true);
-        expected.intervals.push_back(interval);
-        checkIndexBounds("{a : [1, 2, 3]}", expected);
-    }
-
-
-    //
-    //  Features: Regex, $where, $text, hashed key
-    //
-
-    // { a: /abc/ } -> a: ["", {}), [/abc/, /abc/]
-    TEST(CMCollapseTreeTest, Regex) {
-        OrderedIntervalList expected;
-        expected.intervals.push_back(
-            Interval(BSON("" << "" << "" << BSONObj()), true, false));
-        BSONObjBuilder builder;
-        builder.appendRegex("", "abc");
-        builder.appendRegex("", "abc");
-        expected.intervals.push_back(Interval(builder.obj(), true, true));
-        checkIndexBounds("{ a: /abc/ }", expected);
-    }
-
-    // {$where: 'this.credits == this.debits' }
-    TEST(CMCollapseTreeTest, Where) {
-        OrderedIntervalList expected;
-        BSONObjBuilder builder;
-        builder.appendMinKey("");
-        builder.appendMaxKey("");
-        expected.intervals.push_back(Interval(builder.obj(), true, true));
-        checkIndexBounds("{$where: 'this.credits == this.debits' }", expected);
-    }
-
-    // { $text: { $search: "coffee -cake" } }
-    TEST(CMCollapseTreeTest, Text) {
-        OrderedIntervalList expected;
-        BSONObjBuilder builder;
-        builder.appendMinKey("");
-        builder.appendMaxKey("");
-        expected.intervals.push_back(Interval(builder.obj(), true, true));
-        checkIndexBounds("{ $text: { $search: 'coffee -cake' } }", expected);
-    }
-
-    // { a: 2, $text: { $search: "leche", $language: "es" } }
-    TEST(CMCollapseTreeTest, TextWithQuery) {
-        OrderedIntervalList expected;
-        BSONObjBuilder builder;
-        builder.appendMinKey("");
-        builder.appendMaxKey("");
-        expected.intervals.push_back(Interval(builder.obj(), true, true));
-        checkIndexBounds("{ a: 2, $text: { $search: 'leche', $language: 'es' } }", expected);
-    }
-
-    //  { a: 0 } -> hashed a: [hash(0), hash(0)]
-    TEST(CMCollapseTreeTest, HashedSinglePoint) {
-        const char* queryStr = "{ a: 0 }";
-        auto_ptr<CanonicalQuery> query(canonicalize(queryStr));
-        ASSERT(query.get() != NULL);
-
-        BSONObj key = fromjson("{a: 'hashed'}");
-
-        IndexBounds indexBounds = ChunkManager::getIndexBoundsForQuery(key, query.get());
-        ASSERT_EQUALS(indexBounds.size(), 1U);
-        const OrderedIntervalList& oil = indexBounds.fields.front();
-        ASSERT_EQUALS(oil.intervals.size(), 1U);
-        const Interval& interval = oil.intervals.front();
-        ASSERT(interval.isPoint());
-    }
-
-    // { a: { $lt: 2, $gt: 1} } -> hashed a: [Minkey, Maxkey]
-    TEST(CMCollapseTreeTest, HashedRange) {
-        IndexBounds expectedBounds;
-        expectedBounds.fields.push_back(OrderedIntervalList());
-        OrderedIntervalList& expectedOil = expectedBounds.fields.front();
-        BSONObjBuilder builder;
-        builder.appendMinKey("");
-        builder.appendMaxKey("");
-        expectedOil.intervals.push_back(Interval(builder.obj(), true, true));
-        checkIndexBoundsWithKey("{a: 'hashed'}", "{ a: { $lt: 2, $gt: 1} }", expectedBounds);
-    }
-
-    // { a: /abc/ } -> hashed a: [Minkey, Maxkey]
-    TEST(CMCollapseTreeTest, HashedRegex) {
-        IndexBounds expectedBounds;
-        expectedBounds.fields.push_back(OrderedIntervalList());
-        OrderedIntervalList& expectedOil = expectedBounds.fields.front();
-        BSONObjBuilder builder;
-        builder.appendMinKey("");
-        builder.appendMaxKey("");
-        expectedOil.intervals.push_back(Interval(builder.obj(), true, true));
-
-        checkIndexBoundsWithKey("{a: 'hashed'}", "{ a: /abc/ }", expectedBounds);
-    }
-
-    /**
-     * KeyPattern key bounds generation test
-     */
-
-    void CheckBoundList(const BoundList& list, const BoundList& expected) {
-        ASSERT_EQUALS(list.size(), expected.size());
-        for (size_t i = 0; i < list.size(); i++) {
-            ASSERT_EQUALS(list[i].first.woCompare(expected[i].first), 0);
-            ASSERT_EQUALS(list[i].second.woCompare(expected[i].second), 0);
-        }
-    }
-
-    // Key { a: 1 }, Bounds a: [0]
-    //  => { a: 0 } -> { a: 0 }
-    TEST(CMKeyBoundsTest, Basic) {
-        IndexBounds indexBounds;
-        indexBounds.fields.push_back(OrderedIntervalList());
-        indexBounds.fields.front().intervals.push_back(
-            Interval(BSON("" << 0 << "" << 0), true, true));
-
-        BoundList expectedList;
-        expectedList.push_back(make_pair(fromjson("{a: 0}"), fromjson("{a: 0}")));
-
-        ShardKeyPattern skeyPattern(fromjson("{a: 1}"));
-        BoundList list = skeyPattern.flattenBounds(indexBounds);
-        CheckBoundList(list, expectedList);
-    }
-
-    // Key { a: 1 }, Bounds a: [2, 3)
-    //  => { a: 2 } -> { a: 3 }  // bound inclusion is ignored.
-    TEST(CMKeyBoundsTest, SingleInterval) {
-        IndexBounds indexBounds;
-        indexBounds.fields.push_back(OrderedIntervalList());
-        indexBounds.fields.front().intervals.push_back(
-            Interval(BSON("" << 2 << "" << 3), true, false));
-
-        BoundList expectedList;
-        expectedList.push_back(make_pair(fromjson("{a: 2}"), fromjson("{a: 3}")));
-
-        ShardKeyPattern skeyPattern(fromjson("{a: 1}"));
-        BoundList list = skeyPattern.flattenBounds(indexBounds);
-        CheckBoundList(list, expectedList);
-    }
-
-    // Key { a: 1, b: 1, c: 1 }, Bounds a: [2, 3), b: [2, 3), c: [2: 3)
-    //  => { a: 2, b: 2, c: 2 } -> { a: 3, b: 3, c: 3 }
-    TEST(CMKeyBoundsTest, MultiIntervals) {
-        IndexBounds indexBounds;
-        indexBounds.fields.push_back(OrderedIntervalList());
-        indexBounds.fields.push_back(OrderedIntervalList());
-        indexBounds.fields.push_back(OrderedIntervalList());
-        indexBounds.fields[0].intervals.push_back(
-            Interval(BSON("" << 2 << "" << 3), true, false));
-        indexBounds.fields[1].intervals.push_back(
-            Interval(BSON("" << 2 << "" << 3), true, false));
-        indexBounds.fields[2].intervals.push_back(
-            Interval(BSON("" << 2 << "" << 3), true, false));
-
-        BoundList expectedList;
-        expectedList.push_back(make_pair(
-            fromjson("{ a: 2, b: 2, c: 2 }"),
-            fromjson("{ a: 3, b: 3, c: 3 }")));
-
-        ShardKeyPattern skeyPattern(fromjson("{a: 1, b: 1, c: 1}"));
-        BoundList list = skeyPattern.flattenBounds(indexBounds);
-        CheckBoundList(list, expectedList);
-    }
-
-    // Key { a: 1, b: 1, c: 1 }, Bounds a: [0, 0], b: { $in: [4, 5, 6] }, c: [2: 3)
-    //  => { a: 0, b: 4, c: 2 } -> { a: 0, b: 4, c: 3 }
-    //     { a: 0, b: 5, c: 2 } -> { a: 0, b: 5, c: 3 }
-    //     { a: 0, b: 6, c: 2 } -> { a: 0, b: 6, c: 3 }
-    TEST(CMKeyBoundsTest, IntervalExpansion) {
-        IndexBounds indexBounds;
-        indexBounds.fields.push_back(OrderedIntervalList());
-        indexBounds.fields.push_back(OrderedIntervalList());
-        indexBounds.fields.push_back(OrderedIntervalList());
-
-        indexBounds.fields[0].intervals.push_back(
-            Interval(BSON("" << 0 << "" << 0), true, true));
-
-        indexBounds.fields[1].intervals.push_back(
-            Interval(BSON("" << 4 << "" << 4), true, true));
-        indexBounds.fields[1].intervals.push_back(
-            Interval(BSON("" << 5 << "" << 5), true, true));
-        indexBounds.fields[1].intervals.push_back(
-            Interval(BSON("" << 6 << "" << 6), true, true));
-
-        indexBounds.fields[2].intervals.push_back(
-            Interval(BSON("" << 2 << "" << 3), true, false));
-
-        BoundList expectedList;
-        expectedList.push_back(make_pair(
-            fromjson("{ a: 0, b: 4, c: 2 }"),
-            fromjson("{ a: 0, b: 4, c: 3 }")));
-        expectedList.push_back(make_pair(
-            fromjson("{ a: 0, b: 5, c: 2 }"),
-            fromjson("{ a: 0, b: 5, c: 3 }")));
-        expectedList.push_back(make_pair(
-            fromjson("{ a: 0, b: 6, c: 2 }"),
-            fromjson("{ a: 0, b: 6, c: 3 }")));
-
-        ShardKeyPattern skeyPattern(fromjson("{a: 1, b: 1, c: 1}"));
-        BoundList list = skeyPattern.flattenBounds(indexBounds);
-        CheckBoundList(list, expectedList);
-    }
-
-    // Key { a: 1, b: 1, c: 1 }, Bounds a: [0, 1], b: { $in: [4, 5, 6] }, c: [2: 3)
-    //  => { a: 0, b: 4, c: 2 } -> { a: 1, b: 6, c: 3 }
-    // Since field "a" is not a point, expasion after "a" is not allowed.
-    TEST(CMKeyBoundsTest, NonPointIntervalExpasion) {
-        IndexBounds indexBounds;
-        indexBounds.fields.push_back(OrderedIntervalList());
-        indexBounds.fields.push_back(OrderedIntervalList());
-        indexBounds.fields.push_back(OrderedIntervalList());
-
-        indexBounds.fields[0].intervals.push_back(
-            Interval(BSON("" << 0 << "" << 1), true, true));
-
-        indexBounds.fields[1].intervals.push_back(
-            Interval(BSON("" << 4 << "" << 4), true, true));
-        indexBounds.fields[1].intervals.push_back(
-            Interval(BSON("" << 5 << "" << 5), true, true));
-        indexBounds.fields[1].intervals.push_back(
-            Interval(BSON("" << 6 << "" << 6), true, true));
-
-        indexBounds.fields[2].intervals.push_back(
-            Interval(BSON("" << 2 << "" << 3), true, false));
-
-        BoundList expectedList;
-        expectedList.push_back(make_pair(
-            fromjson("{ a: 0, b: 4, c: 2 }"),
-            fromjson("{ a: 1, b: 6, c: 3 }")));
-
-        ShardKeyPattern skeyPattern(fromjson("{a: 1, b: 1, c: 1}"));
-        BoundList list = skeyPattern.flattenBounds(indexBounds);
-        CheckBoundList(list, expectedList);
-    }
-
-} // namespace
+    // Range queries on hashed field cannot be used for targeting.
+    auto request = buildDelete(kNss, fromjson("{'a.b': {$gt : 101}}"));
+    ASSERT_THROWS_CODE(cmTargeter.targetDelete(operationContext(), BatchItemRef(&request, 0)),
+                       DBException,
+                       ErrorCodes::ShardKeyNotFound);
+}
+
+}  // namespace
+}  // namespace mongo

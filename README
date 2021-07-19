@@ -1,25 +1,34 @@
-MongoDB README
+PERCONA SERVER FOR MONGODB README
 
-Welcome to MongoDB!
+Welcome to Percona Server for MongoDB!
+
+Percona Server for MongoDB is a free, enhanced, fully compatible, open source, drop-in replacement for MongoDB Community Edition with enterprise-grade features. It requires no changes to MongoDB applications or code.
 
 COMPONENTS
 
-  mongod - The database process.
-  mongos - Sharding controller.
-  mongo  - The database shell (uses interactive javascript).
+  - mongod - The database server.
+  - mongos - Sharding router.
+  - mongo  - The database shell (uses interactive javascript).
+  - tools
+    - bsondump
+    - mongodump
+    - mongorestore
+    - mongoexport
+    - mongostat
+    - perconadecrypt
 
-UTILITIES
+DOCUMENTATION
 
-  mongodump         - MongoDB dump tool - for backups, snapshots, etc.
-  mongorestore      - MongoDB restore a dump
-  mongoexport       - Export a single collection to test (JSON, CSV)
-  mongoimport       - Import from JSON or CSV
-  mongofiles        - Utility for putting and getting files from MongoDB GridFS
-  mongostat         - Show performance statistics
+- Percona Server for MongoDB Documentation
+     https://www.percona.com/doc/percona-server-for-mongodb/LATEST/index.html
 
-BUILDING
+- MongoDB Manual
+     https://docs.mongodb.com/manual/
 
-  See docs/building.md, also www.mongodb.org search for "Building".
+INSTALLATION
+
+   Go to https://www.percona.com/doc/percona-server-for-mongodb/LATEST/install/index.html and navigate to the required installation instructions.
+
 
 RUNNING
 
@@ -29,51 +38,49 @@ RUNNING
 
   To run a single server database:
 
-    $ mkdir /data/db
+    $ sudo mkdir -p /data/db
     $ ./mongod
     $
     $ # The mongo javascript shell connects to localhost and test database by default:
-    $ ./mongo 
+    $ ./mongo
     > help
 
 DRIVERS
 
-  Client drivers for most programming languages are available at mongodb.org.  Use the 
-  shell ("mongo") for administrative tasks.
+  Client drivers for most programming languages are available at
+  https://docs.mongodb.com/manual/applications/drivers/. Use the shell
+  ("mongo") for administrative tasks.
 
 PACKAGING
 
-  Packages are created dynamically by the package.py script located in the buildscripts directory. This will 
-  generate RPM and Debian packages.
+  Packages for Percona Server for MongoDB are created by Percona team and are available at Percona website: 
+    https://www.percona.com/downloads/percona-server-mongodb-LATEST/.
 
-DOCUMENTATION
+COMMUNITY
 
-  http://www.mongodb.org/
- 
-CLOUD MANAGED MONGODB
+ Find answers to MongoDB-related questions on Percona Server for MongoDB Forum: 
+    https://forums.percona.com/categories/percona-server-for-mongodb.
 
-  http://mms.mongodb.com/
+ Get insights about MongoDB from experts in the industry on Percona Database Performance Blog:
+    https://www.percona.com/blog/category/mongodb/.
 
-MAIL LISTS AND IRC
+SUBMITTING BUG REPORTS OR FEATURE REQUESTS
 
-  http://dochub.mongodb.org/core/community
-  
-LEARN MONGODB
+If you find a bug in Percona Server for MongoDB, you can submit a report to the Percona JIRA for Percona Server for MongoDB:
+    https://jira.percona.com/projects/PSMDB
 
-  http://university.mongodb.com/
+Start by searching the open tickets in Percona's JIRA (https://jira.percona.com/projects/PSMDB) or MongoDB's Jira (https://jira.mongodb.org/) for a similar report. If you find that someone else has already reported your problem, then you can upvote that report to increase its visibility.
 
-32 BIT BUILD NOTES
+If there is no existing report, submit a report following these steps:
 
-  MongoDB uses memory mapped files.  If built as a 32 bit executable, you will
-  not be able to work with large (multi-gigabyte) databases.  However, 32 bit
-  builds work fine with small development databases.
+1. Sign in to JIRA issue tracker. You will need to create an account if you do not have one.
+2. In the Summary, Description, Steps To Reproduce, Affects Version fields describe the problem you have detected.
+3. As a general rule of thumb, try to create bug reports that are:
+    * Reproducible: describe the steps to reproduce the problem.
+    * Specific: include the version of Percona Server for MongoDB, your environment, and so on.
+    * Unique: check if there already exists a JIRA ticket to describe the problem.
+    * Scoped to a Single Bug: only report one bug in one JIRA ticket.
 
 LICENSE
 
-  Most MongoDB source files (src/mongo folder and below) are made available under the terms of the
-  GNU Affero General Public License (AGPL).  See individual files for
-  details.
-
-  As an exception, the files in the client/, debian/, rpm/,
-  utils/mongoutils, and all subdirectories thereof are made available under
-  the terms of the Apache License, version 2.0.
+   Percona Server for MongoDB is source-available software.

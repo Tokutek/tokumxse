@@ -1,951 +1,709 @@
-//@file indexupdatetests.cpp : mongo/db/index_update.{h,cpp} tests
-
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#include <boost/scoped_ptr.hpp>
+#include "mongo/platform/basic.h"
+
+#include <cstdint>
 
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/index_catalog.h"
-#include "mongo/db/catalog/index_create.h"
+#include "mongo/db/catalog/multi_index_block.h"
+#include "mongo/db/catalog/uncommitted_collections.h"
+#include "mongo/db/catalog_raii.h"
+#include "mongo/db/client.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
-#include "mongo/db/dbhelpers.h"
-#include "mongo/db/global_environment_d.h"
-#include "mongo/db/global_environment_experiment.h"
 #include "mongo/db/index/index_descriptor.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/storage_engine_init.h"
 #include "mongo/dbtests/dbtests.h"
-#include "mongo/platform/cstdint.h"
 
 namespace IndexUpdateTests {
 
-    using boost::scoped_ptr;
+namespace {
+const auto kIndexVersion = IndexDescriptor::IndexVersion::kV2;
+}  // namespace
 
-    static const char* const _ns = "unittests.indexupdate";
+static const char* const _ns = "unittests.indexupdate";
+static const NamespaceString _nss = NamespaceString(_ns);
 
-    /**
-     * Test fixture for a write locked test using collection _ns.  Includes functionality to
-     * partially construct a new IndexDetails in a manner that supports proper cleanup in
-     * dropCollection().
-     */
-    class IndexBuildBase {
-    public:
-        IndexBuildBase() :
-            _ctx(&_txn, _ns),
-            _client(&_txn) {
+/**
+ * Test fixture for a write locked test using collection _ns.  Includes functionality to
+ * partially construct a new IndexDetails in a manner that supports proper cleanup in
+ * dropcollection().get().
+ */
+class IndexBuildBase {
+public:
+    IndexBuildBase() {
+        regenOpCtx();
 
-            _client.createCollection( _ns );
-        }
-        ~IndexBuildBase() {
-            _client.dropCollection( _ns );
-            getGlobalEnvironment()->unsetKillAllOperations();
-        }
-        Collection* collection() {
-            return _ctx.getCollection();
-        }
-    protected:
-    // QUERY_MIGRATION
-#if 0
-        /** @return IndexDetails for a new index on a:1, with the info field populated. */
-        IndexDescriptor* addIndexWithInfo() {
-            BSONObj indexInfo = BSON( "v" << 1 <<
-                                      "key" << BSON( "a" << 1 ) <<
-                                      "ns" << _ns <<
-                                      "name" << "a_1" );
-            int32_t lenWHdr = indexInfo.objsize() + Record::HeaderSize;
-            const char* systemIndexes = "unittests.system.indexes";
-            RecordId infoLoc = allocateSpaceForANewRecord( systemIndexes,
-                                                          nsdetails( systemIndexes ),
-                                                          lenWHdr,
-                                                          false );
-            Record* infoRecord = reinterpret_cast<Record*>( getDur().writingPtr( infoLoc.rec(),
-                                                                                 lenWHdr ) );
-            memcpy( infoRecord->data(), indexInfo.objdata(), indexInfo.objsize() );
-            addRecordToRecListInExtent( infoRecord, infoLoc );
-
-            IndexCatalog::IndexBuildBlock blk( collection()->getIndexCatalog(), "a_1", infoLoc );
-            blk.success();
-
-            return collection()->getIndexCatalog()->findIndexByName( "a_1" );
-        }
-#endif
-
-        Status createIndex(const std::string& dbname, const BSONObj& indexSpec);
-
-        bool buildIndexInterrupted(const BSONObj& key, bool allowInterruption) {
-            try {
-                MultiIndexBlock indexer(&_txn, collection());
-                if (allowInterruption)
-                    indexer.allowInterruption();
-
-                uassertStatusOK(indexer.init(key));
-                uassertStatusOK(indexer.insertAllDocumentsInCollection());
-                WriteUnitOfWork wunit(&_txn);
-                indexer.commit();
-                wunit.commit();
-            }
-            catch (const DBException& e) {
-                if (ErrorCodes::isInterruption(ErrorCodes::Error(e.getCode())))
-                    return true;
-
-                throw;
-            }
-            return false;
-        }
-
-        OperationContextImpl _txn;
-        OldClientWriteContext _ctx;
-        DBDirectClient _client;
-    };
-
-    /** addKeysToPhaseOne() adds keys from a collection's documents to an external sorter. */
-    // QUERY_MIGRATION
-#if 0
-    class AddKeysToPhaseOne : public IndexBuildBase {
-    public:
-        void run() {
-            // Add some data to the collection.
-            int32_t nDocs = 130;
-            for( int32_t i = 0; i < nDocs; ++i ) {
-                _client.insert( _ns, BSON( "a" << i ) );
-            }
-
-            IndexDescriptor* id = addIndexWithInfo();
-            // Create a SortPhaseOne.
-            SortPhaseOne phaseOne;
-            ProgressMeterHolder pm (txn->setMessage("AddKeysToPhaseOne",
-                                                    "AddKeysToPhaseOne Progress",
-                                                    nDocs,
-                                                    nDocs));
-            // Add keys to phaseOne.
-            BtreeBasedBuilder::addKeysToPhaseOne( collection(),
-                                                  id,
-                                                  BSON( "a" << 1 ),
-                                                  &phaseOne,
-                                                  pm.get(), true );
-            // Keys for all documents were added to phaseOne.
-            ASSERT_EQUALS( static_cast<uint64_t>( nDocs ), phaseOne.n );
-        }
-    };
-
-    /** addKeysToPhaseOne() aborts if the current operation is killed. */
-    class InterruptAddKeysToPhaseOne : public IndexBuildBase {
-    public:
-        InterruptAddKeysToPhaseOne( bool mayInterrupt ) :
-            _mayInterrupt( mayInterrupt ) {
-        }
-        void run() {
-            // It's necessary to index sufficient keys that a RARELY condition will be triggered.
-            int32_t nDocs = 130;
-            // Add some data to the collection.
-            for( int32_t i = 0; i < nDocs; ++i ) {
-                _client.insert( _ns, BSON( "a" << i ) );
-            }
-            IndexDescriptor* id = addIndexWithInfo();
-            // Create a SortPhaseOne.
-            SortPhaseOne phaseOne;
-            ProgressMeterHolder pm (txn->setMessage("InterruptAddKeysToPhaseOne",
-                                                    "InterruptAddKeysToPhaseOne Progress",
-                                                    nDocs,
-                                                    nDocs));
-            // Register a request to kill the current operation.
-            txn.getCurOp()->kill();
-            if ( _mayInterrupt ) {
-                // Add keys to phaseOne.
-                ASSERT_THROWS( BtreeBasedBuilder::addKeysToPhaseOne( collection(),
-                                                                     id,
-                                                                     BSON( "a" << 1 ),
-                                                                     &phaseOne,
-                                                                     pm.get(),
-                                                                     _mayInterrupt ),
-                               UserException );
-                // Not all keys were added to phaseOne due to the interrupt.
-                ASSERT( static_cast<uint64_t>( nDocs ) > phaseOne.n );
-            }
-            else {
-                // Add keys to phaseOne.
-                BtreeBasedBuilder::addKeysToPhaseOne( collection(),
-                                                      id,
-                                                      BSON( "a" << 1 ),
-                                                      &phaseOne,
-                                                      pm.get(),
-                                                      _mayInterrupt );
-                // All keys were added to phaseOne despite to the kill request, because
-                // mayInterrupt == false.
-                ASSERT_EQUALS( static_cast<uint64_t>( nDocs ), phaseOne.n );
-            }
-        }
-    private:
-        bool _mayInterrupt;
-    };
-#endif
-
-    // QUERY_MIGRATION
-#if 0
-    /** buildBottomUpPhases2And3() builds a btree from the keys in an external sorter. */
-    class BuildBottomUp : public IndexBuildBase {
-    public:
-        void run() {
-            IndexDescriptor* id = addIndexWithInfo();
-            // Create a SortPhaseOne.
-            SortPhaseOne phaseOne;
-            phaseOne.sorter.reset( new BSONObjExternalSorter(_aFirstSort));
-            // Add index keys to the phaseOne.
-            int32_t nKeys = 130;
-            for( int32_t i = 0; i < nKeys; ++i ) {
-                phaseOne.sorter->add( BSON( "a" << i ), /* dummy disk loc */ RecordId(), false );
-            }
-            phaseOne.nkeys = phaseOne.n = nKeys;
-            phaseOne.sorter->sort( false );
-            // Set up remaining arguments.
-            set<RecordId> dups;
-            CurOp* op = txn.getCurOp();
-            ProgressMeterHolder pm (op->setMessage("BuildBottomUp",
-                                                   "BuildBottomUp Progress",
-                                                   nKeys,
-                                                   nKeys));
-            pm.finished();
-            Timer timer;
-            // The index's root has not yet been set.
-            ASSERT( id->getHead().isNull() );
-            // Finish building the index.
-            buildBottomUpPhases2And3<V1>( true,
-                                          id,
-                                          *phaseOne.sorter,
-                                          false,
-                                          dups,
-                                          op,
-                                          &phaseOne,
-                                          pm,
-                                          timer,
-                                          true );
-            // The index's root is set after the build is complete.
-            ASSERT( !id->getHead().isNull() );
-            // Create a cursor over the index.
-            scoped_ptr<BtreeCursor> cursor(
-                    BtreeCursor::make( nsdetails( _ns ),
-                                       id->getOnDisk(),
-                                       BSON( "" << -1 ),    // startKey below minimum key.
-                                       BSON( "" << nKeys ), // endKey above maximum key.
-                                       true,                // endKeyInclusive true.
-                                       1                    // direction forward.
-                                       ) );
-            // Check that the keys in the index are the expected ones.
-            int32_t expectedKey = 0;
-            for( ; cursor->ok(); cursor->advance(), ++expectedKey ) {
-                ASSERT_EQUALS( expectedKey, cursor->currKey().firstElement().number() );
-            }
-            ASSERT_EQUALS( nKeys, expectedKey );
-        }
-    };
-#endif
-
-    // QUERY_MIGRATION
-#if 0
-    /** buildBottomUpPhases2And3() aborts if the current operation is interrupted. */
-    class InterruptBuildBottomUp : public IndexBuildBase {
-    public:
-        InterruptBuildBottomUp( bool mayInterrupt ) :
-            _mayInterrupt( mayInterrupt ) {
-        }
-        void run() {
-            IndexDescriptor* id = addIndexWithInfo();
-            // Create a SortPhaseOne.
-            SortPhaseOne phaseOne;
-            phaseOne.sorter.reset(new BSONObjExternalSorter(_aFirstSort));
-            // It's necessary to index sufficient keys that a RARELY condition will be triggered,
-            // but few enough keys that the btree builder will not create an internal node and check
-            // for an interrupt internally (which would cause this test to pass spuriously).
-            int32_t nKeys = 130;
-            // Add index keys to the phaseOne.
-            for( int32_t i = 0; i < nKeys; ++i ) {
-                phaseOne.sorter->add( BSON( "a" << i ), /* dummy disk loc */ RecordId(), false );
-            }
-            phaseOne.nkeys = phaseOne.n = nKeys;
-            phaseOne.sorter->sort( false );
-            // Set up remaining arguments.
-            set<RecordId> dups;
-            CurOp* op = txn.getCurOp();
-            ProgressMeterHolder pm (op->setMessage("InterruptBuildBottomUp",
-                                                   "InterruptBuildBottomUp Progress",
-                                                   nKeys,
-                                                   nKeys));
-            pm.finished();
-            Timer timer;
-            // The index's root has not yet been set.
-            ASSERT( id->getHead().isNull() );
-            // Register a request to kill the current operation.
-            txn.getCurOp()->kill();
-            if ( _mayInterrupt ) {
-                // The build is aborted due to the kill request.
-                ASSERT_THROWS
-                        ( buildBottomUpPhases2And3<V1>( true,
-                                                        id,
-                                                        *phaseOne.sorter,
-                                                        false,
-                                                        dups,
-                                                        op,
-                                                        &phaseOne,
-                                                        pm,
-                                                        timer,
-                                                        _mayInterrupt ),
-                          UserException );
-                // The root of the index is not set because the build did not complete.
-                ASSERT( id->getHead().isNull() );
-            }
-            else {
-                // The build is aborted despite the kill request because mayInterrupt == false.
-                buildBottomUpPhases2And3<V1>( true,
-                                              id,
-                                              *phaseOne.sorter,
-                                              false,
-                                              dups,
-                                              op,
-                                              &phaseOne,
-                                              pm,
-                                              timer,
-                                              _mayInterrupt );
-                // The index's root is set after the build is complete.
-                ASSERT( !id->getHead().isNull() );
-            }
-        }
-    private:
-        bool _mayInterrupt;
-    };
-#endif
-    /** Index creation ignores unique constraints when told to. */
-    template <bool background>
-    class InsertBuildIgnoreUnique : public IndexBuildBase {
-    public:
-        void run() {
-            // Create a new collection.
-            Database* db = _ctx.db();
-            Collection* coll;
-            {
-                WriteUnitOfWork wunit(&_txn);
-                db->dropCollection( &_txn, _ns );
-                coll = db->createCollection( &_txn, _ns );
-
-                coll->insertDocument( &_txn, BSON( "_id" << 1 << "a" << "dup" ), true );
-                coll->insertDocument( &_txn, BSON( "_id" << 2 << "a" << "dup" ), true );
-                wunit.commit();
-            }
-
-            MultiIndexBlock indexer(&_txn, coll);
-            indexer.allowBackgroundBuilding();
-            indexer.allowInterruption();
-            indexer.ignoreUniqueConstraint();
-
-            const BSONObj spec = BSON("name" << "a"
-                                   << "ns" << coll->ns().ns()
-                                   << "key" << BSON("a" << 1)
-                                   << "unique" << true
-                                   << "background" << background);
-
-            ASSERT_OK(indexer.init(spec));
-            ASSERT_OK(indexer.insertAllDocumentsInCollection());
-
-            WriteUnitOfWork wunit(&_txn);
-            indexer.commit();
-            wunit.commit();
-        }
-    };
-
-    /** Index creation enforces unique constraints unless told not to. */
-    template <bool background>
-    class InsertBuildEnforceUnique : public IndexBuildBase {
-    public:
-        void run() {
-            // Create a new collection.
-            Database* db = _ctx.db();
-            Collection* coll;
-            {
-                WriteUnitOfWork wunit(&_txn);
-                db->dropCollection( &_txn, _ns );
-                coll = db->createCollection( &_txn, _ns );
-
-                coll->insertDocument( &_txn, BSON( "_id" << 1 << "a" << "dup" ), true );
-                coll->insertDocument( &_txn, BSON( "_id" << 2 << "a" << "dup" ), true );
-                wunit.commit();
-            }
-
-            MultiIndexBlock indexer(&_txn, coll);
-            indexer.allowBackgroundBuilding();
-            indexer.allowInterruption();
-            // indexer.ignoreUniqueConstraint(); // not calling this
-
-            const BSONObj spec = BSON("name" << "a"
-                                   << "ns" << coll->ns().ns()
-                                   << "key" << BSON("a" << 1)
-                                   << "unique" << true
-                                   << "background" << background);
-
-            ASSERT_OK(indexer.init(spec));
-            const Status status = indexer.insertAllDocumentsInCollection();
-            ASSERT_EQUALS(status.code(), ErrorCodes::DuplicateKey);
-        }
-    };
-
-    /** Index creation fills a passed-in set of dups rather than failing. */
-    template <bool background>
-    class InsertBuildFillDups : public IndexBuildBase {
-    public:
-        void run() {
-            // Create a new collection.
-            Database* db = _ctx.db();
-            Collection* coll;
-            RecordId loc1;
-            RecordId loc2;
-            {
-                WriteUnitOfWork wunit(&_txn);
-                db->dropCollection( &_txn, _ns );
-                coll = db->createCollection( &_txn, _ns );
-
-                StatusWith<RecordId> swLoc1 = coll->insertDocument(&_txn,
-                                                                BSON("_id" << 1 << "a" << "dup"),
-                                                                true);
-                StatusWith<RecordId> swLoc2 = coll->insertDocument(&_txn,
-                                                                BSON("_id" << 2 << "a" << "dup"),
-                                                                true);
-                ASSERT_OK(swLoc1.getStatus());
-                ASSERT_OK(swLoc2.getStatus());
-                loc1 = swLoc1.getValue();
-                loc2 = swLoc2.getValue();
-                wunit.commit();
-            }
-
-            MultiIndexBlock indexer(&_txn, coll);
-            indexer.allowBackgroundBuilding();
-            indexer.allowInterruption();
-            // indexer.ignoreUniqueConstraint(); // not calling this
-
-            const BSONObj spec = BSON("name" << "a"
-                                   << "ns" << coll->ns().ns()
-                                   << "key" << BSON("a" << 1)
-                                   << "unique" << true
-                                   << "background" << background);
-
-            ASSERT_OK(indexer.init(spec));
-
-            std::set<RecordId> dups;
-            ASSERT_OK(indexer.insertAllDocumentsInCollection(&dups));
-
-            // either loc1 or loc2 should be in dups but not both.
-            ASSERT_EQUALS(dups.size(), 1U);
-            ASSERT(dups.count(loc1) || dups.count(loc2));
-        }
-    };
-
-    /** Index creation is killed if mayInterrupt is true. */
-    class InsertBuildIndexInterrupt : public IndexBuildBase {
-    public:
-        void run() {
-            // Create a new collection.
-            Database* db = _ctx.db();
-            Collection* coll;
-            {
-                WriteUnitOfWork wunit(&_txn);
-                db->dropCollection( &_txn, _ns );
-                coll = db->createCollection( &_txn, _ns );
-                // Drop all indexes including id index.
-                coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
-                // Insert some documents with enforceQuota=true.
-                int32_t nDocs = 1000;
-                for( int32_t i = 0; i < nDocs; ++i ) {
-                    coll->insertDocument( &_txn, BSON( "a" << i ), true );
-                }
-                wunit.commit();
-            }
-            // Initialize curop.
-            _txn.getCurOp()->reset();
-            // Request an interrupt.
-            getGlobalEnvironment()->setKillAllOperations();
-            BSONObj indexInfo = BSON( "key" << BSON( "a" << 1 ) << "ns" << _ns << "name" << "a_1" );
-            // The call is interrupted because mayInterrupt == true.
-            ASSERT_TRUE(buildIndexInterrupted(indexInfo, true));
-            // only want to interrupt the index build
-            getGlobalEnvironment()->unsetKillAllOperations();
-            // The new index is not listed in the index catalog because the index build failed.
-            ASSERT( !coll->getIndexCatalog()->findIndexByName( &_txn, "a_1" ) );
-        }
-    };
-
-    /** Index creation is not killed if mayInterrupt is false. */
-    class InsertBuildIndexInterruptDisallowed : public IndexBuildBase {
-    public:
-        void run() {
-            // Create a new collection.
-            Database* db = _ctx.db();
-            Collection* coll;
-            {
-                WriteUnitOfWork wunit(&_txn);
-                db->dropCollection( &_txn, _ns );
-                coll = db->createCollection( &_txn, _ns );
-                coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
-                // Insert some documents.
-                int32_t nDocs = 1000;
-                for( int32_t i = 0; i < nDocs; ++i ) {
-                    coll->insertDocument( &_txn, BSON( "a" << i ), true );
-                }
-                wunit.commit();
-            }
-            // Initialize curop.
-            _txn.getCurOp()->reset();
-            // Request an interrupt.
-            getGlobalEnvironment()->setKillAllOperations();
-            BSONObj indexInfo = BSON( "key" << BSON( "a" << 1 ) << "ns" << _ns << "name" << "a_1" );
-            // The call is not interrupted because mayInterrupt == false.
-            ASSERT_FALSE(buildIndexInterrupted(indexInfo, false));
-            // only want to interrupt the index build
-            getGlobalEnvironment()->unsetKillAllOperations();
-            // The new index is listed in the index catalog because the index build completed.
-            ASSERT( coll->getIndexCatalog()->findIndexByName( &_txn, "a_1" ) );
-        }
-    };
-
-    /** Index creation is killed when building the _id index. */
-    class InsertBuildIdIndexInterrupt : public IndexBuildBase {
-    public:
-        void run() {
-            // Recreate the collection as capped, without an _id index.
-            Database* db = _ctx.db();
-            Collection* coll;
-            {
-                WriteUnitOfWork wunit(&_txn);
-                db->dropCollection( &_txn, _ns );
-                CollectionOptions options;
-                options.capped = true;
-                options.cappedSize = 10 * 1024;
-                coll = db->createCollection( &_txn, _ns, options );
-                coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
-                // Insert some documents.
-                int32_t nDocs = 1000;
-                for( int32_t i = 0; i < nDocs; ++i ) {
-                    coll->insertDocument( &_txn, BSON( "_id" << i ), true );
-                }
-                wunit.commit();
-            }
-            // Initialize curop.
-            _txn.getCurOp()->reset();
-            // Request an interrupt.
-            getGlobalEnvironment()->setKillAllOperations();
-            BSONObj indexInfo = BSON( "key" << BSON( "_id" << 1 ) <<
-                                      "ns" << _ns <<
-                                      "name" << "_id_" );
-            // The call is interrupted because mayInterrupt == true.
-            ASSERT_TRUE(buildIndexInterrupted(indexInfo, true));
-            // only want to interrupt the index build
-            getGlobalEnvironment()->unsetKillAllOperations();
-            // The new index is not listed in the index catalog because the index build failed.
-            ASSERT( !coll->getIndexCatalog()->findIndexByName( &_txn, "_id_" ) );
-        }
-    };
-
-    /** Index creation is not killed when building the _id index if mayInterrupt is false. */
-    class InsertBuildIdIndexInterruptDisallowed : public IndexBuildBase {
-    public:
-        void run() {
-            // Recreate the collection as capped, without an _id index.
-            Database* db = _ctx.db();
-            Collection* coll;
-            {
-                WriteUnitOfWork wunit(&_txn);
-                db->dropCollection( &_txn, _ns );
-                CollectionOptions options;
-                options.capped = true;
-                options.cappedSize = 10 * 1024;
-                coll = db->createCollection( &_txn, _ns, options );
-                coll->getIndexCatalog()->dropAllIndexes(&_txn, true );
-                // Insert some documents.
-                int32_t nDocs = 1000;
-                for( int32_t i = 0; i < nDocs; ++i ) {
-                    coll->insertDocument( &_txn, BSON( "_id" << i ), true );
-                }
-                wunit.commit();
-            }
-            // Initialize curop.
-            _txn.getCurOp()->reset();
-            // Request an interrupt.
-            getGlobalEnvironment()->setKillAllOperations();
-            BSONObj indexInfo = BSON( "key" << BSON( "_id" << 1 ) <<
-                                      "ns" << _ns <<
-                                      "name" << "_id_" );
-            // The call is not interrupted because mayInterrupt == false.
-            ASSERT_FALSE(buildIndexInterrupted(indexInfo, false));
-            // only want to interrupt the index build
-            getGlobalEnvironment()->unsetKillAllOperations();
-            // The new index is listed in the index catalog because the index build succeeded.
-            ASSERT( coll->getIndexCatalog()->findIndexByName( &_txn, "_id_" ) );
-        }
-    };
-
-    /** Helpers::ensureIndex() is not interrupted. */
-    class HelpersEnsureIndexInterruptDisallowed : public IndexBuildBase {
-    public:
-        void run() {
-            // Insert some documents.
-            int32_t nDocs = 1000;
-            for( int32_t i = 0; i < nDocs; ++i ) {
-                _client.insert( _ns, BSON( "a" << i ) );
-            }
-            // Start with just _id
-            ASSERT_EQUALS( 1U, _client.getIndexSpecs(_ns).size());
-            // Initialize curop.
-            _txn.getCurOp()->reset();
-            // Request an interrupt.
-            getGlobalEnvironment()->setKillAllOperations();
-            // The call is not interrupted.
-            Helpers::ensureIndex( &_txn, collection(), BSON( "a" << 1 ), false, "a_1" );
-            // only want to interrupt the index build
-            getGlobalEnvironment()->unsetKillAllOperations();
-            // The new index is listed in getIndexSpecs because the index build completed.
-            ASSERT_EQUALS( 2U, _client.getIndexSpecs(_ns).size());
-        }
-    };
-    // QUERY_MIGRATION
-#if 0
-    class IndexBuildInProgressTest : public IndexBuildBase {
-    public:
-        void run() {
-
-            NamespaceDetails* nsd = nsdetails( _ns );
-
-            // _id_ is at 0, so nIndexes == 1
-            IndexCatalog::IndexBuildBlock* a = halfAddIndex("a");
-            IndexCatalog::IndexBuildBlock* b = halfAddIndex("b");
-            IndexCatalog::IndexBuildBlock* c = halfAddIndex("c");
-            IndexCatalog::IndexBuildBlock* d = halfAddIndex("d");
-            int offset = nsd->_catalogFindIndexByName( "b_1", true );
-            ASSERT_EQUALS(2, offset);
-
-            delete b;
-
-            ASSERT_EQUALS(2, nsd->_catalogFindIndexByName( "c_1", true ) );
-            ASSERT_EQUALS(3, nsd->_catalogFindIndexByName( "d_1", true ) );
-
-            offset = nsd->_catalogFindIndexByName( "d_1", true );
-            delete d;
-
-            ASSERT_EQUALS(2, nsd->_catalogFindIndexByName( "c_1", true ) );
-            ASSERT( nsd->_catalogFindIndexByName( "d_1", true ) < 0 );
-
-            offset = nsd->_catalogFindIndexByName( "a_1", true );
-            delete a;
-
-            ASSERT_EQUALS(1, nsd->_catalogFindIndexByName( "c_1", true ));
-            delete c;
-        }
-
-    private:
-        IndexCatalog::IndexBuildBlock* halfAddIndex(const std::string& key) {
-            string name = key + "_1";
-            BSONObj indexInfo = BSON( "v" << 1 <<
-                                      "key" << BSON( key << 1 ) <<
-                                      "ns" << _ns <<
-                                      "name" << name );
-            int32_t lenWHdr = indexInfo.objsize() + Record::HeaderSize;
-            const char* systemIndexes = "unittests.system.indexes";
-            RecordId infoLoc = allocateSpaceForANewRecord( systemIndexes,
-                                                          nsdetails( systemIndexes ),
-                                                          lenWHdr,
-                                                          false );
-            Record* infoRecord = reinterpret_cast<Record*>( getDur().writingPtr( infoLoc.rec(),
-                                                                                 lenWHdr ) );
-            memcpy( infoRecord->data(), indexInfo.objdata(), indexInfo.objsize() );
-            addRecordToRecListInExtent( infoRecord, infoLoc );
-
-            return new IndexCatalog::IndexBuildBlock( _ctx.getCollection()->getIndexCatalog(),
-                                                     name,
-                                                     infoLoc );
-        }
-    };
-#endif
-
-    Status IndexBuildBase::createIndex(const std::string& dbname, const BSONObj& indexSpec) {
-        MultiIndexBlock indexer(&_txn, collection());
-        Status status = indexer.init(indexSpec);
-        if (status == ErrorCodes::IndexAlreadyExists) {
-            return Status::OK();
-        }
-        if (!status.isOK()) {
-            return status;
-        }
-        status = indexer.insertAllDocumentsInCollection();
-        if (!status.isOK()) {
-            return status;
-        }
-        WriteUnitOfWork wunit(&_txn);
-        indexer.commit();
-        wunit.commit();
-        return Status::OK();
+        AutoGetCollection autoColl(_opCtx, _nss, LockMode::MODE_IX);
+        WriteUnitOfWork wuow(_opCtx);
+        auto db = autoColl.ensureDbExists();
+        ASSERT(db->createCollection(_opCtx, _nss)) << _nss;
+        wuow.commit();
     }
 
-    /**
-     * Fixture class that has a basic compound index.
-     */
-    class SimpleCompoundIndex: public IndexBuildBase {
-    public:
-        SimpleCompoundIndex() {
-            ASSERT_OK(
-                    createIndex(
-                            "unittest",
-                            BSON("name" << "x"
-                                 << "ns" << _ns
-                                 << "key" << BSON("x" << 1 << "y" << 1))));
+    ~IndexBuildBase() {
+        getGlobalServiceContext()->unsetKillAllOperations();
+
+        AutoGetCollection autoColl(_opCtx, _nss, LockMode::MODE_X);
+        WriteUnitOfWork wuow(_opCtx);
+        auto db = autoColl.ensureDbExists();
+        ASSERT_OK(db->dropCollection(_opCtx, _nss, {})) << _nss;
+        wuow.commit();
+    }
+
+    CollectionWriter& collection() {
+        _collection.emplace(_opCtx, _nss);
+        return *_collection;
+    }
+
+protected:
+    Status createIndex(const BSONObj& indexSpec);
+
+    bool buildIndexInterrupted(const BSONObj& key) {
+        try {
+            MultiIndexBlock indexer;
+
+            auto abortOnExit = makeGuard([&] {
+                indexer.abortIndexBuild(_opCtx, collection(), MultiIndexBlock::kNoopOnCleanUpFn);
+            });
+
+            uassertStatusOK(
+                indexer.init(_opCtx, collection(), key, MultiIndexBlock::kNoopOnInitFn));
+            uassertStatusOK(indexer.insertAllDocumentsInCollection(_opCtx, collection().get()));
+            WriteUnitOfWork wunit(_opCtx);
+            ASSERT_OK(indexer.commit(_opCtx,
+                                     collection().getWritableCollection(),
+                                     MultiIndexBlock::kNoopOnCreateEachFn,
+                                     MultiIndexBlock::kNoopOnCommitFn));
+            wunit.commit();
+            abortOnExit.dismiss();
+        } catch (const DBException& e) {
+            if (ErrorCodes::isInterruption(e.code()))
+                return true;
+
+            throw;
         }
-    };
+        return false;
+    }
 
-    class SameSpecDifferentOption: public SimpleCompoundIndex {
-    public:
-        void run() {
-            // Cannot have same key spec with an option different from the existing one.
-            ASSERT_EQUALS(
-                    ErrorCodes::IndexOptionsConflict,
-                    createIndex(
-                            "unittest",
-                            BSON("name" << "x"
-                                 << "ns" << _ns
-                                 << "unique" << true
-                                 << "key" << BSON("x" << 1 << "y" << 1))));
+    void regenOpCtx() {
+        _txnPtr = nullptr;
+        _txnPtr = cc().makeOperationContext();
+        _opCtx = _txnPtr.get();
+    }
+
+    ServiceContext::UniqueOperationContext _txnPtr;  // = cc().makeOperationContext();
+    OperationContext* _opCtx;                        // = _txnPtr.get();
+    boost::optional<CollectionWriter> _collection;
+};
+
+/** Index creation ignores unique constraints when told to. */
+template <bool background>
+class InsertBuildIgnoreUnique : public IndexBuildBase {
+public:
+    void run() {
+        AutoGetCollection autoColl(_opCtx, _nss, LockMode::MODE_X);
+        auto db = autoColl.ensureDbExists();
+        ASSERT(db) << _nss;
+        auto& coll = collection();
+        {
+            WriteUnitOfWork wunit(_opCtx);
+            OpDebug* const nullOpDebug = nullptr;
+            ASSERT_OK(coll->insertDocument(_opCtx,
+                                           InsertStatement(BSON("_id" << 1 << "a"
+                                                                      << "dup")),
+                                           nullOpDebug,
+                                           true));
+            ASSERT_OK(coll->insertDocument(_opCtx,
+                                           InsertStatement(BSON("_id" << 2 << "a"
+                                                                      << "dup")),
+                                           nullOpDebug,
+                                           true));
+            wunit.commit();
         }
-    };
 
-    class SameSpecSameOptions: public SimpleCompoundIndex {
-    public:
-        void run() {
-            ASSERT_OK(
-                    createIndex(
-                            "unittest",
-                            BSON("name" << "x"
-                                 << "ns" << _ns
-                                 << "key" << BSON("x" << 1 << "y" << 1))));
-        }
-    };
+        MultiIndexBlock indexer;
+        indexer.ignoreUniqueConstraint();
 
-    class DifferentSpecSameName: public SimpleCompoundIndex {
-    public:
-        void run() {
-            // Cannot create a different index with the same name as the existing one.
-            ASSERT_EQUALS(
-                    ErrorCodes::IndexKeySpecsConflict,
-                    createIndex(
-                            "unittest",
-                            BSON("name" << "x"
-                                 << "ns" << _ns
-                                 << "key" << BSON("y" << 1 << "x" << 1))));
-        }
-    };
+        const BSONObj spec = BSON("name"
+                                  << "a"
+                                  << "key" << BSON("a" << 1) << "v"
+                                  << static_cast<int>(kIndexVersion) << "unique" << true
+                                  << "background" << background);
 
-    /**
-     * Fixture class for indexes with complex options.
-     */
-    class ComplexIndex: public IndexBuildBase {
-    public:
-        ComplexIndex() {
-            ASSERT_OK(
-                    createIndex(
-                            "unittests",
-                            BSON("name" << "super"
-                                 << "ns" << _ns
-                                 << "unique" << 1
-                                 << "sparse" << true
-                                 << "expireAfterSeconds" << 3600
-                                 << "key" << BSON("superIdx" << "2d"))));
-        }
-    };
+        auto abortOnExit = makeGuard([&] {
+            indexer.abortIndexBuild(_opCtx, collection(), MultiIndexBlock::kNoopOnCleanUpFn);
+        });
 
-    class SameSpecSameOptionDifferentOrder: public ComplexIndex {
-    public:
-        void run() {
-            // Exactly the same specs with the existing one, only
-            // specified in a different order than the original.
-            ASSERT_OK(
-                    createIndex(
-                            "unittests",
-                            BSON("name" << "super2"
-                                 << "ns" << _ns
-                                 << "expireAfterSeconds" << 3600
-                                 << "sparse" << true
-                                 << "unique" << 1
-                                 << "key" << BSON("superIdx" << "2d"))));
-        }
-    };
+        ASSERT_OK(indexer.init(_opCtx, coll, spec, MultiIndexBlock::kNoopOnInitFn).getStatus());
+        ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, coll.get()));
+        ASSERT_OK(indexer.checkConstraints(_opCtx, coll.get()));
 
-    // The following tests tries to create an index with almost the same
-    // specs as the original, except for one option.
+        WriteUnitOfWork wunit(_opCtx);
+        ASSERT_OK(indexer.commit(_opCtx,
+                                 coll.getWritableCollection(),
+                                 MultiIndexBlock::kNoopOnCreateEachFn,
+                                 MultiIndexBlock::kNoopOnCommitFn));
+        wunit.commit();
+        abortOnExit.dismiss();
+    }
+};
 
-    class SameSpecDifferentUnique: public ComplexIndex {
-    public:
-        void run() {
-            ASSERT_EQUALS(
-                    ErrorCodes::IndexOptionsConflict,
-                    createIndex(
-                            "unittest",
-                            BSON("name" << "super2"
-                                 << "ns" << _ns
-                                 << "unique" << false
-                                 << "sparse" << true
-                                 << "expireAfterSeconds" << 3600
-                                 << "key" << BSON("superIdx" << "2d"))));
-        }
-    };
+/** Index creation enforces unique constraints unless told not to. */
+template <bool background>
+class InsertBuildEnforceUnique : public IndexBuildBase {
+public:
+    void run() {
+        // Create a new collection.
+        {
+            AutoGetCollection autoColl(_opCtx, _nss, LockMode::MODE_IX);
+            auto db = autoColl.ensureDbExists();
+            ASSERT(db) << _nss;
 
-    class SameSpecDifferentSparse: public ComplexIndex {
-    public:
-        void run() {
-            ASSERT_EQUALS(
-                    ErrorCodes::IndexOptionsConflict,
-                    createIndex(
-                            "unittest",
-                            BSON("name" << "super2"
-                                 << "ns" << _ns
-                                 << "unique" << 1
-                                 << "sparse" << false
-                                 << "background" << true
-                                 << "expireAfterSeconds" << 3600
-                                 << "key" << BSON("superIdx" << "2d"))));
-        }
-    };
-
-    class SameSpecDifferentTTL: public ComplexIndex {
-    public:
-        void run() {
-            ASSERT_EQUALS(
-                    ErrorCodes::IndexOptionsConflict,
-                    createIndex(
-                            "unittest",
-                            BSON("name" << "super2"
-                                 << "ns" << _ns
-                                 << "unique" << 1
-                                 << "sparse" << true
-                                 << "expireAfterSeconds" << 2400
-                                 << "key" << BSON("superIdx" << "2d"))));
-        }
-    };
-
-    class StorageEngineOptions : public IndexBuildBase {
-    public:
-        void run() {
-            // "storageEngine" field has to be an object if present.
-            ASSERT_NOT_OK(createIndex("unittest", _createSpec(12345)));
-
-            // 'storageEngine' must not be empty.
-            ASSERT_NOT_OK(createIndex("unittest", _createSpec(BSONObj())));
-
-            // Every field under "storageEngine" must match a registered storage engine.
-            ASSERT_NOT_OK(createIndex("unittest",
-                                      _createSpec(BSON("unknownEngine" << BSONObj()))));
-
-            // Testing with 'wiredTiger' because the registered storage engine factory
-            // supports custom index options under 'storageEngine'.
-            const std::string storageEngineName = "wiredTiger";
-
-            // Run 'wiredTiger' tests if the storage engine is supported.
-            if (getGlobalEnvironment()->isRegisteredStorageEngine(storageEngineName)) {
-                // Every field under "storageEngine" has to be an object.
-                ASSERT_NOT_OK(createIndex("unittest", _createSpec(BSON(storageEngineName << 1))));
-
-                // Storage engine options must pass validation by the storage engine factory.
-                // For 'wiredTiger', embedded document must contain 'configString'.
-                ASSERT_NOT_OK(createIndex("unittest", _createSpec(
-                    BSON(storageEngineName << BSON("unknown" << 1)))));
-
-                // Configuration string for 'wiredTiger' must be a string.
-                ASSERT_NOT_OK(createIndex("unittest", _createSpec(
-                    BSON(storageEngineName << BSON("configString" << 1)))));
-
-                // Valid 'wiredTiger' configuration.
-                ASSERT_OK(createIndex("unittest", _createSpec(
-                    BSON(storageEngineName << BSON("configString" << "block_compressor=zlib")))));
+            auto& coll = collection();
+            {
+                WriteUnitOfWork wunit(_opCtx);
+                OpDebug* const nullOpDebug = nullptr;
+                ASSERT_OK(coll->insertDocument(_opCtx,
+                                               InsertStatement(BSON("_id" << 1 << "a"
+                                                                          << "dup")),
+                                               nullOpDebug,
+                                               true));
+                ASSERT_OK(coll->insertDocument(_opCtx,
+                                               InsertStatement(BSON("_id" << 2 << "a"
+                                                                          << "dup")),
+                                               nullOpDebug,
+                                               true));
+                wunit.commit();
             }
         }
-    protected:
-        template <typename T>
-        BSONObj _createSpec(T storageEngineValue) {
-            return BSON("name" << "super2"
-                        << "ns" << _ns
-                        << "key" << BSON("a" << 1)
-                        << "storageEngine" << storageEngineValue);
+        {
+            AutoGetCollection autoColl(_opCtx, _nss, LockMode::MODE_X);
+            MultiIndexBlock indexer;
+
+            const BSONObj spec = BSON("name"
+                                      << "a"
+                                      << "key" << BSON("a" << 1) << "v"
+                                      << static_cast<int>(kIndexVersion) << "unique" << true
+                                      << "background" << background);
+            auto abortOnExit = makeGuard([&] {
+                indexer.abortIndexBuild(_opCtx, collection(), MultiIndexBlock::kNoopOnCleanUpFn);
+            });
+
+            ASSERT_OK(indexer.init(_opCtx, collection(), spec, MultiIndexBlock::kNoopOnInitFn)
+                          .getStatus());
+
+            auto& coll = collection();
+            auto desc =
+                coll->getIndexCatalog()->findIndexByName(_opCtx, "a", true /* includeUnfinished */);
+            ASSERT(desc);
+
+            // Hybrid index builds check duplicates explicitly.
+            ASSERT_OK(indexer.insertAllDocumentsInCollection(_opCtx, coll.get()));
+
+            auto status = indexer.checkConstraints(_opCtx, coll.get());
+            ASSERT_EQUALS(status.code(), ErrorCodes::DuplicateKey);
         }
-    };
+    }
+};
 
-    class IndexCatatalogFixIndexKey {
-    public:
-        void run() {
-            ASSERT_EQUALS( BSON( "x" << 1 ),
-                           IndexCatalog::fixIndexKey( BSON( "x" << 1 ) ) );
+/** Index creation is killed if mayInterrupt is true. */
+class InsertBuildIndexInterrupt : public IndexBuildBase {
+public:
+    void run() {
+        {
+            AutoGetCollection autoColl(_opCtx, _nss, LockMode::MODE_X);
+            auto db = autoColl.ensureDbExists();
+            ASSERT(db) << _nss;
 
-            ASSERT_EQUALS( BSON( "_id" << 1 ),
-                           IndexCatalog::fixIndexKey( BSON( "_id" << 1 ) ) );
-
-            ASSERT_EQUALS( BSON( "_id" << 1 ),
-                           IndexCatalog::fixIndexKey( BSON( "_id" << true ) ) );
+            auto& coll = collection();
+            {
+                WriteUnitOfWork wunit(_opCtx);
+                // Drop all indexes including id index.
+                coll.getWritableCollection()->getIndexCatalog()->dropAllIndexes(_opCtx, true);
+                // Insert some documents.
+                int32_t nDocs = 1000;
+                OpDebug* const nullOpDebug = nullptr;
+                for (int32_t i = 0; i < nDocs; ++i) {
+                    ASSERT_OK(
+                        coll->insertDocument(_opCtx, InsertStatement(BSON("a" << i)), nullOpDebug));
+                }
+                wunit.commit();
+            }
+            // Request an interrupt.
+            getGlobalServiceContext()->setKillAllOperations();
+            BSONObj indexInfo = BSON("key" << BSON("a" << 1) << "name"
+                                           << "a_1"
+                                           << "v" << static_cast<int>(kIndexVersion));
+            // The call is interrupted because mayInterrupt == true.
+            ASSERT_TRUE(buildIndexInterrupted(indexInfo));
+            // only want to interrupt the index build
+            getGlobalServiceContext()->unsetKillAllOperations();
         }
-    };
 
-    class IndexUpdateTests : public Suite {
-    public:
-        IndexUpdateTests() :
-            Suite( "indexupdate" ) {
+        regenOpCtx();
+        AutoGetDb dbRaii(_opCtx, _nss.db(), LockMode::MODE_IX);
+        boost::optional<Lock::CollectionLock> collLk;
+        collLk.emplace(_opCtx, _nss, LockMode::MODE_IX);
+        // The new index is not listed in the index catalog because the index build failed.
+        ASSERT(!collection().get()->getIndexCatalog()->findIndexByName(_opCtx, "a_1"));
+    }
+};
+
+/** Index creation is killed when building the _id index. */
+class InsertBuildIdIndexInterrupt : public IndexBuildBase {
+public:
+    void run() {
+        // Skip the test if the storage engine doesn't support capped collections.
+        if (!getGlobalServiceContext()->getStorageEngine()->supportsCappedCollections()) {
+            return;
         }
 
-        void setupTests() {
-            //add<AddKeysToPhaseOne>();
-            //add<InterruptAddKeysToPhaseOne>( false );
-            //add<InterruptAddKeysToPhaseOne>( true );
-            // QUERY_MIGRATION
-            //add<BuildBottomUp>();
-            //add<InterruptBuildBottomUp>( false );
-            //add<InterruptBuildBottomUp>( true );
-            add<InsertBuildIgnoreUnique<true> >();
-            add<InsertBuildIgnoreUnique<false> >();
-            add<InsertBuildEnforceUnique<true> >();
-            add<InsertBuildEnforceUnique<false> >();
-            add<InsertBuildFillDups<true> >();
-            add<InsertBuildFillDups<false> >();
-            add<InsertBuildIndexInterrupt>();
-            add<InsertBuildIndexInterruptDisallowed>();
-            add<InsertBuildIdIndexInterrupt>();
-            add<InsertBuildIdIndexInterruptDisallowed>();
-            add<HelpersEnsureIndexInterruptDisallowed>();
-            //add<IndexBuildInProgressTest>();
-            add<SameSpecDifferentOption>();
-            add<SameSpecSameOptions>();
-            add<DifferentSpecSameName>();
-            add<SameSpecSameOptionDifferentOrder>();
-            add<SameSpecDifferentUnique>();
-            add<SameSpecDifferentSparse>();
-            add<SameSpecDifferentTTL>();
-            add<StorageEngineOptions>();
+        {
+            // Recreate the collection as capped, without an _id index.
+            AutoGetCollection autoColl(_opCtx, _nss, LockMode::MODE_X);
+            auto db = autoColl.ensureDbExists();
 
-            add<IndexCatatalogFixIndexKey>();
+            WriteUnitOfWork wunit(_opCtx);
+            ASSERT_OK(db->dropCollection(_opCtx, _nss));
+            CollectionOptions options;
+            options.capped = true;
+            options.cappedSize = 10 * 1024;
+            Collection* coll = db->createCollection(_opCtx, _nss, options);
+            coll->getIndexCatalog()->dropAllIndexes(_opCtx, true);
+            // Insert some documents.
+            int32_t nDocs = 1000;
+            OpDebug* const nullOpDebug = nullptr;
+            for (int32_t i = 0; i < nDocs; ++i) {
+                ASSERT_OK(coll->insertDocument(
+                    _opCtx, InsertStatement(BSON("_id" << i)), nullOpDebug, true));
+            }
+            wunit.commit();
+            // Request an interrupt.
+            getGlobalServiceContext()->setKillAllOperations();
+            BSONObj indexInfo = BSON("key" << BSON("_id" << 1) << "name"
+                                           << "_id_"
+                                           << "v" << static_cast<int>(kIndexVersion));
+            ASSERT_TRUE(buildIndexInterrupted(indexInfo));
+            // only want to interrupt the index build
+            getGlobalServiceContext()->unsetKillAllOperations();
         }
-    } indexUpdateTests;
+        regenOpCtx();
+        AutoGetCollection autoColl(_opCtx, _nss, LockMode::MODE_IX);
 
-} // namespace IndexUpdateTests
+        // The new index is not listed in the index catalog because the index build failed.
+        ASSERT(!collection().get()->getIndexCatalog()->findIndexByName(_opCtx, "_id_"));
+    }
+};  // namespace IndexUpdateTests
+
+Status IndexBuildBase::createIndex(const BSONObj& indexSpec) {
+    Lock::DBLock dbLk(_opCtx, _nss.db(), MODE_IX);
+    Lock::CollectionLock collLk(_opCtx, _nss, MODE_X);
+
+    MultiIndexBlock indexer;
+    auto abortOnExit = makeGuard(
+        [&] { indexer.abortIndexBuild(_opCtx, collection(), MultiIndexBlock::kNoopOnCleanUpFn); });
+    Status status =
+        indexer.init(_opCtx, collection(), indexSpec, MultiIndexBlock::kNoopOnInitFn).getStatus();
+    if (status == ErrorCodes::IndexAlreadyExists) {
+        return Status::OK();
+    }
+    if (!status.isOK()) {
+        return status;
+    }
+    status = indexer.insertAllDocumentsInCollection(_opCtx, collection().get());
+    if (!status.isOK()) {
+        return status;
+    }
+    status = indexer.checkConstraints(_opCtx, collection().get());
+    if (!status.isOK()) {
+        return status;
+    }
+    WriteUnitOfWork wunit(_opCtx);
+    ASSERT_OK(indexer.commit(_opCtx,
+                             collection().getWritableCollection(),
+                             MultiIndexBlock::kNoopOnCreateEachFn,
+                             MultiIndexBlock::kNoopOnCommitFn));
+    wunit.commit();
+    abortOnExit.dismiss();
+    return Status::OK();
+}
+
+/**
+ * Fixture class that has a basic compound index.
+ */
+class SimpleCompoundIndex : public IndexBuildBase {
+public:
+    SimpleCompoundIndex() {
+        ASSERT_OK(createIndex(BSON("name"
+                                   << "x"
+                                   << "key" << BSON("x" << 1 << "y" << 1) << "v"
+                                   << static_cast<int>(kIndexVersion))));
+    }
+};
+
+class SameSpecDifferentOption : public SimpleCompoundIndex {
+public:
+    void run() {
+        // Cannot have same key spec with an option different from the existing one.
+        ASSERT_EQUALS(ErrorCodes::IndexOptionsConflict,
+                      createIndex(BSON("name"
+                                       << "x"
+                                       << "key" << BSON("x" << 1 << "y" << 1) << "storageEngine"
+                                       << BSON("wiredTiger" << BSONObj()) << "v"
+                                       << static_cast<int>(kIndexVersion))));
+    }
+};
+
+class SameSpecSameOptions : public SimpleCompoundIndex {
+public:
+    void run() {
+        ASSERT_OK(createIndex(BSON("name"
+                                   << "x"
+                                   << "key" << BSON("x" << 1 << "y" << 1) << "v"
+                                   << static_cast<int>(kIndexVersion))));
+    }
+};
+
+class DifferentSpecSameName : public SimpleCompoundIndex {
+public:
+    void run() {
+        // Cannot create a different index with the same name as the existing one.
+        ASSERT_EQUALS(ErrorCodes::IndexKeySpecsConflict,
+                      createIndex(BSON("name"
+                                       << "x"
+                                       << "key" << BSON("y" << 1 << "x" << 1) << "v"
+                                       << static_cast<int>(kIndexVersion))));
+    }
+};
+
+/**
+ * Fixture class for indexes with complex options.
+ */
+class ComplexIndex : public IndexBuildBase {
+public:
+    ComplexIndex() {
+        ASSERT_OK(createIndex(BSON("name"
+                                   << "super"
+                                   << "unique" << 1 << "sparse" << true << "expireAfterSeconds"
+                                   << 3600 << "key"
+                                   << BSON("superIdx"
+                                           << "2d")
+                                   << "v" << static_cast<int>(kIndexVersion))));
+    }
+};
+
+class SameSpecDifferentNameDifferentOrder : public ComplexIndex {
+public:
+    void run() {
+        // Exactly the same specs with the existing one, only specified in a different order than
+        // the original. This will throw an IndexOptionsConflict as the index already exists under
+        // another name.
+        ASSERT_EQUALS(ErrorCodes::IndexOptionsConflict,
+                      createIndex(BSON("name"
+                                       << "super2"
+                                       << "expireAfterSeconds" << 3600 << "sparse" << true
+                                       << "unique" << 1 << "key"
+                                       << BSON("superIdx"
+                                               << "2d")
+                                       << "v" << static_cast<int>(kIndexVersion))));
+    }
+};
+
+class SameSpecSameNameDifferentOrder : public ComplexIndex {
+public:
+    void run() {
+        // Exactly the same specs with the existing one, only specified in a different order than
+        // the original, but with the same name.
+        ASSERT_OK(createIndex(BSON("name"
+                                   << "super"
+                                   << "expireAfterSeconds" << 3600 << "sparse" << true << "unique"
+                                   << 1 << "key"
+                                   << BSON("superIdx"
+                                           << "2d")
+                                   << "v" << static_cast<int>(kIndexVersion))));
+    }
+};
+
+// The following tests tries to create an index with almost the same
+// specs as the original, except for one option.
+
+class SameSpecDifferentUnique : public ComplexIndex {
+public:
+    void run() {
+        ASSERT_OK(createIndex(BSON("name"
+                                   << "super2"
+                                   << "unique" << false << "sparse" << true << "expireAfterSeconds"
+                                   << 3600 << "key"
+                                   << BSON("superIdx"
+                                           << "2d")
+                                   << "v" << static_cast<int>(kIndexVersion))));
+    }
+};
+
+class SameSpecDifferentSparse : public ComplexIndex {
+public:
+    void run() {
+        ASSERT_OK(createIndex(BSON("name"
+                                   << "super3"
+                                   << "unique" << 1 << "sparse" << false << "background" << true
+                                   << "expireAfterSeconds" << 3600 << "key"
+                                   << BSON("superIdx"
+                                           << "2d")
+                                   << "v" << static_cast<int>(kIndexVersion))));
+    }
+};
+
+class SameSpecDifferentTTL : public ComplexIndex {
+public:
+    void run() {
+        ASSERT_EQUALS(ErrorCodes::IndexOptionsConflict,
+                      createIndex(BSON("name"
+                                       << "super4"
+                                       << "unique" << 1 << "sparse" << true << "expireAfterSeconds"
+                                       << 2400 << "key"
+                                       << BSON("superIdx"
+                                               << "2d")
+                                       << "v" << static_cast<int>(kIndexVersion))));
+    }
+};
+
+class StorageEngineOptions : public IndexBuildBase {
+public:
+    void run() {
+        // "storageEngine" field has to be an object if present.
+        ASSERT_NOT_OK(createIndex(_createSpec(12345)));
+
+        // 'storageEngine' must not be empty.
+        ASSERT_NOT_OK(createIndex(_createSpec(BSONObj())));
+
+        // Every field under "storageEngine" must match a registered storage engine.
+        ASSERT_NOT_OK(createIndex(_createSpec(BSON("unknownEngine" << BSONObj()))));
+
+        // Testing with 'wiredTiger' because the registered storage engine factory
+        // supports custom index options under 'storageEngine'.
+        const std::string storageEngineName = "wiredTiger";
+
+        // Run 'wiredTiger' tests if the storage engine is supported.
+        if (isRegisteredStorageEngine(getGlobalServiceContext(), storageEngineName)) {
+            // Every field under "storageEngine" has to be an object.
+            ASSERT_NOT_OK(createIndex(_createSpec(BSON(storageEngineName << 1))));
+
+            // Storage engine options must pass validation by the storage engine factory.
+            // For 'wiredTiger', embedded document must contain 'configString'.
+            ASSERT_NOT_OK(
+                createIndex(_createSpec(BSON(storageEngineName << BSON("unknown" << 1)))));
+
+            // Configuration string for 'wiredTiger' must be a string.
+            ASSERT_NOT_OK(
+                createIndex(_createSpec(BSON(storageEngineName << BSON("configString" << 1)))));
+
+            // Valid 'wiredTiger' configuration.
+            ASSERT_OK(createIndex(
+                _createSpec(BSON(storageEngineName << BSON("configString"
+                                                           << "block_compressor=zlib")))));
+        }
+    }
+
+protected:
+    template <typename T>
+    BSONObj _createSpec(T storageEngineValue) {
+        return BSON("name"
+                    << "super2"
+                    << "key" << BSON("a" << 1) << "v" << static_cast<int>(kIndexVersion)
+                    << "storageEngine" << storageEngineValue);
+    }
+};
+
+class IndexCatatalogFixIndexKey : public IndexBuildBase {
+public:
+    void run() {
+        auto indexCatalog = collection().get()->getIndexCatalog();
+
+        ASSERT_BSONOBJ_EQ(BSON("x" << 1), indexCatalog->fixIndexKey(BSON("x" << 1)));
+
+        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), indexCatalog->fixIndexKey(BSON("_id" << 1)));
+
+        ASSERT_BSONOBJ_EQ(BSON("_id" << 1), indexCatalog->fixIndexKey(BSON("_id" << true)));
+    }
+};
+
+class InsertSymbolIntoIndexWithCollationFails {
+public:
+    void run() {
+        auto opCtx = cc().makeOperationContext();
+        DBDirectClient client(opCtx.get());
+        client.dropCollection(_ns);
+        IndexSpec indexSpec;
+        indexSpec.addKey("a").addOptions(BSON("collation" << BSON("locale"
+                                                                  << "fr")));
+        client.createIndex(_ns, indexSpec);
+        client.insert(_ns, BSON("a" << BSONSymbol("mySymbol")));
+        ASSERT_EQUALS(client.getLastErrorDetailed()["code"].numberInt(),
+                      ErrorCodes::CannotBuildIndexKeys);
+        ASSERT_EQUALS(client.count(_nss), 0U);
+    }
+};
+
+class InsertSymbolIntoIndexWithoutCollationSucceeds {
+public:
+    void run() {
+        auto opCtx = cc().makeOperationContext();
+        DBDirectClient client(opCtx.get());
+        client.dropCollection(_ns);
+        IndexSpec indexSpec;
+        indexSpec.addKey("a");
+        client.createIndex(_ns, indexSpec);
+        client.insert(_ns, BSON("a" << BSONSymbol("mySymbol")));
+        ASSERT(client.getLastError().empty());
+        ASSERT_EQUALS(client.count(_nss), 1U);
+    }
+};
+
+class InsertSymbolInsideNestedObjectIntoIndexWithCollationFails {
+public:
+    void run() {
+        auto opCtx = cc().makeOperationContext();
+        DBDirectClient client(opCtx.get());
+        client.dropCollection(_ns);
+        IndexSpec indexSpec;
+        indexSpec.addKey("a").addOptions(BSON("collation" << BSON("locale"
+                                                                  << "fr")));
+        client.createIndex(_ns, indexSpec);
+        client.insert(_ns, BSON("a" << BSON("b" << 99 << "c" << BSONSymbol("mySymbol"))));
+        ASSERT_EQUALS(client.getLastErrorDetailed()["code"].numberInt(),
+                      ErrorCodes::CannotBuildIndexKeys);
+        ASSERT_EQUALS(client.count(_nss), 0U);
+    }
+};
+
+class InsertSymbolInsideNestedArrayIntoIndexWithCollationFails {
+public:
+    void run() {
+        auto opCtx = cc().makeOperationContext();
+        DBDirectClient client(opCtx.get());
+        client.dropCollection(_ns);
+        IndexSpec indexSpec;
+        indexSpec.addKey("a").addOptions(BSON("collation" << BSON("locale"
+                                                                  << "fr")));
+        client.createIndex(_ns, indexSpec);
+        client.insert(_ns, BSON("a" << BSON_ARRAY(99 << BSONSymbol("mySymbol"))));
+        ASSERT_EQUALS(client.getLastErrorDetailed()["code"].numberInt(),
+                      ErrorCodes::CannotBuildIndexKeys);
+        ASSERT_EQUALS(client.count(_nss), 0U);
+    }
+};
+
+class BuildingIndexWithCollationWhenSymbolDataExistsShouldFail {
+public:
+    void run() {
+        auto opCtx = cc().makeOperationContext();
+        DBDirectClient client(opCtx.get());
+        client.dropCollection(_ns);
+        client.insert(_ns, BSON("a" << BSON_ARRAY(99 << BSONSymbol("mySymbol"))));
+        ASSERT_EQUALS(client.count(_nss), 1U);
+        IndexSpec indexSpec;
+        indexSpec.addKey("a").addOptions(BSON("collation" << BSON("locale"
+                                                                  << "fr")));
+        ASSERT_THROWS_CODE(client.createIndex(_ns, indexSpec),
+                           AssertionException,
+                           ErrorCodes::CannotBuildIndexKeys);
+    }
+};
+
+class IndexingSymbolWithInheritedCollationShouldFail {
+public:
+    void run() {
+        auto opCtx = cc().makeOperationContext();
+        DBDirectClient client(opCtx.get());
+        client.dropCollection(_ns);
+        BSONObj cmdResult;
+        ASSERT_TRUE(client.runCommand("unittests",
+                                      BSON("create"
+                                           << "indexupdate"
+                                           << "collation"
+                                           << BSON("locale"
+                                                   << "fr")),
+                                      cmdResult));
+        IndexSpec indexSpec;
+        indexSpec.addKey("a");
+        client.createIndex(_ns, indexSpec);
+        client.insert(_ns, BSON("a" << BSON_ARRAY(99 << BSONSymbol("mySymbol"))));
+        ASSERT_EQUALS(client.getLastErrorDetailed()["code"].numberInt(),
+                      ErrorCodes::CannotBuildIndexKeys);
+    }
+};
+
+class IndexUpdateTests : public OldStyleSuiteSpecification {
+public:
+    IndexUpdateTests() : OldStyleSuiteSpecification("indexupdate") {}
+
+    template <typename T>
+    void addIf() {
+        addNameCallback(nameForTestClass<T>(), [] { T().run(); });
+    }
+
+    void setupTests() {
+        // These tests check that index creation ignores the unique constraint when told to.
+        // The mobile storage engine does not support duplicate keys in unique indexes so these
+        // tests are disabled.
+        addIf<InsertBuildIgnoreUnique<true>>();
+        addIf<InsertBuildIgnoreUnique<false>>();
+        addIf<InsertBuildEnforceUnique<true>>();
+        addIf<InsertBuildEnforceUnique<false>>();
+
+        add<InsertBuildIndexInterrupt>();
+        add<InsertBuildIdIndexInterrupt>();
+        add<SameSpecDifferentOption>();
+        add<SameSpecSameOptions>();
+        add<DifferentSpecSameName>();
+        add<SameSpecDifferentNameDifferentOrder>();
+        add<SameSpecSameNameDifferentOrder>();
+        add<SameSpecDifferentUnique>();
+        add<SameSpecDifferentSparse>();
+        add<SameSpecDifferentTTL>();
+        add<StorageEngineOptions>();
+
+        add<IndexCatatalogFixIndexKey>();
+
+        add<InsertSymbolInsideNestedObjectIntoIndexWithCollationFails>();
+        add<InsertSymbolIntoIndexWithoutCollationSucceeds>();
+        add<InsertSymbolInsideNestedObjectIntoIndexWithCollationFails>();
+        add<InsertSymbolInsideNestedArrayIntoIndexWithCollationFails>();
+        add<BuildingIndexWithCollationWhenSymbolDataExistsShouldFail>();
+        add<IndexingSymbolWithInheritedCollationShouldFail>();
+    }
+};
+
+OldStyleSuiteInitializer<IndexUpdateTests> indexUpdateTests;
+
+}  // namespace IndexUpdateTests

@@ -1,89 +1,91 @@
-t = db.jstests_or4;
-t.drop();
+// @tags: [
+//   does_not_support_stepdowns,
+//   requires_fastcount,
+//   requires_getmore,
+//   requires_non_retryable_writes,
+// ]
 
-// v8 does not have a builtin Array.sort
-if (!Array.sort) {
-  Array.sort = function(arr) {
-    return arr.sort();
-  };
-}
+load("jstests/aggregation/extras/utils.js");  // For resultsEq
+(function() {
+"use strict";
 
-checkArrs = function( a, b ) {
-    m = "[" + a + "] != [" + b + "]";
-    a = eval( a );
-    b = eval( b );
-    assert.eq( a.length, b.length, m );
-    aStr = [];
-    bStr = [];
-    a.forEach( function( x ) { aStr.push( tojson( x ) ); } );
-    b.forEach( function( x ) { bStr.push( tojson( x ) ); } );
-    for ( i = 0; i < aStr.length; ++i ) {
-        assert( -1 != bStr.indexOf( aStr[ i ] ), m );
-    }
-}
+const coll = db.or4;
+coll.drop();
+db.getCollection("mrOutput").drop();
 
-t.ensureIndex( {a:1} );
-t.ensureIndex( {b:1} );
+coll.createIndex({a: 1});
+coll.createIndex({b: 1});
 
-t.save( {a:2} );
-t.save( {b:3} );
-t.save( {b:3} );
-t.save( {a:2,b:3} );
+assert.commandWorked(coll.insert({a: 2}));
+assert.commandWorked(coll.insert({b: 3}));
+assert.commandWorked(coll.insert({b: 3}));
+assert.commandWorked(coll.insert({a: 2, b: 3}));
 
-assert.eq.automsg( "4", "t.count( {$or:[{a:2},{b:3}]} )" );
-assert.eq.automsg( "2", "t.count( {$or:[{a:2},{a:2}]} )" );
+assert.eq(4, coll.count({$or: [{a: 2}, {b: 3}]}));
+assert.eq(2, coll.count({$or: [{a: 2}, {a: 2}]}));
 
-assert.eq.automsg( "2", "t.find( {} ).skip( 2 ).count( true )" );
-assert.eq.automsg( "2", "t.find( {$or:[{a:2},{b:3}]} ).skip( 2 ).count( true )" );
-assert.eq.automsg( "1", "t.find( {$or:[{a:2},{b:3}]} ).skip( 3 ).count( true )" );
+assert.eq(2, coll.find({}).skip(2).count(true));
+assert.eq(2, coll.find({$or: [{a: 2}, {b: 3}]}).skip(2).count(true));
+assert.eq(1, coll.find({$or: [{a: 2}, {b: 3}]}).skip(3).count(true));
 
-assert.eq.automsg( "2", "t.find( {} ).limit( 2 ).count( true )" );
-assert.eq.automsg( "1", "t.find( {$or:[{a:2},{b:3}]} ).limit( 1 ).count( true )" );
-assert.eq.automsg( "2", "t.find( {$or:[{a:2},{b:3}]} ).limit( 2 ).count( true )" );
-assert.eq.automsg( "3", "t.find( {$or:[{a:2},{b:3}]} ).limit( 3 ).count( true )" );
-assert.eq.automsg( "4", "t.find( {$or:[{a:2},{b:3}]} ).limit( 4 ).count( true )" );
+assert.eq(2, coll.find({}).limit(2).count(true));
+assert.eq(1, coll.find({$or: [{a: 2}, {b: 3}]}).limit(1).count(true));
+assert.eq(2, coll.find({$or: [{a: 2}, {b: 3}]}).limit(2).count(true));
+assert.eq(3, coll.find({$or: [{a: 2}, {b: 3}]}).limit(3).count(true));
+assert.eq(4, coll.find({$or: [{a: 2}, {b: 3}]}).limit(4).count(true));
 
-t.remove({ $or: [{ a: 2 }, { b: 3}] });
-assert.eq.automsg( "0", "t.count()" );
+coll.remove({$or: [{a: 2}, {b: 3}]});
+assert.eq(0, coll.count());
 
-t.save( {b:3} );
-t.remove({ $or: [{ a: 2 }, { b: 3}] });
-assert.eq.automsg( "0", "t.count()" );
+assert.commandWorked(coll.insert({b: 3}));
+coll.remove({$or: [{a: 2}, {b: 3}]});
+assert.eq(0, coll.count());
 
-t.save( {a:2} );
-t.save( {b:3} );
-t.save( {a:2,b:3} );
+assert.commandWorked(coll.insert({a: 2}));
+assert.commandWorked(coll.insert({b: 3}));
+assert.commandWorked(coll.insert({a: 2, b: 3}));
 
-t.update( {$or:[{a:2},{b:3}]}, {$set:{z:1}}, false, true );
-assert.eq.automsg( "3", "t.count( {z:1} )" );
+coll.update({$or: [{a: 2}, {b: 3}]}, {$set: {z: 1}}, false, true);
+assert.eq(3, coll.count({z: 1}));
 
-assert.eq.automsg( "3", "t.find( {$or:[{a:2},{b:3}]} ).toArray().length" );
-checkArrs( "t.find().toArray()", "t.find( {$or:[{a:2},{b:3}]} ).toArray()" );
-assert.eq.automsg( "2", "t.find( {$or:[{a:2},{b:3}]} ).skip(1).toArray().length" );
+assert.eq(3, coll.find({$or: [{a: 2}, {b: 3}]}).toArray().length);
+assert.eq(coll.find().sort({_id: 1}).toArray(),
+          coll.find({$or: [{a: 2}, {b: 3}]}).sort({_id: 1}).toArray());
+assert.eq(2, coll.find({$or: [{a: 2}, {b: 3}]}).skip(1).toArray().length);
 
-assert.eq.automsg( "3", "t.find( {$or:[{a:2},{b:3}]} ).batchSize( 2 ).toArray().length" );
+assert.eq(3, coll.find({$or: [{a: 2}, {b: 3}]}).batchSize(2).toArray().length);
 
-t.save( {a:1} );
-t.save( {b:4} );
-t.save( {a:2} );
+assert.commandWorked(coll.insert({a: 1}));
+assert.commandWorked(coll.insert({b: 4}));
+assert.commandWorked(coll.insert({a: 2}));
 
-assert.eq.automsg( "4", "t.find( {$or:[{a:2},{b:3}]} ).batchSize( 2 ).toArray().length" );
-assert.eq.automsg( "4", "t.find( {$or:[{a:2},{b:3}]} ).snapshot().toArray().length" );
+assert.eq(4, coll.find({$or: [{a: 2}, {b: 3}]}).batchSize(2).toArray().length);
 
-t.save( {a:1,b:3} );
-assert.eq.automsg( "4", "t.find( {$or:[{a:2},{b:3}]} ).batchSize(-4).toArray().length" );
+assert.commandWorked(coll.insert({a: 1, b: 3}));
+assert.eq(4, coll.find({$or: [{a: 2}, {b: 3}]}).limit(4).toArray().length);
 
-assert.eq.automsg( "[1,2]", "Array.sort( t.distinct( 'a', {$or:[{a:2},{b:3}]} ) )" );
+assert.eq([1, 2], Array.sort(coll.distinct('a', {$or: [{a: 2}, {b: 3}]})));
 
-assert.eq.automsg( "[{a:2},{a:null},{a:1}]", "t.group( {key:{a:1}, cond:{$or:[{a:2},{b:3}]}, reduce:function( x, y ) { }, initial:{} } )" );
-assert.eq.automsg( "5", "t.mapReduce( function() { emit( 'a', this.a ); }, function( key, vals ) { return vals.length; }, {out:{inline:true},query:{$or:[{a:2},{b:3}]}} ).counts.input" );
+assert.commandWorked(coll.mapReduce(
+    function() {
+        if (!this.hasOwnProperty('a')) {
+            emit('a', 0);
+        } else {
+            emit('a', this.a);
+        }
+    },
+    function(key, vals) {
+        return vals.reduce((a, b) => a + b, 0);
+    },
+    {out: {merge: "mrOutput"}, query: {$or: [{a: 2}, {b: 3}]}}));
+assert(resultsEq([{"_id": "a", "value": 7}], db.getCollection("mrOutput").find().toArray()),
+       db.getCollection("mrOutput").find().toArray());
 
-t.remove( {} );
+coll.remove({});
 
-t.save( {a:[1,2]} );
-assert.eq.automsg( "1", "t.find( {$or:[{a:1},{a:2}]} ).toArray().length" );
-assert.eq.automsg( "1", "t.count( {$or:[{a:1},{a:2}]} )" );
-assert.eq.automsg( "1", "t.find( {$or:[{a:2},{a:1}]} ).toArray().length" );
-assert.eq.automsg( "1", "t.count( {$or:[{a:2},{a:1}]} )" );
-
-t.remove({});
+assert.commandWorked(coll.insert({a: [1, 2]}));
+assert.eq(1, coll.find({$or: [{a: 1}, {a: 2}]}).toArray().length);
+assert.eq(1, coll.count({$or: [{a: 1}, {a: 2}]}));
+assert.eq(1, coll.find({$or: [{a: 2}, {a: 1}]}).toArray().length);
+assert.eq(1, coll.count({$or: [{a: 2}, {a: 1}]}));
+})();

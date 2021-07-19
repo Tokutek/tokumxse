@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -14,22 +14,77 @@
  *	Per-process information for the library.
  */
 struct __wt_process {
-	WT_SPINLOCK spinlock;		/* Per-process spinlock */
+    WT_SPINLOCK spinlock; /* Per-process spinlock */
 
-					/* Locked: connection queue */
-	TAILQ_HEAD(__wt_connection_impl_qh, __wt_connection_impl) connqh;
-	WT_CACHE_POOL *cache_pool;
+    /* Locked: connection queue */
+    TAILQ_HEAD(__wt_connection_impl_qh, __wt_connection_impl) connqh;
+
+/* Checksum functions */
+#define __wt_checksum(chunk, len) __wt_process.checksum(chunk, len)
+    uint32_t (*checksum)(const void *, size_t);
+
+#define WT_TSC_DEFAULT_RATIO 1.0
+    double tsc_nsec_ratio; /* rdtsc ticks to nanoseconds */
+    bool use_epochtime;    /* use expensive time */
+
+    WT_CACHE_POOL *cache_pool; /* shared cache information */
 };
 extern WT_PROCESS __wt_process;
+
+/*
+ * WT_BUCKET_STORAGE --
+ *	A list entry for a storage source with a unique name (bucket, prefix).
+ */
+struct __wt_bucket_storage {
+    const char *bucket;                /* Bucket name */
+    const char *bucket_prefix;         /* Bucket prefix */
+    int owned;                         /* Storage needs to be terminated */
+    uint64_t object_size;              /* Tiered object size */
+    uint64_t retain_secs;              /* Tiered period */
+    const char *auth_token;            /* Tiered authentication cookie */
+    WT_FILE_SYSTEM *file_system;       /* File system for bucket */
+    WT_STORAGE_SOURCE *storage_source; /* Storage source callbacks */
+    /* Linked list of bucket storage entries */
+    TAILQ_ENTRY(__wt_bucket_storage) hashq;
+    TAILQ_ENTRY(__wt_bucket_storage) q;
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define WT_BUCKET_FREE 0x1u
+    /* AUTOMATIC FLAG VALUE GENERATION STOP */
+    uint32_t flags;
+};
+
+/* Call a function with the bucket storage and its associated file system. */
+#define WT_WITH_BUCKET_STORAGE(bsto, s, e)                                  \
+    do {                                                                    \
+        WT_BUCKET_STORAGE *__saved_bstorage = (s)->bucket_storage;          \
+        (s)->bucket_storage = ((bsto) == NULL ? S2C(s)->bstorage : (bsto)); \
+        e;                                                                  \
+        (s)->bucket_storage = __saved_bstorage;                             \
+    } while (0)
+
+/*
+ * WT_KEYED_ENCRYPTOR --
+ *	A list entry for an encryptor with a unique (name, keyid).
+ */
+struct __wt_keyed_encryptor {
+    const char *keyid;       /* Key id of encryptor */
+    int owned;               /* Encryptor needs to be terminated */
+    size_t size_const;       /* The result of the sizing callback */
+    WT_ENCRYPTOR *encryptor; /* User supplied callbacks */
+    /* Linked list of encryptors */
+    TAILQ_ENTRY(__wt_keyed_encryptor) hashq;
+    TAILQ_ENTRY(__wt_keyed_encryptor) q;
+};
 
 /*
  * WT_NAMED_COLLATOR --
  *	A collator list entry
  */
 struct __wt_named_collator {
-	const char *name;		/* Name of collator */
-	WT_COLLATOR *collator;		/* User supplied object */
-	TAILQ_ENTRY(__wt_named_collator) q;	/* Linked list of collators */
+    const char *name;                   /* Name of collator */
+    WT_COLLATOR *collator;              /* User supplied object */
+    TAILQ_ENTRY(__wt_named_collator) q; /* Linked list of collators */
 };
 
 /*
@@ -37,10 +92,10 @@ struct __wt_named_collator {
  *	A compressor list entry
  */
 struct __wt_named_compressor {
-	const char *name;		/* Name of compressor */
-	WT_COMPRESSOR *compressor;	/* User supplied callbacks */
-					/* Linked list of compressors */
-	TAILQ_ENTRY(__wt_named_compressor) q;
+    const char *name;          /* Name of compressor */
+    WT_COMPRESSOR *compressor; /* User supplied callbacks */
+    /* Linked list of compressors */
+    TAILQ_ENTRY(__wt_named_compressor) q;
 };
 
 /*
@@ -48,10 +103,24 @@ struct __wt_named_compressor {
  *	A data source list entry
  */
 struct __wt_named_data_source {
-	const char *prefix;		/* Name of data source */
-	WT_DATA_SOURCE *dsrc;		/* User supplied callbacks */
-					/* Linked list of data sources */
-	TAILQ_ENTRY(__wt_named_data_source) q;
+    const char *prefix;   /* Name of data source */
+    WT_DATA_SOURCE *dsrc; /* User supplied callbacks */
+    /* Linked list of data sources */
+    TAILQ_ENTRY(__wt_named_data_source) q;
+};
+
+/*
+ * WT_NAMED_ENCRYPTOR --
+ *	An encryptor list entry
+ */
+struct __wt_named_encryptor {
+    const char *name;        /* Name of encryptor */
+    WT_ENCRYPTOR *encryptor; /* User supplied callbacks */
+    /* Locked: list of encryptors by key */
+    TAILQ_HEAD(__wt_keyedhash, __wt_keyed_encryptor) * keyedhashqh;
+    TAILQ_HEAD(__wt_keyed_qh, __wt_keyed_encryptor) keyedqh;
+    /* Linked list of encryptors */
+    TAILQ_ENTRY(__wt_named_encryptor) q;
 };
 
 /*
@@ -59,310 +128,532 @@ struct __wt_named_data_source {
  *	An extractor list entry
  */
 struct __wt_named_extractor {
-	const char *name;		/* Name of extractor */
-	WT_EXTRACTOR *extractor;		/* User supplied object */
-	TAILQ_ENTRY(__wt_named_extractor) q;	/* Linked list of extractors */
+    const char *name;                    /* Name of extractor */
+    WT_EXTRACTOR *extractor;             /* User supplied object */
+    TAILQ_ENTRY(__wt_named_extractor) q; /* Linked list of extractors */
 };
 
 /*
- * Allocate some additional slots for internal sessions.  There is a default
- * session for each connection, plus a session for each server thread.
+ * WT_NAMED_STORAGE_SOURCE --
+ *	A storage source list entry
  */
-#define	WT_NUM_INTERNAL_SESSIONS	10
+struct __wt_named_storage_source {
+    const char *name;                  /* Name of storage source */
+    WT_STORAGE_SOURCE *storage_source; /* User supplied callbacks */
+    TAILQ_HEAD(__wt_buckethash, __wt_bucket_storage) * buckethashqh;
+    TAILQ_HEAD(__wt_bucket_qh, __wt_bucket_storage) bucketqh;
+    /* Linked list of storage sources */
+    TAILQ_ENTRY(__wt_named_storage_source) q;
+};
+
+/*
+ * WT_NAME_FLAG --
+ *	Simple structure for name and flag configuration searches
+ */
+struct __wt_name_flag {
+    const char *name;
+    uint64_t flag;
+};
 
 /*
  * WT_CONN_CHECK_PANIC --
  *	Check if we've panicked and return the appropriate error.
  */
-#define	WT_CONN_CHECK_PANIC(conn)					\
-	(F_ISSET(conn, WT_CONN_PANIC) ? WT_PANIC : 0)
-#define	WT_SESSION_CHECK_PANIC(session)					\
-	WT_CONN_CHECK_PANIC(S2C(session))
+#define WT_CONN_CHECK_PANIC(conn) (F_ISSET(conn, WT_CONN_PANIC) ? WT_PANIC : 0)
+#define WT_SESSION_CHECK_PANIC(session) WT_CONN_CHECK_PANIC(S2C(session))
 
 /*
- * Macros to ensure the dhandle is inserted or removed from both the
- * main queue and the hashed queue.
+ * Macros to ensure the dhandle is inserted or removed from both the main queue and the hashed
+ * queue.
  */
-#define	WT_CONN_DHANDLE_INSERT(conn, dhandle, bucket) do {		\
-	SLIST_INSERT_HEAD(&(conn)->dhlh, dhandle, l);			\
-	SLIST_INSERT_HEAD(&(conn)->dhhash[bucket], dhandle, hashl);	\
-} while (0)
+#define WT_CONN_DHANDLE_INSERT(conn, dhandle, bucket)                                            \
+    do {                                                                                         \
+        WT_ASSERT(session, FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_HANDLE_LIST_WRITE)); \
+        TAILQ_INSERT_HEAD(&(conn)->dhqh, dhandle, q);                                            \
+        TAILQ_INSERT_HEAD(&(conn)->dhhash[bucket], dhandle, hashq);                              \
+        ++(conn)->dh_bucket_count[bucket];                                                       \
+        ++(conn)->dhandle_count;                                                                 \
+    } while (0)
 
-#define	WT_CONN_DHANDLE_REMOVE(conn, dhandle, bucket) do {		\
-	SLIST_REMOVE(&(conn)->dhlh, dhandle, __wt_data_handle, l);	\
-	SLIST_REMOVE(&(conn)->dhhash[bucket],				\
-	    dhandle, __wt_data_handle, hashl);				\
-} while (0)
+#define WT_CONN_DHANDLE_REMOVE(conn, dhandle, bucket)                                            \
+    do {                                                                                         \
+        WT_ASSERT(session, FLD_ISSET(session->lock_flags, WT_SESSION_LOCKED_HANDLE_LIST_WRITE)); \
+        TAILQ_REMOVE(&(conn)->dhqh, dhandle, q);                                                 \
+        TAILQ_REMOVE(&(conn)->dhhash[bucket], dhandle, hashq);                                   \
+        --(conn)->dh_bucket_count[bucket];                                                       \
+        --(conn)->dhandle_count;                                                                 \
+    } while (0)
 
 /*
- * Macros to ensure the block is inserted or removed from both the
- * main queue and the hashed queue.
+ * Macros to ensure the block is inserted or removed from both the main queue and the hashed queue.
  */
-#define	WT_CONN_BLOCK_INSERT(conn, block, bucket) do {			\
-	SLIST_INSERT_HEAD(&(conn)->blocklh, block, l);			\
-	SLIST_INSERT_HEAD(&(conn)->blockhash[bucket], block, hashl);	\
-} while (0)
+#define WT_CONN_BLOCK_INSERT(conn, block, bucket)                    \
+    do {                                                             \
+        TAILQ_INSERT_HEAD(&(conn)->blockqh, block, q);               \
+        TAILQ_INSERT_HEAD(&(conn)->blockhash[bucket], block, hashq); \
+    } while (0)
 
-#define	WT_CONN_BLOCK_REMOVE(conn, block, bucket) do {			\
-	SLIST_REMOVE(&(conn)->blocklh, block, __wt_block, l);		\
-	SLIST_REMOVE(							\
-	    &(conn)->blockhash[bucket], block, __wt_block, hashl);	\
-} while (0)
+#define WT_CONN_BLOCK_REMOVE(conn, block, bucket)               \
+    do {                                                        \
+        TAILQ_REMOVE(&(conn)->blockqh, block, q);               \
+        TAILQ_REMOVE(&(conn)->blockhash[bucket], block, hashq); \
+    } while (0)
 
 /*
- * Macros to ensure the file handle is inserted or removed from both the
- * main queue and the hashed queue.
+ * WT_CONN_HOTBACKUP_START --
+ *	Macro to set connection data appropriately for when we commence hot backup.
  */
-#define	WT_CONN_FILE_INSERT(conn, fh, bucket) do {			\
-	SLIST_INSERT_HEAD(&(conn)->fhlh, fh, l);			\
-	SLIST_INSERT_HEAD(&(conn)->fhhash[bucket], fh, hashl);		\
-} while (0)
-
-#define	WT_CONN_FILE_REMOVE(conn, fh, bucket) do {			\
-	SLIST_REMOVE(&(conn)->fhlh, fh, __wt_fh, l);			\
-	SLIST_REMOVE(&(conn)->fhhash[bucket], fh, __wt_fh, hashl);	\
-} while (0)
+#define WT_CONN_HOTBACKUP_START(conn)                        \
+    do {                                                     \
+        (conn)->hot_backup_start = (conn)->ckpt_most_recent; \
+        (conn)->hot_backup_list = NULL;                      \
+    } while (0)
 
 /*
  * WT_CONNECTION_IMPL --
  *	Implementation of WT_CONNECTION
  */
 struct __wt_connection_impl {
-	WT_CONNECTION iface;
+    WT_CONNECTION iface;
 
-	/* For operations without an application-supplied session */
-	WT_SESSION_IMPL *default_session;
-	WT_SESSION_IMPL  dummy_session;
+    /* For operations without an application-supplied session */
+    WT_SESSION_IMPL *default_session;
+    WT_SESSION_IMPL dummy_session;
 
-	const char *cfg;		/* Connection configuration */
+    const char *cfg; /* Connection configuration */
 
-	WT_SPINLOCK api_lock;		/* Connection API spinlock */
-	WT_SPINLOCK checkpoint_lock;	/* Checkpoint spinlock */
-	WT_SPINLOCK dhandle_lock;	/* Data handle list spinlock */
-	WT_SPINLOCK fh_lock;		/* File handle queue spinlock */
-	WT_SPINLOCK reconfig_lock;	/* Single thread reconfigure */
-	WT_SPINLOCK schema_lock;	/* Schema operation spinlock */
-	WT_SPINLOCK table_lock;		/* Table creation spinlock */
+    WT_SPINLOCK api_lock;        /* Connection API spinlock */
+    WT_SPINLOCK checkpoint_lock; /* Checkpoint spinlock */
+    WT_SPINLOCK fh_lock;         /* File handle queue spinlock */
+    WT_SPINLOCK metadata_lock;   /* Metadata update spinlock */
+    WT_SPINLOCK reconfig_lock;   /* Single thread reconfigure */
+    WT_SPINLOCK schema_lock;     /* Schema operation spinlock */
+    WT_RWLOCK table_lock;        /* Table list lock */
+    WT_SPINLOCK turtle_lock;     /* Turtle file spinlock */
+    WT_RWLOCK dhandle_lock;      /* Data handle list lock */
 
-	/*
-	 * We distribute the btree page locks across a set of spin locks; it
-	 * can't be an array, we impose cache-line alignment and gcc doesn't
-	 * support that for arrays.  Don't use too many: they are only held for
-	 * very short operations, each one is 64 bytes, so 256 will fill the L1
-	 * cache on most CPUs.
-	 */
-#define	WT_PAGE_LOCKS(conn)	16
-	WT_SPINLOCK *page_lock;	        /* Btree page spinlocks */
-	u_int	     page_lock_cnt;	/* Next spinlock to use */
+    /* Connection queue */
+    TAILQ_ENTRY(__wt_connection_impl) q;
+    /* Cache pool queue */
+    TAILQ_ENTRY(__wt_connection_impl) cpq;
 
-					/* Connection queue */
-	TAILQ_ENTRY(__wt_connection_impl) q;
-					/* Cache pool queue */
-	TAILQ_ENTRY(__wt_connection_impl) cpq;
+    const char *home;         /* Database home */
+    const char *error_prefix; /* Database error prefix */
+    uint64_t dh_hash_size;    /* Data handle hash bucket array size */
+    uint64_t hash_size;       /* General hash bucket array size */
+    int is_new;               /* Connection created database */
 
-	const char *home;		/* Database home */
-	const char *error_prefix;	/* Database error prefix */
-	int is_new;			/* Connection created database */
+    uint16_t compat_major; /* Compatibility major version */
+    uint16_t compat_minor; /* Compatibility minor version */
+#define WT_CONN_COMPAT_NONE UINT16_MAX
+    uint16_t req_max_major; /* Compatibility maximum major */
+    uint16_t req_max_minor; /* Compatibility maximum minor */
+    uint16_t req_min_major; /* Compatibility minimum major */
+    uint16_t req_min_minor; /* Compatibility minimum minor */
 
-	WT_EXTENSION_API extension_api;	/* Extension API */
+    WT_EXTENSION_API extension_api; /* Extension API */
 
-					/* Configuration */
-	const WT_CONFIG_ENTRY **config_entries;
+    /* Configuration */
+    const WT_CONFIG_ENTRY **config_entries;
 
-	void  **foc;			/* Free-on-close array */
-	size_t  foc_cnt;		/* Array entries */
-	size_t  foc_size;		/* Array size */
+    uint64_t operation_timeout_us; /* Maximum operation period before rollback */
 
-	WT_FH *lock_fh;			/* Lock file handle */
+    const char *optrack_path;         /* Directory for operation logs */
+    WT_FH *optrack_map_fh;            /* Name to id translation file. */
+    WT_SPINLOCK optrack_map_spinlock; /* Translation file spinlock. */
+    uintmax_t optrack_pid;            /* Cache the process ID. */
 
-	volatile uint64_t  split_gen;	/* Generation number for splits */
+    void **foc;      /* Free-on-close array */
+    size_t foc_cnt;  /* Array entries */
+    size_t foc_size; /* Array size */
 
-	/*
-	 * The connection keeps a cache of data handles. The set of handles
-	 * can grow quite large so we maintain both a simple list and a hash
-	 * table of lists. The hash table key is based on a hash of the table
-	 * URI.
-	 */
-					/* Locked: data handle hash array */
-#define	WT_HASH_ARRAY_SIZE	512
-	SLIST_HEAD(__wt_dhhash, __wt_data_handle) dhhash[WT_HASH_ARRAY_SIZE];
-					/* Locked: data handle list */
-	SLIST_HEAD(__wt_dhandle_lh, __wt_data_handle) dhlh;
-					/* Locked: LSM handle list. */
-	TAILQ_HEAD(__wt_lsm_qh, __wt_lsm_tree) lsmqh;
-					/* Locked: file list */
-	SLIST_HEAD(__wt_fhhash, __wt_fh) fhhash[WT_HASH_ARRAY_SIZE];
-	SLIST_HEAD(__wt_fh_lh, __wt_fh) fhlh;
-					/* Locked: library list */
-	TAILQ_HEAD(__wt_dlh_qh, __wt_dlh) dlhqh;
+    WT_FH *lock_fh; /* Lock file handle */
 
-	WT_SPINLOCK block_lock;		/* Locked: block manager list */
-	SLIST_HEAD(__wt_blockhash, __wt_block) blockhash[WT_HASH_ARRAY_SIZE];
-	SLIST_HEAD(__wt_block_lh, __wt_block) blocklh;
+    /*
+     * The connection keeps a cache of data handles. The set of handles can grow quite large so we
+     * maintain both a simple list and a hash table of lists. The hash table key is based on a hash
+     * of the table URI.
+     */
+    /* Locked: data handle hash array */
+    TAILQ_HEAD(__wt_dhhash, __wt_data_handle) * dhhash;
+    /* Locked: data handle list */
+    TAILQ_HEAD(__wt_dhandle_qh, __wt_data_handle) dhqh;
+    /* Locked: LSM handle list. */
+    TAILQ_HEAD(__wt_lsm_qh, __wt_lsm_tree) lsmqh;
+    /* Locked: file list */
+    TAILQ_HEAD(__wt_fhhash, __wt_fh) * fhhash;
+    TAILQ_HEAD(__wt_fh_qh, __wt_fh) fhqh;
+    /* Locked: library list */
+    TAILQ_HEAD(__wt_dlh_qh, __wt_dlh) dlhqh;
 
-	u_int open_btree_count;		/* Locked: open writable btree count */
-	uint32_t next_file_id;		/* Locked: file ID counter */
+    WT_SPINLOCK block_lock; /* Locked: block manager list */
+    TAILQ_HEAD(__wt_blockhash, __wt_block) * blockhash;
+    TAILQ_HEAD(__wt_block_qh, __wt_block) blockqh;
 
-	/*
-	 * WiredTiger allocates space for 50 simultaneous sessions (threads of
-	 * control) by default.  Growing the number of threads dynamically is
-	 * possible, but tricky since server threads are walking the array
-	 * without locking it.
-	 *
-	 * There's an array of WT_SESSION_IMPL pointers that reference the
-	 * allocated array; we do it that way because we want an easy way for
-	 * the server thread code to avoid walking the entire array when only a
-	 * few threads are running.
-	 */
-	WT_SESSION_IMPL	*sessions;	/* Session reference */
-	uint32_t	 session_size;	/* Session array size */
-	uint32_t	 session_cnt;	/* Session count */
+    /* Locked: handles in each bucket */
+    uint64_t *dh_bucket_count;
+    uint64_t dhandle_count;     /* Locked: handles in the queue */
+    u_int open_btree_count;     /* Locked: open writable btree count */
+    uint32_t next_file_id;      /* Locked: file ID counter */
+    uint32_t open_file_count;   /* Atomic: open file handle count */
+    uint32_t open_cursor_count; /* Atomic: open cursor handle count */
 
-	size_t     session_scratch_max;	/* Max scratch memory per session */
+    /*
+     * WiredTiger allocates space for 50 simultaneous sessions (threads of control) by default.
+     * Growing the number of threads dynamically is possible, but tricky since server threads are
+     * walking the array without locking it.
+     *
+     * There's an array of WT_SESSION_IMPL pointers that reference the allocated array; we do it
+     * that way because we want an easy way for the server thread code to avoid walking the entire
+     * array when only a few threads are running.
+     */
+    WT_SESSION_IMPL *sessions; /* Session reference */
+    uint32_t session_size;     /* Session array size */
+    uint32_t session_cnt;      /* Session count */
 
-	/*
-	 * WiredTiger allocates space for a fixed number of hazard pointers
-	 * in each thread of control.
-	 */
-	uint32_t   hazard_max;		/* Hazard array size */
+    size_t session_scratch_max; /* Max scratch memory per session */
 
-	WT_CACHE  *cache;		/* Page cache */
-	uint64_t   cache_size;		/* Configured cache size */
+    WT_CACHE *cache;              /* Page cache */
+    volatile uint64_t cache_size; /* Cache size (either statically
+                                     configured or the current size
+                                     within a cache pool). */
 
-	WT_TXN_GLOBAL txn_global;	/* Global transaction state */
+    WT_TXN_GLOBAL txn_global; /* Global transaction state */
 
-	WT_SPINLOCK hot_backup_lock;	/* Hot backup serialization */
-	int hot_backup;
+    /* Recovery checkpoint snapshot details saved in the metadata file */
+    uint64_t recovery_ckpt_snap_min, recovery_ckpt_snap_max;
+    uint64_t *recovery_ckpt_snapshot;
+    uint32_t recovery_ckpt_snapshot_count;
 
-	WT_SESSION_IMPL *ckpt_session;	/* Checkpoint thread session */
-	wt_thread_t	 ckpt_tid;	/* Checkpoint thread */
-	int		 ckpt_tid_set;	/* Checkpoint thread set */
-	WT_CONDVAR	*ckpt_cond;	/* Checkpoint wait mutex */
-	const char	*ckpt_config;	/* Checkpoint configuration */
-#define	WT_CKPT_LOGSIZE(conn)	((conn)->ckpt_logsize != 0)
-	wt_off_t	 ckpt_logsize;	/* Checkpoint log size period */
-	uint32_t	 ckpt_signalled;/* Checkpoint signalled */
-	uint64_t	 ckpt_usecs;	/* Checkpoint period */
+    WT_RWLOCK hot_backup_lock; /* Hot backup serialization */
+    uint64_t hot_backup_start; /* Clock value of most recent checkpoint needed by hot backup */
+    char **hot_backup_list;    /* Hot backup file list */
 
-	int compact_in_memory_pass;	/* Compaction serialization */
+    WT_SESSION_IMPL *ckpt_session; /* Checkpoint thread session */
+    wt_thread_t ckpt_tid;          /* Checkpoint thread */
+    bool ckpt_tid_set;             /* Checkpoint thread set */
+    WT_CONDVAR *ckpt_cond;         /* Checkpoint wait mutex */
+    uint64_t ckpt_most_recent;     /* Clock value of most recent checkpoint */
+#define WT_CKPT_LOGSIZE(conn) ((conn)->ckpt_logsize != 0)
+    wt_off_t ckpt_logsize; /* Checkpoint log size period */
+    bool ckpt_signalled;   /* Checkpoint signalled */
 
-#define	WT_CONN_STAT_ALL	0x01	/* "all" statistics configured */
-#define	WT_CONN_STAT_CLEAR	0x02	/* clear after gathering */
-#define	WT_CONN_STAT_FAST	0x04	/* "fast" statistics configured */
-#define	WT_CONN_STAT_NONE	0x08	/* don't gather statistics */
-#define	WT_CONN_STAT_ON_CLOSE	0x10	/* output statistics on close */
-	uint32_t stat_flags;
+    uint64_t ckpt_apply;      /* Checkpoint handles applied */
+    uint64_t ckpt_apply_time; /* Checkpoint applied handles gather time */
+    uint64_t ckpt_skip;       /* Checkpoint handles skipped */
+    uint64_t ckpt_skip_time;  /* Checkpoint skipped handles gather time */
+    uint64_t ckpt_usecs;      /* Checkpoint timer */
+    uint64_t ckpt_prep_max;   /* Checkpoint prepare time min/max */
+    uint64_t ckpt_prep_min;
+    uint64_t ckpt_prep_recent; /* Checkpoint prepare time recent/total */
+    uint64_t ckpt_prep_total;
+    uint64_t ckpt_time_max; /* Checkpoint time min/max */
+    uint64_t ckpt_time_min;
+    uint64_t ckpt_time_recent; /* Checkpoint time recent/total */
+    uint64_t ckpt_time_total;
 
-	WT_CONNECTION_STATS stats;	/* Connection statistics */
+    /* Checkpoint stats and verbosity timers */
+    struct timespec ckpt_prep_end;
+    struct timespec ckpt_prep_start;
+    struct timespec ckpt_timer_start;
+    struct timespec ckpt_timer_scrub_end;
 
-#if SPINLOCK_TYPE == SPINLOCK_PTHREAD_MUTEX_LOGGING
-	/*
-	 * Spinlock registration, so we can track which spinlocks are heavily
-	 * used, which are blocking and where.
-	 *
-	 * There's an array of spinlocks, and an array of blocking IDs.
-	 */
-#define	WT_SPINLOCK_MAX			1024
-#define	WT_SPINLOCK_MAX_LOCATION_ID	60
-	WT_SPINLOCK *spinlock_list[WT_SPINLOCK_MAX];
+    /* Checkpoint progress message data */
+    uint64_t ckpt_progress_msg_count;
+    uint64_t ckpt_write_bytes;
+    uint64_t ckpt_write_pages;
 
-					/* Spinlock blocking matrix */
-	struct __wt_connection_stats_spinlock {
-		const char *name;	/* Mutex name */
+    /* Checkpoint and incremental backup data */
+    uint64_t incr_granularity;
+    WT_BLKINCR incr_backups[WT_BLKINCR_MAX];
 
-		const char *file;	/* Caller's file/line, ID location */
-		int line;
+    /* Connection's base write generation. */
+    uint64_t base_write_gen;
 
-		u_int total;		/* Count of total, blocked calls */
-		u_int blocked[WT_SPINLOCK_MAX_LOCATION_ID];
-	} spinlock_block[WT_SPINLOCK_MAX_LOCATION_ID];
-#endif
+    /* Last checkpoint connection's base write generation */
+    uint64_t last_ckpt_base_write_gen;
 
-	WT_ASYNC	*async;		/* Async structure */
-	int		 async_cfg;	/* Global async configuration */
-	uint32_t	 async_size;	/* Async op array size */
-	uint32_t	 async_workers;	/* Number of async workers */
+    uint32_t stat_flags; /* Options declared in flags.py */
 
-	WT_LSM_MANAGER	lsm_manager;	/* LSM worker thread information */
+    /* Connection statistics */
+    uint64_t rec_maximum_seconds; /* Maximum seconds reconciliation took. */
+    WT_CONNECTION_STATS *stats[WT_COUNTER_SLOTS];
+    WT_CONNECTION_STATS *stat_array;
 
-	WT_SESSION_IMPL *evict_session; /* Eviction server sessions */
-	wt_thread_t	 evict_tid;	/* Eviction server thread ID */
-	int		 evict_tid_set;	/* Eviction server thread ID set */
+    WT_CAPACITY capacity;              /* Capacity structure */
+    WT_SESSION_IMPL *capacity_session; /* Capacity thread session */
+    wt_thread_t capacity_tid;          /* Capacity thread */
+    bool capacity_tid_set;             /* Capacity thread set */
+    WT_CONDVAR *capacity_cond;         /* Capacity wait mutex */
 
-	uint32_t	 evict_workers_alloc;/* Allocated eviction workers */
-	uint32_t	 evict_workers_max;/* Max eviction workers */
-	uint32_t	 evict_workers_min;/* Min eviction workers */
-	uint32_t	 evict_workers;	/* Number of eviction workers */
-	WT_EVICT_WORKER	*evict_workctx;	/* Eviction worker context */
+    WT_LSM_MANAGER lsm_manager; /* LSM worker thread information */
 
-	WT_SESSION_IMPL *stat_session;	/* Statistics log session */
-	wt_thread_t	 stat_tid;	/* Statistics log thread */
-	int		 stat_tid_set;	/* Statistics log thread set */
-	WT_CONDVAR	*stat_cond;	/* Statistics log wait mutex */
-	const char	*stat_format;	/* Statistics log timestamp format */
-	FILE		*stat_fp;	/* Statistics log file handle */
-	char		*stat_path;	/* Statistics log path format */
-	char	       **stat_sources;	/* Statistics log list of objects */
-	const char	*stat_stamp;	/* Statistics log entry timestamp */
-	uint64_t	 stat_usecs;	/* Statistics log period */
+    WT_BUCKET_STORAGE *bstorage;     /* Bucket storage for the connection */
+    WT_BUCKET_STORAGE bstorage_none; /* Bucket storage for "none" */
 
-#define	WT_CONN_LOG_ARCHIVE	0x01	/* Archive is enabled */
-#define	WT_CONN_LOG_ENABLED	0x02	/* Logging is enabled */
-#define	WT_CONN_LOG_EXISTED	0x04	/* Log files found */
-#define	WT_CONN_LOG_PREALLOC	0x08	/* Pre-allocation is enabled */
-#define	WT_CONN_LOG_RECOVER_ERR	0x10	/* Error if recovery required */
-	uint32_t	 log_flags;	/* Global logging configuration */
-	WT_CONDVAR	*log_cond;	/* Log server wait mutex */
-	WT_SESSION_IMPL *log_session;	/* Log server session */
-	wt_thread_t	 log_tid;	/* Log server thread */
-	int		 log_tid_set;	/* Log server thread set */
-	WT_CONDVAR	*log_close_cond;/* Log close thread wait mutex */
-	WT_SESSION_IMPL *log_close_session;/* Log close thread session */
-	wt_thread_t	 log_close_tid;	/* Log close thread thread */
-	int		 log_close_tid_set;/* Log close thread set */
-	WT_CONDVAR	*log_wrlsn_cond;/* Log write lsn thread wait mutex */
-	WT_SESSION_IMPL *log_wrlsn_session;/* Log write lsn thread session */
-	wt_thread_t	 log_wrlsn_tid;	/* Log write lsn thread thread */
-	int		 log_wrlsn_tid_set;/* Log write lsn thread set */
-	WT_LOG		*log;		/* Logging structure */
-	WT_COMPRESSOR	*log_compressor;/* Logging compressor */
-	wt_off_t	 log_file_max;	/* Log file max size */
-	const char	*log_path;	/* Logging path format */
-	uint32_t	 log_prealloc;	/* Log file pre-allocation */
-	uint32_t	 txn_logsync;	/* Log sync configuration */
+    WT_KEYED_ENCRYPTOR *kencryptor; /* Encryptor for metadata and log */
 
-	WT_SESSION_IMPL *sweep_session;	/* Handle sweep session */
-	wt_thread_t	 sweep_tid;	/* Handle sweep thread */
-	int		 sweep_tid_set;	/* Handle sweep thread set */
-	WT_CONDVAR	*sweep_cond;	/* Handle sweep wait mutex */
-	time_t		 sweep_idle_time;/* Handle sweep idle time */
-	time_t		 sweep_interval;/* Handle sweep interval */
+    bool evict_server_running; /* Eviction server operating */
 
-					/* Locked: collator list */
-	TAILQ_HEAD(__wt_coll_qh, __wt_named_collator) collqh;
+    WT_THREAD_GROUP evict_threads;
+    uint32_t evict_threads_max; /* Max eviction threads */
+    uint32_t evict_threads_min; /* Min eviction threads */
 
-					/* Locked: compressor list */
-	TAILQ_HEAD(__wt_comp_qh, __wt_named_compressor) compqh;
+#define WT_STATLOG_FILENAME "WiredTigerStat.%d.%H"
+    WT_SESSION_IMPL *stat_session; /* Statistics log session */
+    wt_thread_t stat_tid;          /* Statistics log thread */
+    bool stat_tid_set;             /* Statistics log thread set */
+    WT_CONDVAR *stat_cond;         /* Statistics log wait mutex */
+    const char *stat_format;       /* Statistics log timestamp format */
+    WT_FSTREAM *stat_fs;           /* Statistics log stream */
+    /* Statistics log json table printing state flag */
+    bool stat_json_tables;
+    char *stat_path;        /* Statistics log path format */
+    char **stat_sources;    /* Statistics log list of objects */
+    const char *stat_stamp; /* Statistics log entry timestamp */
+    uint64_t stat_usecs;    /* Statistics log period */
 
-					/* Locked: data source list */
-	TAILQ_HEAD(__wt_dsrc_qh, __wt_named_data_source) dsrcqh;
+    WT_SESSION_IMPL *tiered_session; /* Tiered thread session */
+    wt_thread_t tiered_tid;          /* Tiered thread */
+    bool tiered_tid_set;             /* Tiered thread set */
+    WT_CONDVAR *tiered_cond;         /* Tiered wait mutex */
+    bool tiered_server_running;      /* Internal tiered server operating */
 
-					/* Locked: extractor list */
-	TAILQ_HEAD(__wt_extractor_qh, __wt_named_extractor) extractorqh;
+    WT_TIERED_MANAGER tiered_mgr;        /* Tiered manager thread information */
+    WT_SESSION_IMPL *tiered_mgr_session; /* Tiered manager thread session */
+    wt_thread_t tiered_mgr_tid;          /* Tiered manager thread */
+    bool tiered_mgr_tid_set;             /* Tiered manager thread set */
+    WT_CONDVAR *tiered_mgr_cond;         /* Tiered manager wait mutex */
 
-	void	*lang_private;		/* Language specific private storage */
+    uint32_t tiered_threads_max; /* Max tiered threads */
+    uint32_t tiered_threads_min; /* Min tiered threads */
 
-	/* If non-zero, all buffers used for I/O will be aligned to this. */
-	size_t buffer_alignment;
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define WT_CONN_LOG_ARCHIVE 0x001u         /* Archive is enabled */
+#define WT_CONN_LOG_CONFIG_ENABLED 0x002u  /* Logging is configured */
+#define WT_CONN_LOG_DEBUG_MODE 0x004u      /* Debug-mode logging enabled */
+#define WT_CONN_LOG_DOWNGRADED 0x008u      /* Running older version */
+#define WT_CONN_LOG_ENABLED 0x010u         /* Logging is enabled */
+#define WT_CONN_LOG_EXISTED 0x020u         /* Log files found */
+#define WT_CONN_LOG_FORCE_DOWNGRADE 0x040u /* Force downgrade */
+#define WT_CONN_LOG_RECOVER_DIRTY 0x080u   /* Recovering unclean */
+#define WT_CONN_LOG_RECOVER_DONE 0x100u    /* Recovery completed */
+#define WT_CONN_LOG_RECOVER_ERR 0x200u     /* Error if recovery required */
+#define WT_CONN_LOG_RECOVER_FAILED 0x400u  /* Recovery failed */
+#define WT_CONN_LOG_ZERO_FILL 0x800u       /* Manually zero files */
+                                           /* AUTOMATIC FLAG VALUE GENERATION STOP */
+    uint32_t log_flags;                    /* Global logging configuration */
+    WT_CONDVAR *log_cond;                  /* Log server wait mutex */
+    WT_SESSION_IMPL *log_session;          /* Log server session */
+    wt_thread_t log_tid;                   /* Log server thread */
+    bool log_tid_set;                      /* Log server thread set */
+    WT_CONDVAR *log_file_cond;             /* Log file thread wait mutex */
+    WT_SESSION_IMPL *log_file_session;     /* Log file thread session */
+    wt_thread_t log_file_tid;              /* Log file thread */
+    bool log_file_tid_set;                 /* Log file thread set */
+    WT_CONDVAR *log_wrlsn_cond;            /* Log write lsn thread wait mutex */
+    WT_SESSION_IMPL *log_wrlsn_session;    /* Log write lsn thread session */
+    wt_thread_t log_wrlsn_tid;             /* Log write lsn thread */
+    bool log_wrlsn_tid_set;                /* Log write lsn thread set */
+    WT_LOG *log;                           /* Logging structure */
+    WT_COMPRESSOR *log_compressor;         /* Logging compressor */
+    uint32_t log_cursors;                  /* Log cursor count */
+    wt_off_t log_dirty_max;                /* Log dirty system cache max size */
+    wt_off_t log_file_max;                 /* Log file max size */
+    const char *log_path;                  /* Logging path format */
+    uint32_t log_prealloc;                 /* Log file pre-allocation */
+    uint16_t log_req_max;                  /* Max required log version */
+    uint16_t log_req_min;                  /* Min required log version */
+    uint32_t txn_logsync;                  /* Log sync configuration */
 
-	uint32_t schema_gen;		/* Schema generation number */
+    WT_SESSION_IMPL *meta_ckpt_session; /* Metadata checkpoint session */
 
-	wt_off_t data_extend_len;	/* file_extend data length */
-	wt_off_t log_extend_len;	/* file_extend log length */
+    /*
+     * Is there a data/schema change that needs to be the part of a checkpoint.
+     */
+    bool modified;
 
-	uint32_t direct_io;		/* O_DIRECT file type flags */
-	int	 mmap;			/* mmap configuration */
-	uint32_t verbose;
+    WT_SESSION_IMPL *sweep_session; /* Handle sweep session */
+    wt_thread_t sweep_tid;          /* Handle sweep thread */
+    int sweep_tid_set;              /* Handle sweep thread set */
+    WT_CONDVAR *sweep_cond;         /* Handle sweep wait mutex */
+    uint64_t sweep_idle_time;       /* Handle sweep idle time */
+    uint64_t sweep_interval;        /* Handle sweep interval */
+    uint64_t sweep_handles_min;     /* Handle sweep minimum open */
 
-	uint32_t flags;
+    uint32_t stable_rollback_maxfile;
+
+    /* Locked: collator list */
+    TAILQ_HEAD(__wt_coll_qh, __wt_named_collator) collqh;
+
+    /* Locked: compressor list */
+    TAILQ_HEAD(__wt_comp_qh, __wt_named_compressor) compqh;
+
+    /* Locked: data source list */
+    TAILQ_HEAD(__wt_dsrc_qh, __wt_named_data_source) dsrcqh;
+
+    /* Locked: encryptor list */
+    WT_SPINLOCK encryptor_lock; /* Encryptor list lock */
+    TAILQ_HEAD(__wt_encrypt_qh, __wt_named_encryptor) encryptqh;
+
+    /* Locked: extractor list */
+    TAILQ_HEAD(__wt_extractor_qh, __wt_named_extractor) extractorqh;
+
+    /* Locked: storage source list */
+    WT_SPINLOCK storage_lock; /* Storage source list lock */
+    TAILQ_HEAD(__wt_storage_source_qh, __wt_named_storage_source) storagesrcqh;
+
+    void *lang_private; /* Language specific private storage */
+
+    /* If non-zero, all buffers used for I/O will be aligned to this. */
+    size_t buffer_alignment;
+
+    uint64_t stashed_bytes; /* Atomic: stashed memory statistics */
+    uint64_t stashed_objects;
+    /* Generations manager */
+    volatile uint64_t generations[WT_GENERATIONS];
+
+    wt_off_t data_extend_len; /* file_extend data length */
+    wt_off_t log_extend_len;  /* file_extend log length */
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define WT_DIRECT_IO_CHECKPOINT 0x1u /* Checkpoints */
+#define WT_DIRECT_IO_DATA 0x2u       /* Data files */
+#define WT_DIRECT_IO_LOG 0x4u        /* Log files */
+                                     /* AUTOMATIC FLAG VALUE GENERATION STOP */
+    uint64_t direct_io;              /* O_DIRECT, FILE_FLAG_NO_BUFFERING */
+    uint64_t write_through;          /* FILE_FLAG_WRITE_THROUGH */
+
+    bool mmap;     /* use mmap when reading checkpoints */
+    bool mmap_all; /* use mmap for all I/O on data files */
+    int page_size; /* OS page size for mmap alignment */
+
+    WT_LSN *debug_ckpt;      /* Debug mode checkpoint LSNs. */
+    size_t debug_ckpt_alloc; /* Checkpoint retention allocated. */
+    uint32_t debug_ckpt_cnt; /* Checkpoint retention number. */
+    uint32_t debug_log_cnt;  /* Log file retention count */
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define WT_CONN_DEBUG_CKPT_RETAIN 0x01u
+#define WT_CONN_DEBUG_CORRUPTION_ABORT 0x02u
+#define WT_CONN_DEBUG_CURSOR_COPY 0x04u
+#define WT_CONN_DEBUG_REALLOC_EXACT 0x08u
+#define WT_CONN_DEBUG_SLOW_CKPT 0x10u
+    /* AUTOMATIC FLAG VALUE GENERATION STOP */
+    uint64_t debug_flags;
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define WT_VERB_API 0x0000000001u
+#define WT_VERB_BACKUP 0x0000000002u
+#define WT_VERB_BLOCK 0x0000000004u
+#define WT_VERB_CHECKPOINT 0x0000000008u
+#define WT_VERB_CHECKPOINT_CLEANUP 0x0000000010u
+#define WT_VERB_CHECKPOINT_PROGRESS 0x0000000020u
+#define WT_VERB_COMPACT 0x0000000040u
+#define WT_VERB_COMPACT_PROGRESS 0x0000000080u
+#define WT_VERB_ERROR_RETURNS 0x0000000100u
+#define WT_VERB_EVICT 0x0000000200u
+#define WT_VERB_EVICTSERVER 0x0000000400u
+#define WT_VERB_EVICT_STUCK 0x0000000800u
+#define WT_VERB_FILEOPS 0x0000001000u
+#define WT_VERB_HANDLEOPS 0x0000002000u
+#define WT_VERB_HS 0x0000004000u
+#define WT_VERB_HS_ACTIVITY 0x0000008000u
+#define WT_VERB_LOG 0x0000010000u
+#define WT_VERB_LSM 0x0000020000u
+#define WT_VERB_LSM_MANAGER 0x0000040000u
+#define WT_VERB_METADATA 0x0000080000u
+#define WT_VERB_MUTEX 0x0000100000u
+#define WT_VERB_OVERFLOW 0x0000200000u
+#define WT_VERB_READ 0x0000400000u
+#define WT_VERB_RECONCILE 0x0000800000u
+#define WT_VERB_RECOVERY 0x0001000000u
+#define WT_VERB_RECOVERY_PROGRESS 0x0002000000u
+#define WT_VERB_RTS 0x0004000000u
+#define WT_VERB_SALVAGE 0x0008000000u
+#define WT_VERB_SHARED_CACHE 0x0010000000u
+#define WT_VERB_SPLIT 0x0020000000u
+#define WT_VERB_TEMPORARY 0x0040000000u
+#define WT_VERB_THREAD_GROUP 0x0080000000u
+#define WT_VERB_TIERED 0x0100000000u
+#define WT_VERB_TIMESTAMP 0x0200000000u
+#define WT_VERB_TRANSACTION 0x0400000000u
+#define WT_VERB_VERIFY 0x0800000000u
+#define WT_VERB_VERSION 0x1000000000u
+#define WT_VERB_WRITE 0x2000000000u
+    /* AUTOMATIC FLAG VALUE GENERATION STOP */
+    uint64_t verbose;
+
+/*
+ * Variable with flags for which subsystems the diagnostic stress timing delays have been requested.
+ */
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define WT_TIMING_STRESS_AGGRESSIVE_SWEEP 0x0001u
+#define WT_TIMING_STRESS_BACKUP_RENAME 0x0002u
+#define WT_TIMING_STRESS_CHECKPOINT_SLOW 0x0004u
+#define WT_TIMING_STRESS_HS_CHECKPOINT_DELAY 0x0008u
+#define WT_TIMING_STRESS_HS_SEARCH 0x0010u
+#define WT_TIMING_STRESS_HS_SWEEP 0x0020u
+#define WT_TIMING_STRESS_PREPARE_CHECKPOINT_DELAY 0x0040u
+#define WT_TIMING_STRESS_SPLIT_1 0x0080u
+#define WT_TIMING_STRESS_SPLIT_2 0x0100u
+#define WT_TIMING_STRESS_SPLIT_3 0x0200u
+#define WT_TIMING_STRESS_SPLIT_4 0x0400u
+#define WT_TIMING_STRESS_SPLIT_5 0x0800u
+#define WT_TIMING_STRESS_SPLIT_6 0x1000u
+#define WT_TIMING_STRESS_SPLIT_7 0x2000u
+#define WT_TIMING_STRESS_SPLIT_8 0x4000u
+    /* AUTOMATIC FLAG VALUE GENERATION STOP */
+    uint64_t timing_stress_flags;
+
+#define WT_STDERR(s) (&S2C(s)->wt_stderr)
+#define WT_STDOUT(s) (&S2C(s)->wt_stdout)
+    WT_FSTREAM wt_stderr, wt_stdout;
+
+    /*
+     * File system interface abstracted to support alternative file system implementations.
+     */
+    WT_FILE_SYSTEM *file_system;
+
+/*
+ * Server subsystem flags.
+ */
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define WT_CONN_SERVER_CAPACITY 0x01u
+#define WT_CONN_SERVER_CHECKPOINT 0x02u
+#define WT_CONN_SERVER_LOG 0x04u
+#define WT_CONN_SERVER_LSM 0x08u
+#define WT_CONN_SERVER_STATISTICS 0x10u
+#define WT_CONN_SERVER_SWEEP 0x20u
+#define WT_CONN_SERVER_TIERED 0x40u
+#define WT_CONN_SERVER_TIERED_MGR 0x80u
+    /* AUTOMATIC FLAG VALUE GENERATION STOP */
+    uint32_t server_flags;
+
+/* AUTOMATIC FLAG VALUE GENERATION START */
+#define WT_CONN_CACHE_CURSORS 0x000001u
+#define WT_CONN_CACHE_POOL 0x000002u
+#define WT_CONN_CKPT_GATHER 0x000004u
+#define WT_CONN_CKPT_SYNC 0x000008u
+#define WT_CONN_CLOSING 0x000010u
+#define WT_CONN_CLOSING_NO_MORE_OPENS 0x000020u
+#define WT_CONN_CLOSING_TIMESTAMP 0x000040u
+#define WT_CONN_COMPATIBILITY 0x000080u
+#define WT_CONN_DATA_CORRUPTION 0x000100u
+#define WT_CONN_EVICTION_RUN 0x000200u
+#define WT_CONN_FILE_CLOSE_SYNC 0x000400u
+#define WT_CONN_HS_OPEN 0x000800u
+#define WT_CONN_INCR_BACKUP 0x001000u
+#define WT_CONN_IN_MEMORY 0x002000u
+#define WT_CONN_LEAK_MEMORY 0x004000u
+#define WT_CONN_LSM_MERGE 0x008000u
+#define WT_CONN_OPTRACK 0x010000u
+#define WT_CONN_PANIC 0x020000u
+#define WT_CONN_READONLY 0x040000u
+#define WT_CONN_RECONFIGURING 0x080000u
+#define WT_CONN_RECOVERING 0x100000u
+#define WT_CONN_SALVAGE 0x200000u
+#define WT_CONN_WAS_BACKUP 0x400000u
+    /* AUTOMATIC FLAG VALUE GENERATION STOP */
+    uint32_t flags;
 };

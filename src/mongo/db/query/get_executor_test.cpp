@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,113 +33,276 @@
 
 #include "mongo/db/query/get_executor.h"
 
+#include <boost/optional.hpp>
+#include <string>
+
+#include "mongo/bson/simple_bsonobj_comparator.h"
+#include "mongo/db/exec/projection_executor.h"
+#include "mongo/db/exec/projection_executor_builder.h"
+#include "mongo/db/exec/wildcard_projection.h"
 #include "mongo/db/json.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/projection_parser.h"
+#include "mongo/db/query/projection_policies.h"
 #include "mongo/db/query/query_settings.h"
+#include "mongo/db/query/query_test_service_context.h"
+#include "mongo/stdx/unordered_set.h"
 #include "mongo/unittest/unittest.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 using namespace mongo;
 
 namespace {
+auto createProjectionExecutor(const BSONObj& spec, const ProjectionPolicies& policies) {
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    auto projection = projection_ast::parse(expCtx, spec, policies);
+    auto executor = projection_executor::buildProjectionExecutor(
+        expCtx, &projection, policies, projection_executor::kDefaultBuilderParams);
+    return WildcardProjection{std::move(executor)};
+}
 
-    using std::auto_ptr;
+using std::unique_ptr;
 
-    static const char* ns = "somebogusns";
+static const NamespaceString nss("test.collection");
 
-    /**
-     * Utility functions to create a CanonicalQuery
-     */
-    CanonicalQuery* canonicalize(const char* queryStr, const char* sortStr,
-                                 const char* projStr) {
-        BSONObj queryObj = fromjson(queryStr);
-        BSONObj sortObj = fromjson(sortStr);
-        BSONObj projObj = fromjson(projStr);
-        CanonicalQuery* cq;
-        Status result = CanonicalQuery::canonicalize(ns, queryObj, sortObj,
-                                                     projObj,
-                                                     &cq);
-        ASSERT_OK(result);
-        return cq;
+/**
+ * Utility functions to create a CanonicalQuery
+ */
+unique_ptr<CanonicalQuery> canonicalize(const char* queryStr,
+                                        const char* sortStr,
+                                        const char* projStr) {
+    QueryTestServiceContext serviceContext;
+    auto opCtx = serviceContext.makeOperationContext();
+
+    auto findCommand = std::make_unique<FindCommandRequest>(nss);
+    findCommand->setFilter(fromjson(queryStr));
+    findCommand->setSort(fromjson(sortStr));
+    findCommand->setProjection(fromjson(projStr));
+    auto statusWithCQ = CanonicalQuery::canonicalize(opCtx.get(), std::move(findCommand));
+    ASSERT_OK(statusWithCQ.getStatus());
+    return std::move(statusWithCQ.getValue());
+}
+
+//
+// get_executor tests
+//
+
+//
+// filterAllowedIndexEntries
+//
+
+/**
+ * Test function to check filterAllowedIndexEntries.
+ *
+ * indexes: A vector of index entries to filter against.
+ * keyPatterns: A set of index key patterns to use in the filter.
+ * indexNames: A set of index names to use for the filter.
+ *
+ * expectedFilteredNames: The names of indexes that are expected to pass through the filter.
+ */
+void testAllowedIndices(std::vector<IndexEntry> indexes,
+                        BSONObjSet keyPatterns,
+                        stdx::unordered_set<std::string> indexNames,
+                        stdx::unordered_set<std::string> expectedFilteredNames) {
+    PlanCache planCache;
+    QuerySettings querySettings;
+
+    // getAllowedIndices should return false when query shape is not yet in query settings.
+    unique_ptr<CanonicalQuery> cq(canonicalize("{a: 1}", "{}", "{}"));
+    const auto key = cq->encodeKey();
+    ASSERT_FALSE(querySettings.getAllowedIndicesFilter(key));
+
+    querySettings.setAllowedIndices(*cq, keyPatterns, indexNames);
+    // Index entry vector should contain 1 entry after filtering.
+    boost::optional<AllowedIndicesFilter> hasFilter = querySettings.getAllowedIndicesFilter(key);
+    ASSERT_TRUE(hasFilter);
+    ASSERT_FALSE(key.empty());
+    auto& filter = *hasFilter;
+
+    // Apply filter in allowed indices.
+    filterAllowedIndexEntries(filter, &indexes);
+    ASSERT_EQ(std::max<size_t>(expectedFilteredNames.size(), indexNames.size()), indexes.size());
+    for (const auto& indexEntry : indexes) {
+        ASSERT_TRUE(expectedFilteredNames.find(indexEntry.identifier.catalogName) !=
+                    expectedFilteredNames.end());
     }
+}
 
-    //
-    // get_executor tests
-    //
+/**
+ * Make a minimal IndexEntry from just a key pattern and a name.
+ */
+IndexEntry buildSimpleIndexEntry(const BSONObj& kp, const std::string& indexName) {
+    return {kp,
+            IndexNames::nameToType(IndexNames::findPluginName(kp)),
+            IndexDescriptor::kLatestIndexVersion,
+            false,
+            {},
+            {},
+            false,
+            false,
+            CoreIndexInfo::Identifier(indexName),
+            nullptr,
+            {},
+            nullptr,
+            nullptr};
+}
 
-    //
-    // filterAllowedIndexEntries
-    //
+/**
+ * Make a minimal IndexEntry from just a key pattern and a name. Include a wildcardProjection which
+ * is neccesary for wildcard indicies.
+ */
+IndexEntry buildWildcardIndexEntry(const BSONObj& kp,
+                                   const WildcardProjection& wcProj,
+                                   const std::string& indexName) {
+    return {kp,
+            IndexNames::nameToType(IndexNames::findPluginName(kp)),
+            IndexDescriptor::kLatestIndexVersion,
+            false,
+            {},
+            {},
+            false,
+            false,
+            CoreIndexInfo::Identifier(indexName),
+            nullptr,
+            {},
+            nullptr,
+            &wcProj};
+}
 
-    /**
-     * Test function to check filterAllowedIndexEntries
-     */
-    void testAllowedIndices(const char* hintKeyPatterns[],
-                            const char* indexCatalogKeyPatterns[],
-                            const char* expectedFilteredKeyPatterns[]) {
-         QuerySettings querySettings;
-         AllowedIndices *allowedIndicesRaw;
+// Use of index filters to select compound index over single key index.
+TEST(GetExecutorTest, GetAllowedIndices) {
+    testAllowedIndices(
+        {buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
+         buildSimpleIndexEntry(fromjson("{a: 1, b: 1}"), "a_1_b_1"),
+         buildSimpleIndexEntry(fromjson("{a: 1, c: 1}"), "a_1_c_1")},
+        SimpleBSONObjComparator::kInstance.makeBSONObjSet({fromjson("{a: 1, b: 1}")}),
+        stdx::unordered_set<std::string>{},
+        {"a_1_b_1"});
+}
 
-         // getAllowedIndices should return false when query shape is not yet in query settings.
-         auto_ptr<CanonicalQuery> cq(canonicalize("{a: 1}", "{}", "{}"));
-         ASSERT_FALSE(querySettings.getAllowedIndices(*cq, &allowedIndicesRaw));
+// Setting index filter referring to non-existent indexes
+// will effectively disregard the index catalog and
+// result in the planner generating a collection scan.
+TEST(GetExecutorTest, GetAllowedIndicesNonExistentIndexKeyPatterns) {
+    testAllowedIndices(
+        {buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
+         buildSimpleIndexEntry(fromjson("{a: 1, b: 1}"), "a_1_b_1"),
+         buildSimpleIndexEntry(fromjson("{a: 1, c: 1}"), "a_1_c_1")},
+        SimpleBSONObjComparator::kInstance.makeBSONObjSet({fromjson("{nosuchfield: 1}")}),
+        stdx::unordered_set<std::string>{},
+        stdx::unordered_set<std::string>{});
+}
 
-         // Add entry to query settings.
-         const PlanCacheKey& key = cq->getPlanCacheKey();
-         std::vector<BSONObj> indexKeyPatterns;
-         for (int i=0; hintKeyPatterns[i] != NULL; ++i) {
-             indexKeyPatterns.push_back(fromjson(hintKeyPatterns[i]));
-         }
-         querySettings.setAllowedIndices(*cq, indexKeyPatterns);
+// This test case shows how to force query execution to use
+// an index that orders items in descending order.
+TEST(GetExecutorTest, GetAllowedIndicesDescendingOrder) {
+    testAllowedIndices({buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
+                        buildSimpleIndexEntry(fromjson("{a: -1}"), "a_-1")},
+                       SimpleBSONObjComparator::kInstance.makeBSONObjSet({fromjson("{a: -1}")}),
+                       stdx::unordered_set<std::string>{},
+                       {"a_-1"});
+}
 
-         // Index entry vector should contain 1 entry after filtering.
-         ASSERT_TRUE(querySettings.getAllowedIndices(*cq, &allowedIndicesRaw));
-         ASSERT_FALSE(key.empty());
-         ASSERT(NULL != allowedIndicesRaw);
-         auto_ptr<AllowedIndices> allowedIndices(allowedIndicesRaw);
+TEST(GetExecutorTest, GetAllowedIndicesMatchesByName) {
+    testAllowedIndices({buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1:en")},
+                       // BSONObjSet default constructor is explicit, so we cannot
+                       // copy-list-initialize until C++14.
+                       SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
+                       {"a_1"},
+                       {"a_1"});
+}
 
-         // Indexes from index catalog.
-         std::vector<IndexEntry> indexEntries;
-         for (int i=0; indexCatalogKeyPatterns[i] != NULL; ++i) {
-             indexEntries.push_back(IndexEntry(fromjson(indexCatalogKeyPatterns[i])));
-         }
+TEST(GetExecutorTest, GetAllowedIndicesMatchesMultipleIndexesByKey) {
+    testAllowedIndices({buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1:en")},
+                       SimpleBSONObjComparator::kInstance.makeBSONObjSet({fromjson("{a: 1}")}),
+                       stdx::unordered_set<std::string>{},
+                       {"a_1", "a_1:en"});
+}
 
-         // Apply filter in allowed indices.
-         filterAllowedIndexEntries(*allowedIndices, &indexEntries);
-         size_t numExpected = 0;
-         while (expectedFilteredKeyPatterns[numExpected] != NULL) {
-             ASSERT_LESS_THAN(numExpected, indexEntries.size());
-             ASSERT_EQUALS(indexEntries[numExpected].keyPattern,
-                           fromjson(expectedFilteredKeyPatterns[numExpected]));
-             numExpected++;
-         }
-         ASSERT_EQUALS(indexEntries.size(), numExpected);
-     }
+TEST(GetExecutorTest, GetAllowedWildcardIndicesByKey) {
+    auto wcProj = createProjectionExecutor(
+        fromjson("{_id: 0}"),
+        {ProjectionPolicies::DefaultIdPolicy::kExcludeId,
+         ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays});
+    testAllowedIndices({buildWildcardIndexEntry(BSON("$**" << 1), wcProj, "$**_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1, b: 1}"), "a_1_b_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1, c: 1}"), "a_1_c_1")},
+                       SimpleBSONObjComparator::kInstance.makeBSONObjSet({BSON("$**" << 1)}),
+                       stdx::unordered_set<std::string>{},
+                       {"$**_1"});
+}
 
-    // Use of index filters to select compound index over single key index.
-    TEST(GetExecutorTest, GetAllowedIndices) {
-        const char* hintKeyPatterns[] = {"{a: 1, b: 1}", NULL};
-        const char* indexCatalogKeyPatterns[] = {"{a: 1}", "{a: 1, b: 1}", "{a: 1, c: 1}", NULL};
-        const char* expectedFilteredKeyPatterns[] = {"{a: 1, b: 1}", NULL};
-        testAllowedIndices(hintKeyPatterns, indexCatalogKeyPatterns,  expectedFilteredKeyPatterns);
-    }
+TEST(GetExecutorTest, GetAllowedWildcardIndicesByName) {
+    auto wcProj = createProjectionExecutor(
+        fromjson("{_id: 0}"),
+        {ProjectionPolicies::DefaultIdPolicy::kExcludeId,
+         ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays});
+    testAllowedIndices({buildWildcardIndexEntry(BSON("$**" << 1), wcProj, "$**_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1, b: 1}"), "a_1_b_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1, c: 1}"), "a_1_c_1")},
+                       SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
+                       {"$**_1"},
+                       {"$**_1"});
+}
 
-    // Setting index filter referring to non-existent indexes
-    // will effectively disregard the index catalog and
-    // result in the planner generating a collection scan.
-    TEST(GetExecutorTest, GetAllowedIndicesNonExistentIndexKeyPatterns) {
-        const char* hintKeyPatterns[] = {"{nosuchfield: 1}", NULL};
-        const char* indexCatalogKeyPatterns[] = {"{a: 1}", "{a: 1, b: 1}", "{a: 1, c: 1}", NULL};
-        const char* expectedFilteredKeyPatterns[] = {NULL};
-        testAllowedIndices(hintKeyPatterns, indexCatalogKeyPatterns,  expectedFilteredKeyPatterns);
-    }
+TEST(GetExecutorTest, GetAllowedPathSpecifiedWildcardIndicesByKey) {
+    auto wcProj = createProjectionExecutor(
+        fromjson("{_id: 0}"),
+        {ProjectionPolicies::DefaultIdPolicy::kExcludeId,
+         ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays});
+    testAllowedIndices({buildWildcardIndexEntry(BSON("a.$**" << 1), wcProj, "a.$**_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1, b: 1}"), "a_1_b_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1, c: 1}"), "a_1_c_1")},
+                       SimpleBSONObjComparator::kInstance.makeBSONObjSet({BSON("a.$**" << 1)}),
+                       stdx::unordered_set<std::string>{},
+                       {"a.$**_1"});
+}
 
-    // This test case shows how to force query execution to use
-    // an index that orders items in descending order.
-    TEST(GetExecutorTest, GetAllowedIndicesDescendingOrder) {
-        const char* hintKeyPatterns[] = {"{a: -1}", NULL};
-        const char* indexCatalogKeyPatterns[] = {"{a: 1}", "{a: -1}", NULL};
-        const char* expectedFilteredKeyPatterns[] = {"{a: -1}", NULL};
-        testAllowedIndices(hintKeyPatterns, indexCatalogKeyPatterns,  expectedFilteredKeyPatterns);
-    }
+TEST(GetExecutorTest, GetAllowedPathSpecifiedWildcardIndicesByName) {
+    auto wcProj = createProjectionExecutor(
+        fromjson("{_id: 0}"),
+        {ProjectionPolicies::DefaultIdPolicy::kExcludeId,
+         ProjectionPolicies::ArrayRecursionPolicy::kDoNotRecurseNestedArrays});
+    testAllowedIndices({buildWildcardIndexEntry(BSON("a.$**" << 1), wcProj, "a.$**_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1}"), "a_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1, b: 1}"), "a_1_b_1"),
+                        buildSimpleIndexEntry(fromjson("{a: 1, c: 1}"), "a_1_c_1")},
+                       SimpleBSONObjComparator::kInstance.makeBSONObjSet(),
+                       {"a.$**_1"},
+                       {"a.$**_1"});
+}
+
+TEST(GetExecutorTest, isComponentOfPathMultikeyNoMetadata) {
+    BSONObj indexKey = BSON("a" << 1 << "b.c" << -1);
+    MultikeyPaths multikeyInfo = {};
+
+    ASSERT_TRUE(isAnyComponentOfPathMultikey(indexKey, true, multikeyInfo, "a"));
+    ASSERT_TRUE(isAnyComponentOfPathMultikey(indexKey, true, multikeyInfo, "b.c"));
+
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, false, multikeyInfo, "a"));
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, false, multikeyInfo, "b.c"));
+}
+
+TEST(GetExecutorTest, isComponentOfPathMultikeyWithMetadata) {
+    BSONObj indexKey = BSON("a" << 1 << "b.c" << -1);
+    MultikeyPaths multikeyInfo = {{}, {1}};
+
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, true, multikeyInfo, "a"));
+    ASSERT_TRUE(isAnyComponentOfPathMultikey(indexKey, true, multikeyInfo, "b.c"));
+}
+
+TEST(GetExecutorTest, isComponentOfPathMultikeyWithEmptyMetadata) {
+    BSONObj indexKey = BSON("a" << 1 << "b.c" << -1);
+
+
+    MultikeyPaths multikeyInfoAllPathsScalar = {{}, {}};
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, false, multikeyInfoAllPathsScalar, "a"));
+    ASSERT_FALSE(isAnyComponentOfPathMultikey(indexKey, false, multikeyInfoAllPathsScalar, "b.c"));
+}
 
 }  // namespace

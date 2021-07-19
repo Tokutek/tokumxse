@@ -1,9 +1,17 @@
 /**
  * This test verifies that replica sets of different
  * mixed modes can still function
+ *
+ * @tags: [live_record_incompatible]
  */
 
-load("jstests/ssl/libs/ssl_helpers.js")
+load("jstests/ssl/libs/ssl_helpers.js");
+
+// Limit the amount of time we'll wait on a failure.
+// Apply equally to success tests as well so that
+// a failure to complete replication is more likely to
+// give us a false negative, than a false positive.
+ReplSetTest.kDefaultTimeoutMS = 3 * 60 * 1000;
 
 // Verify that disabled allows non-ssl connections
 print("=== Testing disabled cluster ===");

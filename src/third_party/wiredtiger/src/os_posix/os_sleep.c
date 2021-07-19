@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -10,15 +10,22 @@
 
 /*
  * __wt_sleep --
- *	Pause the thread of control.
+ *     Pause the thread of control.
  */
 void
-__wt_sleep(uint64_t seconds, uint64_t micro_seconds)
+__wt_sleep(uint64_t seconds, uint64_t micro_seconds) WT_GCC_FUNC_ATTRIBUTE((visibility("default")))
 {
-	struct timeval t;
+    struct timeval t;
 
-	t.tv_sec = (time_t)(seconds + micro_seconds / 1000000);
-	t.tv_usec = (suseconds_t)(micro_seconds % 1000000);
+    /*
+     * Sleeping isn't documented as a memory barrier, and it's a reasonable expectation to have.
+     * There's no reason not to explicitly include a barrier since we're giving up the CPU, and
+     * ensures callers are never surprised.
+     */
+    WT_FULL_BARRIER();
 
-	(void)select(0, NULL, NULL, NULL, &t);
+    t.tv_sec = (time_t)(seconds + micro_seconds / WT_MILLION);
+    t.tv_usec = (suseconds_t)(micro_seconds % WT_MILLION);
+
+    (void)select(0, NULL, NULL, NULL, &t);
 }

@@ -6,7 +6,6 @@
  * Inserts some documents into a collection with a text index.
  */
 var $config = (function() {
-
     var states = {
         init: function init(db, collName) {
             // noop
@@ -18,7 +17,7 @@ var $config = (function() {
             var snippet = this.getRandomTextSnippet();
             doc[this.indexedField] = snippet;
             var res = db[collName].insert(doc);
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(1, res.nInserted, tojson(res));
             // TODO: what else can we assert? should that go in a read test?
 
@@ -28,20 +27,17 @@ var $config = (function() {
             if (Array.isArray(snippet)) {
                 snippet = snippet.join(' ');
             }
-            assertWhenOwnColl.gt(db[collName].find({ $text: { $search: snippet } }).itcount(), 0);
+            assertWhenOwnColl.gt(db[collName].find({$text: {$search: snippet}}).itcount(), 0);
         }
     };
 
-    var transitions = {
-        init: { insert: 1 },
-        insert: { insert: 1 }
-    };
+    var transitions = {init: {insert: 1}, insert: {insert: 1}};
 
     function setup(db, collName, cluster) {
         var ixSpec = {};
         ixSpec[this.indexedField] = 'text';
         // Only allowed to create one text index, other tests may create one.
-        assertWhenOwnColl.commandWorked(db[collName].ensureIndex(ixSpec));
+        assertWhenOwnColl.commandWorked(db[collName].createIndex(ixSpec));
     }
 
     var text = [
@@ -129,5 +125,4 @@ var $config = (function() {
         },
         setup: setup
     };
-
 })();

@@ -4,11 +4,6 @@
 //
 
 var DBExplainQuery = (function() {
-
-    // We expect to get back a "command not found" error in a sharded configuration if any
-    // of the shards have not been upgraded and don't implement the explain command.
-    var CMD_NOT_FOUND_CODE = 59;
-
     //
     // Private methods.
     //
@@ -19,7 +14,7 @@ var DBExplainQuery = (function() {
      * is implemented here for backwards compatibility.
      */
     function removeVerboseFields(obj) {
-        if (typeof(obj) !== "object") {
+        if (typeof (obj) !== "object") {
             return;
         }
 
@@ -27,13 +22,13 @@ var DBExplainQuery = (function() {
         delete obj.oldPlan;
         delete obj.stats;
 
-        if (typeof(obj.length) === "number") {
-            for (var i=0; i < obj.length; i++) {
+        if (typeof (obj.length) === "number") {
+            for (var i = 0; i < obj.length; i++) {
                 removeVerboseFields(obj[i]);
             }
         }
 
-        if (obj.shards){
+        if (obj.shards) {
             for (var key in obj.shards) {
                 removeVerboseFields(obj.shards[key]);
             }
@@ -53,7 +48,7 @@ var DBExplainQuery = (function() {
         return function() {
             dbQuery[name].apply(dbQuery, arguments);
             return explainQuery;
-        }
+        };
     }
 
     /**
@@ -79,7 +74,6 @@ var DBExplainQuery = (function() {
     }
 
     function constructor(query, verbosity) {
-
         //
         // Private vars.
         //
@@ -100,7 +94,9 @@ var DBExplainQuery = (function() {
 
         var delegationFuncNames = [
             "addOption",
+            "allowDiskUse",
             "batchSize",
+            "collation",
             "comment",
             "hint",
             "limit",
@@ -110,7 +106,6 @@ var DBExplainQuery = (function() {
             "readPref",
             "showDiskLoc",
             "skip",
-            "snapshot",
             "sort",
         ];
 
@@ -141,9 +136,6 @@ var DBExplainQuery = (function() {
             // Explain always gets pretty printed.
             this._query._prettyShell = true;
 
-            // Explain always passes a negative value for limit.
-            this._query._limit = Math.abs(this._query._limit) * -1;
-
             if (this._mongo.hasExplainCommand()) {
                 // The wire protocol version indicates that the server has the explain command.
                 // Convert this explain query into an explain command, and send the command to
@@ -152,59 +144,54 @@ var DBExplainQuery = (function() {
                 if (this._isCount) {
                     // True means to always apply the skip and limit values.
                     innerCmd = this._query._convertToCountCmd(this._applySkipLimit);
-                }
-                else {
-                    innerCmd = this._query._convertToCommand();
+                } else {
+                    var canAttachReadPref = false;
+                    innerCmd = this._query._convertToCommand(canAttachReadPref);
                 }
 
                 var explainCmd = {explain: innerCmd};
                 explainCmd["verbosity"] = this._verbosity;
-
-                // We explicitly run a find against the $cmd collection instead of using the
-                // runCommand helper so that we can set a read preference on the command.
-                var cmdColl = this._query._db.getCollection("$cmd");
-                var cmdQuery = cmdColl.find(explainCmd,
-                                            {}, // projection
-                                            -1, // limit
-                                            0, // skip
-                                            0, // batchSize
-                                            this._query._options);
-
-                // Handle read preference.
-                if ("$readPreference" in this._query._query) {
-                    // A read preference was set on the query. Pull the read pref up so that it is
-                    // set on the explain command.
-                    var prefObj = this._query._query.$readPreference;
-                    cmdQuery.readPref(prefObj.mode, prefObj.tags);
+                // If "maxTimeMS" is set on innerCmd, it needs to be propagated to the top-level
+                // of explainCmd so that it has the intended effect.
+                if (innerCmd.hasOwnProperty("maxTimeMS")) {
+                    explainCmd.maxTimeMS = innerCmd.maxTimeMS;
                 }
 
-                var explainResult = cmdQuery.next();
-                if (!explainResult.ok && explainResult.code === CMD_NOT_FOUND_CODE) {
+                var explainDb = this._query._db;
+
+                if ("$readPreference" in this._query._query) {
+                    var prefObj = this._query._query.$readPreference;
+                    explainCmd = explainDb._attachReadPreferenceToCommand(explainCmd, prefObj);
+                }
+
+                var explainResult =
+                    explainDb.runReadCommand(explainCmd, null, this._query._options);
+
+                if (!explainResult.ok && explainResult.code === ErrorCodes.CommandNotFound) {
                     // One of the shards doesn't have the explain command available. Retry using
                     // the legacy $explain format, which should be supported by all shards.
                     return explainWithLegacyQueryOption(this);
                 }
 
                 return Explainable.throwOrReturn(explainResult);
-            }
-            else {
+            } else {
                 return explainWithLegacyQueryOption(this);
             }
-        }
+        };
 
         this.next = function() {
             return this.finish();
-        }
+        };
 
         this.hasNext = function() {
             return !this._finished;
-        }
+        };
 
         this.forEach = function(func) {
             while (this.hasNext()) {
                 func(this.next());
             }
-        }
+        };
 
         /**
          * Returns the explain resulting from running this query as a count operation.
@@ -218,7 +205,7 @@ var DBExplainQuery = (function() {
                 this._applySkipLimit = true;
             }
             return this.finish();
-        }
+        };
 
         /**
          * This gets called automatically by the shell in interactive mode. It should
@@ -227,7 +214,7 @@ var DBExplainQuery = (function() {
         this.shellPrint = function() {
             var result = this.finish();
             return tojson(result);
-        }
+        };
 
         /**
          * Display help text.
@@ -242,6 +229,7 @@ var DBExplainQuery = (function() {
             print("\t.addOption(n)");
             print("\t.batchSize(n)");
             print("\t.comment(comment)");
+            print("\t.collation(collationSpec)");
             print("\t.count()");
             print("\t.hint(hintSpec)");
             print("\t.limit(n)");
@@ -251,11 +239,9 @@ var DBExplainQuery = (function() {
             print("\t.readPref(mode, tagSet)");
             print("\t.showDiskLoc()");
             print("\t.skip(n)");
-            print("\t.snapshot()");
             print("\t.sort(sortSpec)");
             return __magicNoPrint;
-        }
-
+        };
     }
 
     return constructor;

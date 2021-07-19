@@ -1,170 +1,125 @@
-// lasterror.h
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include <boost/noncopyable.hpp>
-#include <boost/thread/tss.hpp>
 #include <string>
 
+#include "mongo/db/client.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/bson/oid.h"
 
 namespace mongo {
-    class BSONObjBuilder;
-    class Message;
+class BSONObjBuilder;
 
-    static const char kUpsertedFieldName[] = "upserted";
-    static const char kGLEStatsFieldName[] = "$gleStats";
-    static const char kGLEStatsLastOpTimeFieldName[] = "lastOpTime";
-    static const char kGLEStatsElectionIdFieldName[] = "electionId";
+static const char kUpsertedFieldName[] = "upserted";
 
-    struct LastError {
-        int code;
-        std::string msg;
-        enum UpdatedExistingType { NotUpdate, True, False } updatedExisting;
-        // _id field value from inserted doc, returned as kUpsertedFieldName (above)
-        BSONObj upsertedId;
-        OID writebackId; // this shouldn't get reset so that old GLE are handled
-        int writebackSince;
-        long long nObjects;
-        int nPrev;
-        bool valid;
-        bool disabled;
-        void writeback(const OID& oid) {
-            reset( true );
-            writebackId = oid;
-            writebackSince = 0;
+class LastError {
+public:
+    static const Client::Decoration<LastError> get;
+
+    /**
+     * Resets the object to a newly constructed state.  If "valid" is true, marks the last-error
+     * object as "valid".
+     */
+    void reset(bool valid = false);
+
+    /**
+     * when db receives a message/request, call this
+     */
+    void startRequest();
+
+    /**
+     * Disables error recording for the current operation.
+     */
+    void disable();
+
+    /**
+     * Sets the error information for the current operation, if error recording was not
+     * explicitly disabled via a call to disable() since the call to startRequest.
+     */
+    void setLastError(int code, std::string msg);
+
+    void recordUpdate(bool updateObjects, long long nObjects, BSONObj upsertedId);
+
+    void recordDelete(long long nDeleted);
+
+    /**
+     * Writes the last-error state described by this object to "b".
+     *
+     * If "blankErr" is true, the "err" field will be explicitly set to null in the result
+     * instead of being omitted when the error string is empty.
+     *
+     * Returns true if there is a non-empty error message.
+     */
+    bool appendSelf(BSONObjBuilder& b, bool blankErr) const;
+
+    bool isValid() const {
+        return _valid;
+    }
+    int getNPrev() const {
+        return _nPrev;
+    }
+
+    bool hadNotPrimaryError() const {
+        return _hadNotPrimaryError;
+    }
+
+    class Disabled {
+    public:
+        explicit Disabled(LastError* le) : _le(le), _prev(le->_disabled) {
+            _le->_disabled = true;
         }
-        void raiseError(int _code , const char *_msg) {
-            reset( true );
-            code = _code;
-            msg = _msg;
-        }
-        void recordUpdate( bool _updateObjects , long long _nObjects , BSONObj _upsertedId ) {
-            reset( true );
-            nObjects = _nObjects;
-            updatedExisting = _updateObjects ? True : False;
-            if ( _upsertedId.valid() && _upsertedId.hasField(kUpsertedFieldName) )
-                upsertedId = _upsertedId;
 
-        }
-        void recordDelete( long long nDeleted ) {
-            reset( true );
-            nObjects = nDeleted;
-        }
-        LastError() {
-            reset();
-            writebackSince = 0;
-        }
-        void reset( bool _valid = false ) {
-            code = 0;
-            msg.clear();
-            updatedExisting = NotUpdate;
-            nObjects = 0;
-            nPrev = 1;
-            valid = _valid;
-            disabled = false;
-            upsertedId = BSONObj();
+        ~Disabled() {
+            _le->_disabled = _prev;
         }
 
-        /**
-         * @return if there is an err
-         */
-        bool appendSelf( BSONObjBuilder &b , bool blankErr = true );
-
-        /**
-         * appends fields which are not "error" related
-         * this whole mechanism needs to be re-written
-         * but needs a lot of real thought
-         */
-        void appendSelfStatus( BSONObjBuilder &b );
-
-        struct Disabled : boost::noncopyable {
-            Disabled( LastError * le ) {
-                _le = le;
-                if ( _le ) {
-                    _prev = _le->disabled;
-                    _le->disabled = true;
-                }
-                else {
-                    _prev = false;
-                }
-            }
-
-            ~Disabled() {
-                if ( _le )
-                    _le->disabled = _prev;
-            }
-
-            LastError * _le;
-            bool _prev;
-        };
-
-        static LastError noError;
+    private:
+        LastError* const _le;
+        const bool _prev;
     };
 
-    extern class LastErrorHolder {
-    public:
-        LastErrorHolder(){}
-        ~LastErrorHolder();
+    static LastError noError;
 
-        LastError * get( bool create = false );
-        LastError * getSafe();
-        LastError * _get( bool create = false ); // may return a disabled LastError
+private:
+    enum UpdatedExistingType { NotUpdate, True, False };
 
-        void reset( LastError * le );
+    int _code = 0;
+    std::string _msg = {};
+    UpdatedExistingType _updatedExisting = NotUpdate;
+    // _id field value from inserted doc, returned as kUpsertedFieldName (above)
+    BSONObj _upsertedId = {};
+    long long _nObjects = 0;
+    int _nPrev = 1;
+    bool _valid = false;
+    bool _disabled = false;
+    bool _hadNotPrimaryError = false;
+};
 
-        /** ok to call more than once. */
-        void initThread();
-
-        int getID();
-        
-        void release();
-
-        /** when db receives a message/request, call this */
-        LastError * startRequest( Message& m , LastError * connectionOwned );
-
-        void disconnect( int clientId );
-
-        // used to disable lastError reporting while processing a killCursors message
-        // disable causes get() to return 0.
-        LastError *disableForCommand(); // only call once per command invocation!
-    private:
-        boost::thread_specific_ptr<LastError> _tl;
-
-        struct Status {
-            time_t time;
-            LastError *lerr;
-        };
-    } lastError;
-
-    void setLastError(int code , const char *msg);
-
-} // namespace mongo
+}  // namespace mongo

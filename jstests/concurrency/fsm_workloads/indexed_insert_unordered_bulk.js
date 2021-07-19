@@ -8,12 +8,13 @@
  *
  * Uses an unordered, bulk operation to perform the inserts.
  */
-load('jstests/concurrency/fsm_libs/extend_workload.js'); // for extendWorkload
-load('jstests/concurrency/fsm_workloads/indexed_insert_base.js'); // for $config
+load('jstests/concurrency/fsm_libs/extend_workload.js');           // for extendWorkload
+load('jstests/concurrency/fsm_workloads/indexed_insert_base.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     $config.data.indexedField = 'indexed_insert_unordered_bulk';
+    $config.data.shardKey = {};
+    $config.data.shardKey[$config.data.indexedField] = 1;
 
     $config.states.insert = function insert(db, collName) {
         var doc = {};
@@ -24,7 +25,7 @@ var $config = extendWorkload($config, function($config, $super) {
             bulk.insert(doc);
         }
         var res = bulk.execute();
-        assertAlways.writeOK(res);
+        assertAlways.commandWorked(res);
         assertAlways.eq(this.docsPerInsert, res.nInserted, tojson(res));
 
         this.nInserted += this.docsPerInsert;

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,271 +27,280 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
-
 #include "mongo/db/exec/projection.h"
 
+#include <boost/optional.hpp>
+#include <memory>
+
+#include "mongo/db/exec/document_value/document.h"
 #include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/projection_executor_builder.h"
 #include "mongo/db/exec/scoped_timer.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/record_id.h"
-#include "mongo/util/log.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
+namespace {
 
-    using std::auto_ptr;
-    using std::endl;
-    using std::vector;
+void transitionMemberToOwnedObj(Document&& doc, WorkingSetMember* member) {
+    member->keyData.clear();
+    member->recordId = {};
+    member->doc = {{}, std::move(doc)};
+    member->transitionToOwnedObj();
+}
 
-    static const char* kIdField = "_id";
+void transitionMemberToOwnedObj(const BSONObj& bo, WorkingSetMember* member) {
+    // Use the DocumentStorage that already exists on the WorkingSetMember's document
+    // field if possible.
+    MutableDocument md(std::move(member->doc.value()));
+    md.reset(bo, false);
+    transitionMemberToOwnedObj(md.freeze(), member);
+}
 
-    // static
-    const char* ProjectionStage::kStageType = "PROJECTION";
+/**
+ * Moves document metadata fields from the WSM into the given document 'doc', and returns the same
+ * document but with populated metadata.
+ */
+auto attachMetadataToDocument(Document&& doc, WorkingSetMember* member) {
+    MutableDocument md{std::move(doc)};
+    md.setMetadata(member->releaseMetadata());
+    return md.freeze();
+}
 
-    ProjectionStage::ProjectionStage(const ProjectionStageParams& params,
-                                     WorkingSet* ws,
-                                     PlanStage* child)
-        : _ws(ws),
-          _child(child),
-          _commonStats(kStageType),
-          _projImpl(params.projImpl) {
+/**
+ * Moves document metadata fields from the document 'doc' into the WSM, and returns the same
+ * document but without metadata.
+ */
+auto attachMetadataToWorkingSetMember(Document&& doc, WorkingSetMember* member) {
+    MutableDocument md{std::move(doc)};
+    member->setMetadata(md.releaseMetadata());
+    return md.freeze();
+}
 
-        _projObj = params.projObj;
+/**
+ * Given an index key 'dehyratedKey' with no field names, returns a new Document representing the
+ * index key after adding field names according to 'keyPattern'.
+ *
+ * For example, given:
+ *    - the 'keyPatern' of {'a.b': 1, c: 1}
+ *    - the 'dehydratedKey' of {'': 'abc', '': 10}
+ *
+ * The resulting document will be: {a: {b: 'abc'}, c: 10}
+ */
+auto rehydrateIndexKey(const BSONObj& keyPattern, const BSONObj& dehydratedKey) {
+    MutableDocument md;
+    BSONObjIterator keyIter{keyPattern};
+    BSONObjIterator valueIter{dehydratedKey};
 
-        if (ProjectionStageParams::NO_FAST_PATH == _projImpl) {
-            _exec.reset(new ProjectionExec(params.projObj, 
-                                           params.fullExpression,
-                                           *params.whereCallback));
+    while (keyIter.more() && valueIter.more()) {
+        auto fieldName = keyIter.next().fieldNameStringData();
+        auto value = valueIter.next();
+
+        // Skip the $** index virtual field, as it's not part of the actual index key.
+        if (fieldName == "$_path") {
+            continue;
         }
-        else {
-            // We shouldn't need the full expression if we're fast-pathing.
-            invariant(NULL == params.fullExpression);
 
-            // Sanity-check the input.
-            invariant(_projObj.isOwned());
-            invariant(!_projObj.isEmpty());
+        md.setNestedField(fieldName, Value{value});
+    }
 
-            // Figure out what fields are in the projection.
-            getSimpleInclusionFields(_projObj, &_includedFields);
+    invariant(!keyIter.more());
+    invariant(!valueIter.more());
 
-            // If we're pulling data out of one index we can pre-compute the indices of the fields
-            // in the key that we pull data from and avoid looking up the field name each time.
-            if (ProjectionStageParams::COVERED_ONE_INDEX == params.projImpl) {
-                // Sanity-check.
-                _coveredKeyObj = params.coveredKeyObj;
-                invariant(_coveredKeyObj.isOwned());
+    return md.freeze();
+}
+}  // namespace
 
-                BSONObjIterator kpIt(_coveredKeyObj);
-                while (kpIt.more()) {
-                    BSONElement elt = kpIt.next();
-                    unordered_set<StringData, StringData::Hasher>::iterator fieldIt;
-                    fieldIt = _includedFields.find(elt.fieldNameStringData());
+ProjectionStage::ProjectionStage(ExpressionContext* expCtx,
+                                 const BSONObj& projObj,
+                                 WorkingSet* ws,
+                                 std::unique_ptr<PlanStage> child,
+                                 const char* stageType)
+    : PlanStage{expCtx, std::move(child), stageType},
+      _projObj{expCtx->explain ? boost::make_optional(projObj.getOwned()) : boost::none},
+      _ws{*ws} {}
 
-                    if (_includedFields.end() == fieldIt) {
-                        // Push an unused value on the back to keep _includeKey and _keyFieldNames
-                        // in sync.
-                        _keyFieldNames.push_back(StringData());
-                        _includeKey.push_back(false);
-                    }
-                    else {
-                        // If we are including this key field store its field name.
-                        _keyFieldNames.push_back(*fieldIt);
-                        _includeKey.push_back(true);
-                    }
-                }
+bool ProjectionStage::isEOF() {
+    return child()->isEOF();
+}
+
+PlanStage::StageState ProjectionStage::doWork(WorkingSetID* out) {
+    WorkingSetID id = WorkingSet::INVALID_ID;
+    StageState status = child()->work(&id);
+
+    // Note that we don't do the normal if isEOF() return EOF thing here.  Our child might be a
+    // tailable cursor and isEOF() would be true even if it had more data...
+    if (PlanStage::ADVANCED == status) {
+        WorkingSetMember* member = _ws.get(id);
+        // Punt to our specific projection impl.
+        transform(member);
+        *out = id;
+    } else if (PlanStage::NEED_YIELD == status) {
+        *out = id;
+    }
+
+    return status;
+}
+
+std::unique_ptr<PlanStageStats> ProjectionStage::getStats() {
+    _commonStats.isEOF = isEOF();
+    auto ret = std::make_unique<PlanStageStats>(_commonStats, stageType());
+
+    auto projStats = std::make_unique<ProjectionStats>(_specificStats);
+    projStats->projObj = _projObj.value_or(BSONObj{});
+    ret->specific = std::move(projStats);
+
+    ret->children.emplace_back(child()->getStats());
+    return ret;
+}
+
+ProjectionStageDefault::ProjectionStageDefault(boost::intrusive_ptr<ExpressionContext> expCtx,
+                                               const BSONObj& projObj,
+                                               const projection_ast::Projection* projection,
+                                               WorkingSet* ws,
+                                               std::unique_ptr<PlanStage> child)
+    : ProjectionStage{expCtx.get(), projObj, ws, std::move(child), "PROJECTION_DEFAULT"},
+      _requestedMetadata{projection->metadataDeps()},
+      _projectType{projection->type()},
+      _executor{projection_executor::buildProjectionExecutor(
+          expCtx, projection, {}, projection_executor::kDefaultBuilderParams)} {}
+
+void ProjectionStageDefault::transform(WorkingSetMember* member) const {
+    Document input;
+
+    // Most metadata should have already been stored within the WSM when we project out a document.
+    // The recordId metadata is different though, because it's a fundamental part of the WSM and
+    // we store it within the WSM itself rather than WSM metadata, so we need to transfer it into
+    // the metadata object if the projection has a recordId $meta expression.
+    if (_requestedMetadata[DocumentMetadataFields::kRecordId] &&
+        !member->metadata().hasRecordId()) {
+        member->metadata().setRecordId(member->recordId);
+    }
+
+    if (member->hasObj()) {
+        input = std::move(member->doc.value());
+    } else {
+        // We have a covered projection, which is only supported in inclusion mode.
+        invariant(_projectType == projection_ast::ProjectType::kInclusion);
+        // We're pulling data from an index key, so there must be exactly one key entry in the WSM
+        // as the planner guarantees that it will never generate a covered plan in the case of index
+        // intersection.
+        invariant(member->keyData.size() == 1);
+
+        // For covered projection we will rehydrate in index key into a Document and then pass it
+        // through the projection executor to include only required fields, including metadata
+        // fields.
+        input = rehydrateIndexKey(member->keyData[0].indexKeyPattern, member->keyData[0].keyData);
+    }
+
+    // If the projection doesn't need any metadata, then we'll just apply the projection to the
+    // input document. Otherwise, before applying the projection, we will move document metadata
+    // from the WSM into the document itself, and will move it back to the WSM once the projection
+    // has been applied.
+    auto projected = _requestedMetadata.any()
+        ? attachMetadataToWorkingSetMember(
+              _executor->applyTransformation(attachMetadataToDocument(std::move(input), member)),
+              member)
+        : _executor->applyTransformation(input);
+
+    // An exclusion projection can return an unowned object since the output document is
+    // constructed from the input one backed by BSON which is owned by the storage system, so we
+    // need to  make sure we transition an owned document.
+    transitionMemberToOwnedObj(projected.getOwned(), member);
+}
+
+ProjectionStageCovered::ProjectionStageCovered(ExpressionContext* expCtx,
+                                               const BSONObj& projObj,
+                                               const projection_ast::Projection* projection,
+                                               WorkingSet* ws,
+                                               std::unique_ptr<PlanStage> child,
+                                               const BSONObj& coveredKeyObj)
+    : ProjectionStage{expCtx, projObj, ws, std::move(child), "PROJECTION_COVERED"},
+      _coveredKeyObj{coveredKeyObj} {
+    invariant(projection->isSimple());
+
+    // If we're pulling data out of one index we can pre-compute the indices of the fields
+    // in the key that we pull data from and avoid looking up the field name each time.
+
+    // Sanity-check.
+    invariant(_coveredKeyObj.isOwned());
+
+    _includedFields = {projection->getRequiredFields().begin(),
+                       projection->getRequiredFields().end()};
+    BSONObjIterator kpIt(_coveredKeyObj);
+    while (kpIt.more()) {
+        BSONElement elt = kpIt.next();
+        auto fieldIt = _includedFields.find(elt.fieldNameStringData());
+        if (_includedFields.end() == fieldIt) {
+            // Push an unused value on the back to keep _includeKey and _keyFieldNames
+            // in sync.
+            _keyFieldNames.push_back(StringData());
+            _includeKey.push_back(false);
+        } else {
+            // If we are including this key field store its field name.
+            _keyFieldNames.push_back(*fieldIt);
+            _includeKey.push_back(true);
+        }
+    }
+}
+
+void ProjectionStageCovered::transform(WorkingSetMember* member) const {
+    BSONObjBuilder bob;
+
+    // We're pulling data out of the key.
+    invariant(1 == member->keyData.size());
+    size_t keyIndex = 0;
+
+    // Look at every key element...
+    BSONObjIterator keyIterator(member->keyData[0].keyData);
+    while (keyIterator.more()) {
+        BSONElement elt = keyIterator.next();
+        // If we're supposed to include it...
+        if (_includeKey[keyIndex]) {
+            // Do so.
+            bob.appendAs(elt, _keyFieldNames[keyIndex]);
+        }
+        ++keyIndex;
+    }
+    transitionMemberToOwnedObj(bob.obj(), member);
+}
+
+ProjectionStageSimple::ProjectionStageSimple(ExpressionContext* expCtx,
+                                             const BSONObj& projObj,
+                                             const projection_ast::Projection* projection,
+                                             WorkingSet* ws,
+                                             std::unique_ptr<PlanStage> child)
+    : ProjectionStage{expCtx, projObj, ws, std::move(child), "PROJECTION_SIMPLE"} {
+    invariant(projection->isSimple());
+    _includedFields = {projection->getRequiredFields().begin(),
+                       projection->getRequiredFields().end()};
+}
+
+void ProjectionStageSimple::transform(WorkingSetMember* member) const {
+    BSONObjBuilder bob;
+    // SIMPLE_DOC implies that we expect an object so it's kind of redundant.
+    // If we got here because of SIMPLE_DOC the planner shouldn't have messed up.
+    invariant(member->hasObj());
+
+    // Apply the SIMPLE_DOC projection.
+    // Look at every field in the source document and see if we're including it.
+    auto objToProject = member->doc.value().toBson();
+    auto nFieldsNeeded = _includedFields.size();
+    for (auto&& elt : objToProject) {
+        auto fieldName{elt.fieldNameStringData()};
+        absl::string_view fieldNameKey{fieldName.rawData(), fieldName.size()};
+        if (auto fieldIt = _includedFields.find(fieldNameKey); _includedFields.end() != fieldIt) {
+            bob.append(elt);
+            if (--nFieldsNeeded == 0) {
+                break;
             }
-            else {
-                invariant(ProjectionStageParams::SIMPLE_DOC == params.projImpl);
-            }
         }
     }
 
-    // static
-    void ProjectionStage::getSimpleInclusionFields(const BSONObj& projObj,
-                                                   FieldSet* includedFields) {
-        // The _id is included by default.
-        bool includeId = true;
-
-        // Figure out what fields are in the projection.  TODO: we can get this from the
-        // ParsedProjection...modify that to have this type instead of a vector.
-        BSONObjIterator projObjIt(projObj);
-        while (projObjIt.more()) {
-            BSONElement elt = projObjIt.next();
-            // Must deal with the _id case separately as there is an implicit _id: 1 in the
-            // projection.
-            if (mongoutils::str::equals(elt.fieldName(), kIdField)
-                && !elt.trueValue()) {
-                includeId = false;
-                continue;
-            }
-            includedFields->insert(elt.fieldNameStringData());
-        }
-
-        if (includeId) {
-            includedFields->insert(kIdField);
-        }
-    }
-
-    // static
-    void ProjectionStage::transformSimpleInclusion(const BSONObj& in,
-                                                   const FieldSet& includedFields,
-                                                   BSONObjBuilder& bob) {
-        // Look at every field in the source document and see if we're including it.
-        BSONObjIterator inputIt(in);
-        while (inputIt.more()) {
-            BSONElement elt = inputIt.next();
-            unordered_set<StringData, StringData::Hasher>::const_iterator fieldIt;
-            fieldIt = includedFields.find(elt.fieldNameStringData());
-            if (includedFields.end() != fieldIt) {
-                // If so, add it to the builder.
-                bob.append(elt);
-            }
-        }
-    }
-
-    Status ProjectionStage::transform(WorkingSetMember* member) {
-        // The default no-fast-path case.
-        if (ProjectionStageParams::NO_FAST_PATH == _projImpl) {
-            return _exec->transform(member);
-        }
-
-        BSONObjBuilder bob;
-
-        // Note that even if our fast path analysis is bug-free something that is
-        // covered might be invalidated and just be an obj.  In this case we just go
-        // through the SIMPLE_DOC path which is still correct if the covered data
-        // is not available.
-        //
-        // SIMPLE_DOC implies that we expect an object so it's kind of redundant.
-        if ((ProjectionStageParams::SIMPLE_DOC == _projImpl) || member->hasObj()) {
-            // If we got here because of SIMPLE_DOC the planner shouldn't have messed up.
-            invariant(member->hasObj());
-
-            // Apply the SIMPLE_DOC projection.
-            transformSimpleInclusion(member->obj.value(), _includedFields, bob);
-        }
-        else {
-            invariant(ProjectionStageParams::COVERED_ONE_INDEX == _projImpl);
-            // We're pulling data out of the key.
-            invariant(1 == member->keyData.size());
-            size_t keyIndex = 0;
-
-            // Look at every key element...
-            BSONObjIterator keyIterator(member->keyData[0].keyData);
-            while (keyIterator.more()) {
-                BSONElement elt = keyIterator.next();
-                // If we're supposed to include it...
-                if (_includeKey[keyIndex]) {
-                    // Do so.
-                    bob.appendAs(elt, _keyFieldNames[keyIndex]);
-                }
-                ++keyIndex;
-            }
-        }
-
-        member->state = WorkingSetMember::OWNED_OBJ;
-        member->keyData.clear();
-        member->loc = RecordId();
-        member->obj = Snapshotted<BSONObj>(SnapshotId(), bob.obj());
-        return Status::OK();
-    }
-
-    ProjectionStage::~ProjectionStage() { }
-
-    bool ProjectionStage::isEOF() { return _child->isEOF(); }
-
-    PlanStage::StageState ProjectionStage::work(WorkingSetID* out) {
-        ++_commonStats.works;
-
-        // Adds the amount of time taken by work() to executionTimeMillis.
-        ScopedTimer timer(&_commonStats.executionTimeMillis);
-
-        WorkingSetID id = WorkingSet::INVALID_ID;
-        StageState status = _child->work(&id);
-
-        // Note that we don't do the normal if isEOF() return EOF thing here.  Our child might be a
-        // tailable cursor and isEOF() would be true even if it had more data...
-        if (PlanStage::ADVANCED == status) {
-            WorkingSetMember* member = _ws->get(id);
-            // Punt to our specific projection impl.
-            Status projStatus = transform(member);
-            if (!projStatus.isOK()) {
-                warning() << "Couldn't execute projection, status = "
-                          << projStatus.toString() << endl;
-                *out = WorkingSetCommon::allocateStatusMember(_ws, projStatus);
-                return PlanStage::FAILURE;
-            }
-
-            *out = id;
-            ++_commonStats.advanced;
-        }
-        else if (PlanStage::FAILURE == status) {
-            *out = id;
-            // If a stage fails, it may create a status WSM to indicate why it
-            // failed, in which case 'id' is valid.  If ID is invalid, we
-            // create our own error message.
-            if (WorkingSet::INVALID_ID == id) {
-                mongoutils::str::stream ss;
-                ss << "projection stage failed to read in results from child";
-                Status status(ErrorCodes::InternalError, ss);
-                *out = WorkingSetCommon::allocateStatusMember( _ws, status);
-            }
-        }
-        else if (PlanStage::NEED_TIME == status) {
-            _commonStats.needTime++;
-        }
-        else if (PlanStage::NEED_YIELD == status) {
-            _commonStats.needYield++;
-            *out = id;
-        }
-
-        return status;
-    }
-
-    void ProjectionStage::saveState() {
-        ++_commonStats.yields;
-        _child->saveState();
-    }
-
-    void ProjectionStage::restoreState(OperationContext* opCtx) {
-        ++_commonStats.unyields;
-        _child->restoreState(opCtx);
-    }
-
-    void ProjectionStage::invalidate(OperationContext* txn,
-                                     const RecordId& dl,
-                                     InvalidationType type) {
-        ++_commonStats.invalidates;
-        _child->invalidate(txn, dl, type);
-    }
-
-    vector<PlanStage*> ProjectionStage::getChildren() const {
-        vector<PlanStage*> children;
-        children.push_back(_child.get());
-        return children;
-    }
-
-    PlanStageStats* ProjectionStage::getStats() {
-        _commonStats.isEOF = isEOF();
-        auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_PROJECTION));
-
-        ProjectionStats* projStats = new ProjectionStats(_specificStats);
-        projStats->projObj = _projObj;
-        ret->specific.reset(projStats);
-
-        ret->children.push_back(_child->getStats());
-        return ret.release();
-    }
-
-    const CommonStats* ProjectionStage::getCommonStats() {
-        return &_commonStats;
-    }
-
-    const SpecificStats* ProjectionStage::getSpecificStats() {
-        return &_specificStats;
-    }
+    transitionMemberToOwnedObj(bob.obj(), member);
+}
 
 }  // namespace mongo

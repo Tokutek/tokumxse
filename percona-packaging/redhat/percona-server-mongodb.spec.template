@@ -1,0 +1,398 @@
+#
+%define         mongo_home /var/lib/mongo
+#
+Name:           percona-server-mongodb
+Version:        @@VERSION@@
+Release:        @@RELEASE@@%{?dist}
+Summary:        High-performance MongoDB replacement from Percona (metapackage)
+Group:          Applications/Databases
+
+License:        SSPL
+URL:            https://github.com/percona/percona-server-mongodb.git
+Source0:        @@SOURCE_TARBALL@@
+Source1:        mongod.conf
+Source2:        mongod.service
+Source3:        mongod.default
+Source4:        percona-server-mongodb-helper.sh
+Source5:        mongod.init
+Source6:        mongod.pp
+Source7:        percona-server-mongodb-enable-auth.sh
+
+%if 0%{?rhel} > 6
+Requires(post):   systemd
+Requires(preun):  systemd
+Requires(postun): systemd
+%else
+Requires(post):   /sbin/chkconfig
+Requires(preun):  /sbin/chkconfig
+Requires(preun):  /sbin/service
+%endif
+
+
+BuildRoot:      /var/tmp/%{name}-%{version}-%{release}
+%undefine       _missing_build_ids_terminate_build
+%define         _unpackaged_files_terminate_build 0
+
+%if 0%{?rhel} > 6
+%global _dwz_low_mem_die_limit 0
+%endif
+
+%define         src_dir @@SRC_DIR@@
+
+BuildRequires: gcc, make, cmake, gcc-c++, openssl-devel, cyrus-sasl-devel
+BuildRequires: snappy-devel, zlib-devel, bzip2-devel, libpcap-devel, openldap-devel, xz-devel
+BuildRequires: /usr/bin/scons
+
+# %if 0%{?rhel} >= 6
+# BuildRequires: policycoreutils-python
+# %endif
+
+Requires: %{name}-mongos = %{version}-%{release}
+Requires: %{name}-server = %{version}-%{release}
+Requires: %{name}-shell = %{version}-%{release}
+Requires: %{name}-tools = %{version}-%{release}
+Requires: numactl, openldap, cyrus-sasl-gssapi
+
+Conflicts: Percona-Server-MongoDB < 4.4.0
+Conflicts: Percona-Server-MongoDB-32 Percona-Server-MongoDB-34 Percona-Server-MongoDB-36 mongodb-org
+
+%description
+This package contains high-performance MongoDB replacement from Percona - Percona Server for MongoDB.
+Percona Server for MongoDB is built for scalability, performance and high availability, scaling from single server deployments to large, complex multi-site architectures. By leveraging in-memory computing, Percona Server for MongoDB provides high performance for both reads and writes. Percona Server for MongoDB's native replication and automated failover enable enterprise-grade reliability and operational flexibility.
+
+Percona Server for MongoDB is an open-source database used by companies of all sizes, across all industries and for a wide variety of applications. It is an agile database that allows schemas to change quickly as applications evolve, while still providing the functionality developers expect from traditional databases, such as secondary indexes, a full query language and strict consistency.
+
+Percona Server for MongoDB has a rich client ecosystem including hadoop integration, officially supported drivers for 10 programming languages and environments, as well as 40 drivers supported by the user community.
+
+Percona Server for MongoDB features:
+* JSON Data Model with Dynamic Schemas
+* Auto-Sharding for Horizontal Scalability
+* Built-In Replication for High Availability
+* Rich Secondary Indexes, including geospatial
+* TTL indexes
+* Text Search
+* Aggregation Framework & Native MapReduce
+
+This metapackage will install the mongo shell, import/export tools, other client utilities, server software, default configuration, and init.d scripts.
+
+%package mongos
+Group:          Applications/Databases
+Summary:        Percona Server for MongoDB sharded cluster query router
+%description mongos
+This package contains mongos - the Percona Server for MongoDB sharded cluster query router
+Conflicts: Percona-Server-MongoDB-mongos Percona-Server-MongoDB-32-mongos Percona-Server-MongoDB-34-mongos Percona-Server-MongoDB-36-mongos mongodb-org-mongos
+
+%package server
+Group:          Applications/Databases
+Summary:        Percona Server for MongoDB database server
+Requires: policycoreutils
+Requires: %{name}-shell = %{version}-%{release}
+%description server
+This package contains the Percona Server for MongoDB server software, default configuration files and init.d scripts
+Conflicts: Percona-Server-MongoDB-server Percona-Server-MongoDB-32-server Percona-Server-MongoDB-34-server Percona-Server-MongoDB-36-server mongodb-org-server
+
+%package shell
+Group:          Applications/Databases
+Summary:        Percona Server for MongoDB shell client
+%description shell
+This package contains the Percona Server for MongoDB shell
+Conflicts: Percona-Server-MongoDB-shell Percona-Server-MongoDB-32-shell Percona-Server-MongoDB-34-shell Percona-Server-MongoDB-36-shell mongodb-org-shell
+
+%package tools
+Group:          Applications/Databases
+Summary:        The tools package for Percona Server for MongoDB
+%description tools
+This package contains various tools from MongoDB project, recompiled for Percona Server for MongoDB
+Conflicts: Percona-Server-MongoDB-tools Percona-Server-MongoDB-32-tools Percona-Server-MongoDB-34-tools Percona-Server-MongoDB-36-tools mongodb-org-tools
+
+%prep
+
+%setup -q -n %{src_dir}
+
+%build
+
+export CC=${CC:-gcc}
+export CXX=${CXX:-g++}
+export PSM_TARGETS="mongod mongos mongo perconadecrypt mongobridge"
+export INSTALLDIR=$RPM_BUILD_DIR/install
+export INSTALLDIR_AWS=$RPM_BUILD_DIR/install_aws
+export AWS_LIBS="/usr/local"
+export TOOLS_TAGS="ssl sasl"
+export PORTABLE=1
+export USE_SSE=1
+export PATH=/usr/local/go/bin:$PATH
+
+export PATH=/usr/local/go/bin:${PATH}
+export GOROOT="/usr/local/go/"
+export GOPATH=$(pwd)/
+export PATH="/usr/local/go/bin:$PATH:$GOPATH"
+export GOBINPATH="/usr/local/go/bin"
+
+#aws-sdk-cpp
+pushd $RPM_BUILD_DIR/%{src_dir}/aws-sdk-cpp
+    pushd build
+%if 0%{?rhel} >= 7
+        cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3;transfer" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}"
+        cmake --build . --target install
+%else
+        cmake3 CC=${CC} CXX=${CXX} .. -DCMAKE_BUILD_TYPE=Release -DBUILD_ONLY="s3;transfer" -DBUILD_SHARED_LIBS=OFF -DMINIMIZE_SIZE=ON -DCMAKE_INSTALL_PREFIX="${INSTALLDIR_AWS}"
+        cmake3 --build . --target install
+%endif
+
+    popd
+popd
+mkdir -p ${INSTALLDIR}/include/
+mkdir -p ${INSTALLDIR}/lib/
+mv ${INSTALLDIR_AWS}/include/* ${INSTALLDIR}/include/
+mv ${INSTALLDIR_AWS}/lib*/* ${INSTALLDIR}/lib/
+
+# Build PSfMDB with SCons
+pushd $RPM_BUILD_DIR/%{src_dir}
+buildscripts/scons.py CC=${CC} CXX=${CXX} --disable-warnings-as-errors --audit --release --ssl --opt=on  \
+%{?_smp_mflags} --use-sasl-client CPPPATH=${INSTALLDIR}/include LIBPATH="${INSTALLDIR}/lib ${AWS_LIBS}/lib ${AWS_LIBS}/lib64" \
+--wiredtiger --inmemory --hotbackup ${PSM_TARGETS} || exit $?
+rm -fr resmoke.ini
+popd
+
+# Mongo Tools compilation
+mkdir -p $RPM_BUILD_DIR/%{src_dir}/bin
+pushd $RPM_BUILD_DIR/
+[[ ${PATH} == *"/usr/local/go/bin"* && -x /usr/local/go/bin/go ]] || export PATH=/usr/local/go/bin:${PATH}
+export GOROOT="/usr/local/go/"
+export GOPATH=$(pwd)/
+export PATH="/usr/local/go/bin:$PATH:$GOPATH"
+export GOBINPATH="/usr/local/go/bin"
+mkdir -p $GOPATH/src/github.com/mongodb
+cp -r $RPM_BUILD_DIR/%{src_dir}/mongo-tools ${GOPATH}/src/github.com/mongodb
+pushd ${GOPATH}/src/github.com/mongodb/mongo-tools
+. ./set_tools_revision.sh
+sed -i '12d' buildscript/build.go
+sed -i '167,176d' buildscript/build.go
+sed -i "s:versionStr,:\"$PSMDB_TOOLS_REVISION\",:" buildscript/build.go
+sed -i "s:gitCommit):\"$PSMDB_TOOLS_COMMIT_HASH\"):" buildscript/build.go
+./make build
+mv bin/* $RPM_BUILD_DIR/%{src_dir}/bin
+popd
+
+
+%install
+#
+rm -rf %{buildroot}
+#
+install -m 755 -d %{buildroot}/etc/selinux/targeted/modules/active/modules
+install -m 644 %{SOURCE6} %{buildroot}/etc/selinux/targeted/modules/active/modules/
+#
+install -m 755 -d %{buildroot}/%{_bindir}
+install -m 755 -d %{buildroot}/%{_sysconfdir}
+install -m 755 -d %{buildroot}/%{_mandir}/man1
+
+install -m 750 -d %{buildroot}/var/log/mongo
+touch %{buildroot}/var/log/mongo/mongod.log
+install -m 750 -d %{buildroot}/%{mongo_home}
+install -m 755 -d %{buildroot}/%{_sysconfdir}/sysconfig
+#
+install -m 644 %{SOURCE1} %{buildroot}/%{_sysconfdir}/mongod.conf
+sed -i 's|/var/lib/mongodb|/var/lib/mongo|' %{buildroot}/%{_sysconfdir}/mongod.conf
+sed -i 's|/var/log/mongodb/mongod.log|/var/log/mongo/mongod.log|' %{buildroot}/%{_sysconfdir}/mongod.conf
+# startup stuff
+%if 0%{?rhel} >= 7
+  install -m 755 -d %{buildroot}/%{_unitdir}
+  install -m 644 %{SOURCE2} %{buildroot}/%{_unitdir}/mongod.service
+%else
+  install -m 755 -d %{buildroot}/etc/rc.d/init.d
+  install -m 750 %{SOURCE5} %{buildroot}/etc/rc.d/init.d/mongod
+%endif
+#
+install -m 644 %{SOURCE3} %{buildroot}/%{_sysconfdir}/sysconfig/mongod
+install -m 755 %{SOURCE4} %{buildroot}/%{_bindir}/
+install -m 755 %{SOURCE7} %{buildroot}/%{_bindir}/
+#
+install -m 755 mongo %{buildroot}/%{_bindir}/
+install -m 755 mongod %{buildroot}/%{_bindir}/
+install -m 755 mongos %{buildroot}/%{_bindir}/
+install -m 755 perconadecrypt %{buildroot}/%{_bindir}/
+install -m 755 mongobridge %{buildroot}/%{_bindir}/
+
+install -m 755 $RPM_BUILD_DIR/%{src_dir}/bin/* %{buildroot}/%{_bindir}/
+
+install -m 644 $RPM_BUILD_DIR/%{src_dir}/manpages/* %{buildroot}/%{_mandir}/man1/
+
+%files
+
+%files mongos
+%defattr(-,root,root,-)
+%{_bindir}/mongos
+%{_mandir}/man1/mongos.1.gz
+
+%files server
+%defattr(-,root,root,-)
+%{_bindir}/mongod
+%{_bindir}/perconadecrypt
+%{_bindir}/mongobridge
+%{_mandir}/man1/mongod.1.gz
+%{_bindir}/percona-server-mongodb-helper.sh
+%{_bindir}/percona-server-mongodb-enable-auth.sh
+%if 0%{?rhel} >= 7
+%{_unitdir}/mongod.service
+%else
+/etc/rc.d/init.d/mongod
+%endif
+/etc/selinux/targeted/modules/active/modules/mongod.pp
+%attr(0750,mongod,mongod) %dir %{mongo_home}
+%attr(0750,mongod,mongod) %dir /var/log/mongo
+%config(noreplace) %{_sysconfdir}/mongod.conf
+%config(noreplace) %{_sysconfdir}/sysconfig/mongod
+%attr(0640,mongod,mongod) %ghost /var/log/mongo/mongod.log
+%doc LICENSE-Community.txt README THIRD-PARTY-NOTICES
+
+%files shell
+%defattr(-,root,root,-)
+%{_bindir}/mongo
+%{_mandir}/man1/mongo.1.gz
+
+%files tools
+%defattr(-,root,root,-)
+%{_bindir}/bsondump
+%{_mandir}/man1/bsondump.1.gz
+%{_bindir}/mongostat
+%{_mandir}/man1/mongostat.1.gz
+%{_bindir}/mongofiles
+%{_mandir}/man1/mongofiles.1.gz
+%{_bindir}/mongoexport
+%{_mandir}/man1/mongoexport.1.gz
+%{_bindir}/mongoimport
+%{_mandir}/man1/mongoimport.1.gz
+%{_bindir}/mongorestore
+%{_mandir}/man1/mongorestore.1.gz
+%{_bindir}/mongodump
+%{_mandir}/man1/mongodump.1.gz
+%{_bindir}/mongotop
+%{_mandir}/man1/mongotop.1.gz
+#%{_bindir}/mongoreplay
+
+%pre server
+if [ $1 == 1 ]; then
+  if ! getent passwd mongod > /dev/null 2>&1; then
+    /usr/sbin/groupadd -r mongod
+    /usr/sbin/useradd -M -r -g mongod -d %{mongo_home} -s /bin/false -c mongod mongod > /dev/null 2>&1
+  fi
+fi
+
+if [ $1 -gt 1 ]; then
+    STATUS_FILE=/tmp/MONGO_RPM_UPGRADE_MARKER
+    PID=$(ps wwaux | grep /usr/bin/mongod | grep -v grep | awk '{print $2}')
+    if [  -z $PID ]; then
+        echo "SERVER_TO_START=0"    >> $STATUS_FILE
+    else
+        echo "SERVER_TO_START=1"    >> $STATUS_FILE
+    fi
+fi
+#
+
+%post server
+#
+%if 0%{?rhel} >= 7
+%systemd_post mongod.service
+  if [ $1 == 1 ]; then
+    /usr/bin/systemctl enable mongod >/dev/null 2>&1 || :
+  fi
+%else
+  if [ $1 == 1 ]; then
+      /sbin/chkconfig --add mongod
+  fi
+%endif
+%if 0%{?rhel} > 5
+/usr/sbin/semodule -i /etc/selinux/targeted/modules/active/modules/mongod.pp
+%else
+/usr/sbin/semodule -i /etc/selinux/targeted/modules/active/modules/mongod.pp 2> /dev/null
+%endif
+echo " * To start the service, configure your engine and start mongod"
+parse_yaml() {
+   local s='[[:space:]]*' w='[a-zA-Z0-9_]*' fs=$(echo @|tr @ '\034')
+   sed -ne "s|^\($s\)\($w\)$s:$s\"\(.*\)\"$s\$|\1$fs\2$fs\3|p" \
+        -e "s|^\($s\)\($w\)$s:$s\(.*\)$s\$|\1$fs\2$fs\3|p"  $1 |
+   awk -F$fs '{
+      indent = length($1)/2;
+      vname[indent] = $2;
+      for (i in vname) {if (i > indent) {delete vname[i]}}
+      if (length($3) > 0) {
+         vn=""; for (i=0; i<indent; i++) {vn=(vn)(vname[i])("_")}
+         printf("%s%s=\"%s\"\n", vn, $2, $3);
+      }
+   }'
+}
+
+array=$(parse_yaml /etc/mongod.conf)
+result=0
+while IFS=' ' read -ra VALUES; do
+    for value in "${VALUES[@]}"; do
+        if [[ $value =~ ([^,]+).*"="\"([^,]+)\" ]]; then
+            name=${BASH_REMATCH[1]}
+            val=${BASH_REMATCH[2]}
+        fi
+        if [[ $name =~ security && $name =~ auth ]]; then
+            result=$val
+            break
+        fi
+    done
+done <<< "$array"
+AUTH_ENABLED=0
+if [[ $result == enabled  ]]; then
+    AUTH_ENABLED=1
+elif [[ $result == disabled  ]]; then
+    AUTH_ENABLED=0
+elif [[ `egrep '^auth=1' /etc/mongod.conf` ]]; then
+    AUTH_ENABLED=1
+elif [[ `egrep '^auth=0' /etc/mongod.conf` ]]; then
+    AUTH_ENABLED=0
+fi
+
+if [[ $AUTH_ENABLED == 0 ]]; then
+    echo " ** WARNING: Access control is not enabled for the database."
+    echo " ** Read and write access to data and configuration is unrestricted."
+    echo " ** To fix this please use /usr/bin/percona-server-mongodb-enable-auth.sh "
+fi
+if [ $1 -gt 1 ]; then
+    STATUS_FILE=/tmp/MONGO_RPM_UPGRADE_MARKER
+    if [ -f $STATUS_FILE ] ; then
+            SERVER_TO_START=`grep '^SERVER_TO_START=' $STATUS_FILE | cut -c17-`
+            rm -f $STATUS_FILE
+    else
+            SERVER_TO_START=''
+    fi
+    if [ $SERVER_TO_START == 1 ]; then
+%if 0%{?rhel} >= 7
+    /usr/sbin/service mongod restart
+%else
+if [ -x %{_sysconfdir}/init.d/mongod ] ; then
+  %{_sysconfdir}/init.d/mongod restart
+fi
+%endif
+    fi
+fi
+
+%preun server
+%if 0%{?rhel} >= 7
+%systemd_preun mongod.service
+%else
+if [ -x %{_sysconfdir}/init.d/mongod ] ; then
+  %{_sysconfdir}/init.d/mongod stop
+fi
+%endif
+
+%postun server
+%if 0%{?rhel} >= 7
+%systemd_postun mongod.service
+%endif
+if [ $1 == 0 ]; then
+  if /usr/bin/id -g mongod > /dev/null 2>&1; then
+    /usr/sbin/userdel mongod > /dev/null 2>&1
+    /usr/sbin/groupdel mongod > /dev/null 2>&1 || true
+  fi
+fi
+
+#
+%changelog
+
+* Thu Feb 27 2020 Oleksandr Miroshnychenko <alex.miroshnychenko@percona.com> - 4.4
+- Initial RPM release for Percona Server for MongoDB 4.4

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,150 +29,180 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-
+#include "mongo/db/exec/index_scan.h"
 #include "mongo/db/exec/near.h"
-#include "mongo/db/exec/working_set.h"
 #include "mongo/db/exec/plan_stats.h"
-#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/geo/geometry_container.h"
+#include "mongo/db/geo/r2_region_coverer.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index/s2_common.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/matcher/expression_geo.h"
 #include "mongo/db/query/index_bounds.h"
+#include "third_party/s2/s2cellunion.h"
 
 namespace mongo {
 
-    /**
-     * Generic parameters for a GeoNear search
-     */
-    struct GeoNearParams {
+/**
+ * Generic parameters for a GeoNear search
+ */
+struct GeoNearParams {
+    GeoNearParams()
+        : filter(nullptr), nearQuery(nullptr), addPointMeta(false), addDistMeta(false) {}
 
-        GeoNearParams() :
-            filter(NULL), nearQuery(NULL), addPointMeta(false), addDistMeta(false) {
-        }
+    // MatchExpression to apply to the index keys and fetched documents
+    // Not owned here, owned by solution nodes
+    MatchExpression* filter;
+    // Index scan bounds, not including the geo bounds
+    IndexBounds baseBounds;
 
-        // MatchExpression to apply to the index keys and fetched documents
-        // Not owned here, owned by solution nodes
-        MatchExpression* filter;
-        // Index scan bounds, not including the geo bounds
-        IndexBounds baseBounds;
+    // Not owned here
+    const GeoNearExpression* nearQuery;
+    bool addPointMeta;
+    bool addDistMeta;
+};
 
-        // Not owned here
-        const GeoNearExpression* nearQuery;
-        bool addPointMeta;
-        bool addDistMeta;
-    };
+/**
+ * Implementation of GeoNear on top of a 2D index
+ */
+class GeoNear2DStage final : public NearStage {
+public:
+    GeoNear2DStage(const GeoNearParams& nearParams,
+                   ExpressionContext* expCtx,
+                   WorkingSet* workingSet,
+                   const CollectionPtr& collection,
+                   const IndexDescriptor* twoDIndex);
 
-    /**
-     * Implementation of GeoNear on top of a 2D index
-     */
-    class GeoNear2DStage : public NearStage {
+protected:
+    std::unique_ptr<CoveredInterval> nextInterval(OperationContext* opCtx,
+                                                  WorkingSet* workingSet,
+                                                  const CollectionPtr& collection) final;
+
+    double computeDistance(WorkingSetMember* member) final;
+
+    PlanStage::StageState initialize(OperationContext* opCtx,
+                                     WorkingSet* workingSet,
+                                     WorkingSetID* out) final;
+
+private:
+    class DensityEstimator {
     public:
+        DensityEstimator(const CollectionPtr& collection,
+                         PlanStage::Children* children,
+                         BSONObj infoObj,
+                         const GeoNearParams* nearParams,
+                         const R2Annulus& fullBounds);
 
-        GeoNear2DStage(const GeoNearParams& nearParams,
-                       OperationContext* txn,
-                       WorkingSet* workingSet,
-                       Collection* collection,
-                       IndexDescriptor* twoDIndex);
-
-        virtual ~GeoNear2DStage();
-
-    protected:
-
-        virtual StatusWith<CoveredInterval*> nextInterval(OperationContext* txn,
-                                                          WorkingSet* workingSet,
-                                                          Collection* collection);
-
-        virtual StatusWith<double> computeDistance(WorkingSetMember* member);
-
-        virtual PlanStage::StageState initialize(OperationContext* txn,
-                                                 WorkingSet* workingSet,
-                                                 Collection* collection,
-                                                 WorkingSetID* out);
+        PlanStage::StageState work(ExpressionContext* expCtx,
+                                   WorkingSet* workingSet,
+                                   const IndexDescriptor* twoDIndex,
+                                   WorkingSetID* out,
+                                   double* estimatedDistance);
 
     private:
+        void buildIndexScan(ExpressionContext* expCtx,
+                            WorkingSet* workingSet,
+                            const IndexDescriptor* twoDIndex);
 
-        virtual void finishSaveState();
-
-        virtual void finishRestoreState(OperationContext* txn);
-
-        virtual void finishInvalidate(OperationContext* txn,
-                                      const RecordId& dl,
-                                      InvalidationType type);
-
-        const GeoNearParams _nearParams;
-
-        // The 2D index we're searching over
-        // Not owned here
-        IndexDescriptor* const _twoDIndex;
-
-        // The total search annulus
-        const R2Annulus _fullBounds;
-
-        // The current search annulus
-        R2Annulus _currBounds;
-
-        // Amount to increment the next bounds by
-        double _boundsIncrement;
-
-        class DensityEstimator;
-        boost::scoped_ptr<DensityEstimator> _densityEstimator;
+        const CollectionPtr& _collection;
+        PlanStage::Children* _children;    // Points to PlanStage::_children in the NearStage.
+        const GeoNearParams* _nearParams;  // Not owned here.
+        const R2Annulus& _fullBounds;
+        IndexScan* _indexScan = nullptr;  // Owned in PlanStage::_children.
+        std::unique_ptr<GeoHashConverter> _converter;
+        GeoHash _centroidCell;
+        unsigned _currentLevel;
     };
 
-    /**
-     * Implementation of GeoNear on top of a 2DSphere (S2) index
-     */
-    class GeoNear2DSphereStage : public NearStage {
+    const GeoNearParams _nearParams;
+
+    // The total search annulus
+    const R2Annulus _fullBounds;
+
+    // The current search annulus
+    R2Annulus _currBounds;
+
+    // Amount to increment the next bounds by
+    double _boundsIncrement;
+
+    // Keeps track of the region that has already been scanned
+    R2CellUnion _scannedCells;
+
+    std::unique_ptr<DensityEstimator> _densityEstimator;
+};
+
+/**
+ * Implementation of GeoNear on top of a 2DSphere (S2) index
+ */
+class GeoNear2DSphereStage final : public NearStage {
+public:
+    GeoNear2DSphereStage(const GeoNearParams& nearParams,
+                         ExpressionContext* expCtx,
+                         WorkingSet* workingSet,
+                         const CollectionPtr& collection,
+                         const IndexDescriptor* s2Index);
+
+protected:
+    std::unique_ptr<CoveredInterval> nextInterval(OperationContext* opCtx,
+                                                  WorkingSet* workingSet,
+                                                  const CollectionPtr& collection) final;
+
+    double computeDistance(WorkingSetMember* member) final;
+
+    PlanStage::StageState initialize(OperationContext* opCtx,
+                                     WorkingSet* workingSet,
+                                     WorkingSetID* out) final;
+
+private:
+    // Estimate the density of data by search the nearest cells level by level around center.
+    class DensityEstimator {
     public:
+        DensityEstimator(const CollectionPtr& collection,
+                         PlanStage::Children* children,
+                         const GeoNearParams* nearParams,
+                         const S2IndexingParams& indexParams,
+                         const R2Annulus& fullBounds);
 
-        GeoNear2DSphereStage(const GeoNearParams& nearParams,
-                             OperationContext* txn,
-                             WorkingSet* workingSet,
-                             Collection* collection,
-                             IndexDescriptor* s2Index);
-
-        virtual ~GeoNear2DSphereStage();
-
-    protected:
-
-        virtual StatusWith<CoveredInterval*> nextInterval(OperationContext* txn,
-                                                          WorkingSet* workingSet,
-                                                          Collection* collection);
-
-        virtual StatusWith<double> computeDistance(WorkingSetMember* member);
-
-        virtual PlanStage::StageState initialize(OperationContext* txn,
-                                                 WorkingSet* workingSet,
-                                                 Collection* collection,
-                                                 WorkingSetID* out);
+        // Search for a document in neighbors at current level.
+        // Return IS_EOF is such document exists and set the estimated distance to the nearest doc.
+        PlanStage::StageState work(ExpressionContext* expCtx,
+                                   WorkingSet* workingSet,
+                                   const IndexDescriptor* s2Index,
+                                   WorkingSetID* out,
+                                   double* estimatedDistance);
 
     private:
+        void buildIndexScan(ExpressionContext* expCtx,
+                            WorkingSet* workingSet,
+                            const IndexDescriptor* s2Index);
 
-        virtual void finishSaveState();
-
-        virtual void finishRestoreState(OperationContext* txn);
-
-        virtual void finishInvalidate(OperationContext* txn,
-                                      const RecordId& dl,
-                                      InvalidationType type);
-
-        const GeoNearParams _nearParams;
-
-        // The 2D index we're searching over
-        // Not owned here
-        IndexDescriptor* const _s2Index;
-
-        // The total search annulus
-        const R2Annulus _fullBounds;
-
-        // The current search annulus
-        R2Annulus _currBounds;
-
-        // Amount to increment the next bounds by
-        double _boundsIncrement;
-
-        class DensityEstimator;
-        boost::scoped_ptr<DensityEstimator> _densityEstimator;
+        const CollectionPtr& _collection;
+        PlanStage::Children* _children;    // Points to PlanStage::_children in the NearStage.
+        const GeoNearParams* _nearParams;  // Not owned here.
+        const S2IndexingParams _indexParams;
+        const R2Annulus& _fullBounds;
+        int _currentLevel;
+        IndexScan* _indexScan = nullptr;  // Owned in PlanStage::_children.
     };
 
-} // namespace mongo
+    const GeoNearParams _nearParams;
+
+    S2IndexingParams _indexParams;
+
+    // The total search annulus
+    const R2Annulus _fullBounds;
+
+    // The current search annulus
+    R2Annulus _currBounds;
+
+    // Amount to increment the next bounds by
+    double _boundsIncrement;
+
+    // Keeps track of the region that has already been scanned
+    S2CellUnion _scannedCells;
+
+    std::unique_ptr<DensityEstimator> _densityEstimator;
+};
+
+}  // namespace mongo

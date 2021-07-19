@@ -1,25 +1,24 @@
-// expression_text.cpp
-
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,76 +28,87 @@
  */
 
 #include "mongo/platform/basic.h"
+
 #include "mongo/db/matcher/expression_text.h"
+
+#include <memory>
+
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/index_catalog.h"
+#include "mongo/db/db_raii.h"
+#include "mongo/db/fts/fts_language.h"
+#include "mongo/db/fts/fts_spec.h"
+#include "mongo/db/index/fts_access_method.h"
 
 namespace mongo {
 
-    using std::string;
+TextMatchExpression::TextMatchExpression(fts::FTSQueryImpl ftsQuery)
+    : TextMatchExpressionBase("_fts"), _ftsQuery(ftsQuery) {}
 
-    Status TextMatchExpression::init( const string& query,
-                                      const string& language,
-                                      bool caseSensitive ) {
-        _query = query;
-        _language = language;
-        _caseSensitive = caseSensitive;
-        return initPath( "_fts" );
+TextMatchExpression::TextMatchExpression(OperationContext* opCtx,
+                                         const NamespaceString& nss,
+                                         TextParams params)
+    : TextMatchExpressionBase("_fts") {
+    _ftsQuery.setQuery(std::move(params.query));
+    _ftsQuery.setLanguage(std::move(params.language));
+    _ftsQuery.setCaseSensitive(params.caseSensitive);
+    _ftsQuery.setDiacriticSensitive(params.diacriticSensitive);
+
+    fts::TextIndexVersion version;
+    {
+        // Find text index.
+        AutoGetDb autoDb(opCtx, nss.db(), MODE_IS);
+        Lock::CollectionLock collLock(opCtx, nss, MODE_IS);
+        Database* db = autoDb.getDb();
+
+        uassert(ErrorCodes::IndexNotFound,
+                str::stream() << "text index required for $text query (no such collection '"
+                              << nss.ns() << "')",
+                db);
+
+        CollectionPtr collection =
+            CollectionCatalog::get(opCtx)->lookupCollectionByNamespace(opCtx, nss);
+
+        uassert(ErrorCodes::IndexNotFound,
+                str::stream() << "text index required for $text query (no such collection '"
+                              << nss.ns() << "')",
+                collection);
+
+        std::vector<const IndexDescriptor*> idxMatches;
+        collection->getIndexCatalog()->findIndexByType(opCtx, IndexNames::TEXT, idxMatches);
+
+        uassert(
+            ErrorCodes::IndexNotFound, "text index required for $text query", !idxMatches.empty());
+        uassert(ErrorCodes::IndexNotFound,
+                "more than one text index found for $text query",
+                idxMatches.size() < 2);
+        invariant(idxMatches.size() == 1);
+
+        const IndexDescriptor* index = idxMatches[0];
+        const FTSAccessMethod* fam = static_cast<const FTSAccessMethod*>(
+            collection->getIndexCatalog()->getEntry(index)->accessMethod());
+        invariant(fam);
+
+        // Extract version and default language from text index.
+        version = fam->getSpec().getTextIndexVersion();
+        if (_ftsQuery.getLanguage().empty()) {
+            _ftsQuery.setLanguage(fam->getSpec().defaultLanguage().str());
+        }
     }
 
-    bool TextMatchExpression::matchesSingleElement( const BSONElement& e ) const {
-        // See ops/update.cpp.
-        // This node is removed by the query planner.  It's only ever called if we're getting an
-        // elemMatchKey.
-        return true;
-    }
-
-    void TextMatchExpression::debugString( StringBuilder& debug, int level ) const {
-        _debugAddSpace(debug, level);
-        debug << "TEXT : query=" << _query << ", language="
-                                 << _language << ", caseSensitive="
-                                 << _caseSensitive << ", tag=";
-        MatchExpression::TagData* td = getTag();
-        if ( NULL != td ) {
-            td->debugString( &debug );
-        }
-        else {
-            debug << "NULL";
-        }
-        debug << "\n";
-    }
-
-    void TextMatchExpression::toBSON(BSONObjBuilder* out) const {
-        out->append("$text", BSON("$search" << _query <<
-                                  "$language" << _language <<
-                                  "$caseSensitive" << _caseSensitive));
-    }
-
-    bool TextMatchExpression::equivalent( const MatchExpression* other ) const {
-        if ( matchType() != other->matchType() ) {
-            return false;
-        }
-        const TextMatchExpression* realOther = static_cast<const TextMatchExpression*>( other );
-
-        // TODO This is way too crude.  It looks for string equality, but it should be looking for
-        // common parsed form
-        if ( realOther->getQuery() != _query ) {
-            return false;
-        }
-        if ( realOther->getLanguage() != _language ) {
-            return false;
-        }
-        if ( realOther->getCaseSensitive() != _caseSensitive ) {
-            return false;
-        }
-        return true;
-    }
-
-    LeafMatchExpression* TextMatchExpression::shallowClone() const {
-        TextMatchExpression* next = new TextMatchExpression();
-        next->init( _query, _language, _caseSensitive );
-        if ( getTag() ) {
-            next->setTag( getTag()->clone() );
-        }
-        return next;
-    }
-
+    Status parseStatus = _ftsQuery.parse(version);
+    uassertStatusOK(parseStatus);
 }
+
+std::unique_ptr<MatchExpression> TextMatchExpression::shallowClone() const {
+    auto expr = std::make_unique<TextMatchExpression>(_ftsQuery);
+    // We use the query-only constructor here directly rather than using the full constructor, to
+    // avoid needing to examine
+    // the index catalog.
+    if (getTag()) {
+        expr->setTag(getTag()->clone());
+    }
+    return expr;
+}
+
+}  // namespace mongo

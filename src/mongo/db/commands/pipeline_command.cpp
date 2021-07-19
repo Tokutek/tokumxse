@@ -1,341 +1,210 @@
 /**
- * Copyright (c) 2011-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
-#include <boost/scoped_ptr.hpp>
-#include <boost/shared_ptr.hpp>
-#include <vector>
-
-#include "mongo/db/auth/action_set.h"
-#include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/privilege.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/client.h"
+#include "mongo/db/auth/authorization_checks.h"
+#include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/db_raii.h"
-#include "mongo/db/exec/pipeline_proxy.h"
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/pipeline/accumulator.h"
-#include "mongo/db/pipeline/document.h"
-#include "mongo/db/pipeline/document_source.h"
-#include "mongo/db/pipeline/expression.h"
-#include "mongo/db/pipeline/expression_context.h"
+#include "mongo/db/commands/run_aggregate.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/pipeline/aggregate_command_gen.h"
+#include "mongo/db/pipeline/aggregation_request_helper.h"
+#include "mongo/db/pipeline/lite_parsed_pipeline.h"
 #include "mongo/db/pipeline/pipeline.h"
-#include "mongo/db/pipeline/pipeline_d.h"
-#include "mongo/db/query/find_constants.h"
-#include "mongo/db/query/get_executor.h"
-#include "mongo/db/storage_options.h"
 
 namespace mongo {
+namespace {
 
-    using boost::intrusive_ptr;
-    using boost::scoped_ptr;
-    using boost::shared_ptr;
-    using std::auto_ptr;
-    using std::string;
-    using std::stringstream;
-    using std::endl;
+class PipelineCommand final : public Command {
+public:
+    PipelineCommand() : Command("aggregate") {}
 
-    /**
-     * Returns true if we need to keep a ClientCursor saved for this pipeline (for future getMore
-     * requests).  Otherwise, returns false.
-     */
-    static bool handleCursorCommand(OperationContext* txn,
-                                    const string& ns,
-                                    ClientCursorPin* pin,
-                                    PlanExecutor* exec,
-                                    const BSONObj& cmdObj,
-                                    BSONObjBuilder& result) {
-
-        ClientCursor* cursor = pin ? pin->c() : NULL;
-        if (pin) {
-            invariant(cursor);
-            invariant(cursor->getExecutor() == exec);
-            invariant(cursor->isAggCursor());
-        }
-
-        const long long defaultBatchSize = 101; // Same as query.
-        long long batchSize;
-        uassertStatusOK(Command::parseCommandCursorOptions(cmdObj, defaultBatchSize, &batchSize));
-
-        // can't use result BSONObjBuilder directly since it won't handle exceptions correctly.
-        BSONArrayBuilder resultsArray;
-        const int byteLimit = MaxBytesToReturnToClientAtOnce;
-        BSONObj next;
-        for (int objCount = 0; objCount < batchSize; objCount++) {
-            // The initial getNext() on a PipelineProxyStage may be very expensive so we don't
-            // do it when batchSize is 0 since that indicates a desire for a fast return.
-            if (exec->getNext(&next, NULL) != PlanExecutor::ADVANCED) {
-                // make it an obvious error to use cursor or executor after this point
-                cursor = NULL;
-                exec = NULL;
-                break;
-            }
-
-            if (resultsArray.len() + next.objsize() > byteLimit) {
-                // Get the pipeline proxy stage wrapped by this PlanExecutor.
-                PipelineProxyStage* proxy = static_cast<PipelineProxyStage*>(exec->getRootStage());
-                // too big. next will be the first doc in the second batch
-                proxy->pushBack(next);
-                break;
-            }
-
-            resultsArray.append(next);
-        }
-
-        // NOTE: exec->isEOF() can have side effects such as writing by $out. However, it should
-        // be relatively quick since if there was no pin then the input is empty. Also, this
-        // violates the contract for batchSize==0. Sharding requires a cursor to be returned in that
-        // case. This is ok for now however, since you can't have a sharded collection that doesn't
-        // exist.
-        const bool canReturnMoreBatches = pin;
-        if (!canReturnMoreBatches && exec && !exec->isEOF()) {
-            // msgasserting since this shouldn't be possible to trigger from today's aggregation
-            // language. The wording assumes that the only reason pin would be null is if the
-            // collection doesn't exist.
-            msgasserted(17391, str::stream()
-                << "Aggregation has more results than fit in initial batch, but can't "
-                << "create cursor since collection " << ns << " doesn't exist");
-        }
-
-        if (cursor) {
-            // If a time limit was set on the pipeline, remaining time is "rolled over" to the
-            // cursor (for use by future getmore ops).
-            cursor->setLeftoverMaxTimeMicros( txn->getCurOp()->getRemainingMaxTimeMicros() );
-
-            if (txn->getClient()->isInDirectClient()) {
-                cursor->setUnownedRecoveryUnit(txn->recoveryUnit());
-            }
-            else {
-                // We stash away the RecoveryUnit in the ClientCursor.  It's used for subsequent
-                // getMore requests.  The calling OpCtx gets a fresh RecoveryUnit.
-                txn->recoveryUnit()->commitAndRestart();
-                cursor->setOwnedRecoveryUnit(txn->releaseRecoveryUnit());
-                StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
-                txn->setRecoveryUnit(storageEngine->newRecoveryUnit());
-            }
-
-            // Cursor needs to be in a saved state while we yield locks for getmore. State
-            // will be restored in getMore().
-            exec->saveState();
-        }
-
-        const long long cursorId = cursor ? cursor->cursorid() : 0LL;
-        Command::appendCursorResponseObject(cursorId, ns, resultsArray.arr(), &result);
-
-        return static_cast<bool>(cursor);
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
     }
 
+    /**
+     * It's not known until after parsing whether or not an aggregation command is an explain
+     * request, because it might include the `explain: true` field (ie. aggregation explains do not
+     * need to arrive via the `explain` command). Therefore even parsing of regular aggregation
+     * commands needs to be able to handle the explain case.
+     *
+     * As a result, aggregation command parsing is done in parseForExplain():
+     *
+     * - To parse a regular aggregation command, call parseForExplain() with `explainVerbosity` of
+     *   boost::none.
+     *
+     * - To parse an aggregation command as the sub-command in an `explain` command, call
+     *   parseForExplain() with `explainVerbosity` set to the desired verbosity.
+     */
+    std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
+                                             const OpMsgRequest& opMsgRequest) override {
+        return parseForExplain(opCtx, opMsgRequest, boost::none);
+    }
 
-    class PipelineCommand :
-        public Command {
+    std::unique_ptr<CommandInvocation> parseForExplain(
+        OperationContext* opCtx,
+        const OpMsgRequest& opMsgRequest,
+        boost::optional<ExplainOptions::Verbosity> explainVerbosity) override {
+        const auto aggregationRequest = aggregation_request_helper::parseFromBSON(
+            opMsgRequest.getDatabase().toString(),
+            opMsgRequest.body,
+            explainVerbosity,
+            APIParameters::get(opCtx).getAPIStrict().value_or(false));
+
+        auto privileges = uassertStatusOK(
+            auth::getPrivilegesForAggregate(AuthorizationSession::get(opCtx->getClient()),
+                                            aggregationRequest.getNamespace(),
+                                            aggregationRequest,
+                                            false));
+
+        return std::make_unique<Invocation>(
+            this, opMsgRequest, std::move(aggregationRequest), std::move(privileges));
+    }
+
+    bool shouldAffectReadConcernCounter() const override {
+        return true;
+    }
+
+    bool collectsResourceConsumptionMetrics() const override {
+        return true;
+    }
+
+    class Invocation final : public CommandInvocation {
     public:
-        PipelineCommand() :Command(Pipeline::commandName) {} // command is called "aggregate"
+        Invocation(Command* cmd,
+                   const OpMsgRequest& request,
+                   const AggregateCommandRequest aggregationRequest,
+                   PrivilegeVector privileges)
+            : CommandInvocation(cmd),
+              _request(request),
+              _dbName(request.getDatabase().toString()),
+              _aggregationRequest(std::move(aggregationRequest)),
+              _liteParsedPipeline(_aggregationRequest),
+              _privileges(std::move(privileges)) {}
 
-        // Locks are managed manually, in particular by DocumentSourceCursor.
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual bool slaveOk() const { return false; }
-        virtual bool slaveOverrideOk() const { return true; }
-        virtual void help(stringstream &help) const {
-            help << "{ pipeline: [ { $operator: {...}}, ... ]"
-                 << ", explain: <bool>"
-                 << ", allowDiskUse: <bool>"
-                 << ", cursor: {batchSize: <number>}"
-                 << " }"
-                 << endl
-                 << "See http://dochub.mongodb.org/core/aggregation for more details."
-                 ;
-        }
-
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            Pipeline::addRequiredPrivileges(this, dbname, cmdObj, out);
-        }
-
-        virtual bool run(OperationContext* txn, const string &db, BSONObj &cmdObj, int options,
-                         string &errmsg, BSONObjBuilder &result, bool fromRepl) {
-            NamespaceString nss(parseNs(db, cmdObj));
-            if (nss.coll().empty()) {
-                errmsg = "missing collection name";
-                return false;
-            }
-
-            intrusive_ptr<ExpressionContext> pCtx = new ExpressionContext(txn, nss);
-            pCtx->tempDir = storageGlobalParams.dbpath + "/_tmp";
-
-            /* try to parse the command; if this fails, then we didn't run */
-            intrusive_ptr<Pipeline> pPipeline = Pipeline::parseCommand(errmsg, cmdObj, pCtx);
-            if (!pPipeline.get())
-                return false;
-
-            // This is outside of the if block to keep the object alive until the pipeline is finished.
-            BSONObj parsed;
-            if (kDebugBuild && !pPipeline->isExplain() && !pCtx->inShard) {
-                // Make sure all operations round-trip through Pipeline::toBson() correctly by
-                // reparsing every command in debug builds. This is important because sharded
-                // aggregations rely on this ability.  Skipping when inShard because this has
-                // already been through the transformation (and this unsets pCtx->inShard).
-                parsed = pPipeline->serialize().toBson();
-                pPipeline = Pipeline::parseCommand(errmsg, parsed, pCtx);
-                verify(pPipeline);
-            }
-
-            PlanExecutor* exec = NULL;
-            scoped_ptr<ClientCursorPin> pin; // either this OR the execHolder will be non-null
-            auto_ptr<PlanExecutor> execHolder;
-            {
-                // This will throw if the sharding version for this connection is out of date. The
-                // lock must be held continuously from now until we have we created both the output
-                // ClientCursor and the input executor. This ensures that both are using the same
-                // sharding version that we synchronize on here. This is also why we always need to
-                // create a ClientCursor even when we aren't outputting to a cursor. See the comment
-                // on ShardFilterStage for more details.
-                AutoGetCollectionForRead ctx(txn, nss.ns());
-
-                Collection* collection = ctx.getCollection();
-
-                // This does mongod-specific stuff like creating the input PlanExecutor and adding
-                // it to the front of the pipeline if needed.
-                boost::shared_ptr<PlanExecutor> input = PipelineD::prepareCursorSource(txn,
-                                                                                       collection,
-                                                                                       pPipeline,
-                                                                                       pCtx);
-                pPipeline->stitch();
-
-                // Create the PlanExecutor which returns results from the pipeline. The WorkingSet
-                // ('ws') and the PipelineProxyStage ('proxy') will be owned by the created
-                // PlanExecutor.
-                auto_ptr<WorkingSet> ws(new WorkingSet());
-                auto_ptr<PipelineProxyStage> proxy(
-                    new PipelineProxyStage(pPipeline, input, ws.get()));
-                Status execStatus = Status::OK();
-                if (NULL == collection) {
-                    execStatus = PlanExecutor::make(txn,
-                                                    ws.release(),
-                                                    proxy.release(),
-                                                    nss.ns(),
-                                                    PlanExecutor::YIELD_MANUAL,
-                                                    &exec);
-                }
-                else {
-                    execStatus = PlanExecutor::make(txn,
-                                                    ws.release(),
-                                                    proxy.release(),
-                                                    collection,
-                                                    PlanExecutor::YIELD_MANUAL,
-                                                    &exec);
-                }
-                invariant(execStatus.isOK());
-                execHolder.reset(exec);
-
-                if (!collection && input) {
-                    // If we don't have a collection, we won't be able to register any executors, so
-                    // make sure that the input PlanExecutor (likely wrapping an EOFStage) doesn't
-                    // need to be registered.
-                    invariant(!input->collection());
-                }
-
-                if (collection) {
-                    const bool isAggCursor = true; // enable special locking behavior
-                    ClientCursor* cursor = new ClientCursor(collection->getCursorManager(),
-                                                            execHolder.release(),
-                                                            nss.ns(),
-                                                            0,
-                                                            BSONObj(),
-                                                            isAggCursor);
-                    pin.reset(new ClientCursorPin(collection->getCursorManager(),
-                                                  cursor->cursorid()));
-                    // Don't add any code between here and the start of the try block.
-                }
-
-                // At this point, it is safe to release the collection lock.
-                // - In the case where we have a collection: we will need to reacquire the
-                //   collection lock later when cleaning up our ClientCursorPin.
-                // - In the case where we don't have a collection: our PlanExecutor won't be
-                //   registered, so it will be safe to clean it up outside the lock.
-                invariant(NULL == execHolder.get() || NULL == execHolder->collection());
-            }
-
-            try {
-                // Unless set to true, the ClientCursor created above will be deleted on block exit.
-                bool keepCursor = false;
-
-                const bool isCursorCommand = !cmdObj["cursor"].eoo();
-
-                // If both explain and cursor are specified, explain wins.
-                if (pPipeline->isExplain()) {
-                    result << "stages" << Value(pPipeline->writeExplainOps());
-                }
-                else if (isCursorCommand) {
-                    keepCursor = handleCursorCommand(txn,
-                                                     nss.ns(),
-                                                     pin.get(),
-                                                     exec,
-                                                     cmdObj,
-                                                     result);
-                }
-                else {
-                    pPipeline->run(result);
-                }
-
-                // Clean up our ClientCursorPin, if needed.  We must reacquire the collection lock
-                // in order to do so.
-                if (pin) {
-                    // We acquire locks here with DBLock and CollectionLock instead of using
-                    // AutoGetCollectionForRead.  AutoGetCollectionForRead will throw if the
-                    // sharding version is out of date, and we don't care if the sharding version
-                    // has changed.
-                    Lock::DBLock dbLock(txn->lockState(), nss.db(), MODE_IS);
-                    Lock::CollectionLock collLock(txn->lockState(), nss.ns(), MODE_IS);
-                    if (keepCursor) {
-                        pin->release();
-                    }
-                    else {
-                        pin->deleteUnderlying();
-                    }
-                }
-            }
-            catch (...) {
-                // On our way out of scope, we clean up our ClientCursorPin if needed.
-                if (pin) {
-                    Lock::DBLock dbLock(txn->lockState(), nss.db(), MODE_IS);
-                    Lock::CollectionLock collLock(txn->lockState(), nss.ns(), MODE_IS);
-                    pin->deleteUnderlying();
-                }
-                throw;
-            }
-            // Any code that needs the cursor pinned must be inside the try block, above.
-
+    private:
+        bool supportsWriteConcern() const override {
             return true;
         }
-    } cmdPipeline;
 
-} // namespace mongo
+        bool canIgnorePrepareConflicts() const override {
+            // Aggregate is a special case for prepare conflicts. It may do writes to an output
+            // collection, but it enables enforcement of prepare conflicts before doing so.
+            return true;
+        }
+
+        ReadConcernSupportResult supportsReadConcern(repl::ReadConcernLevel level) const override {
+            return _liteParsedPipeline.supportsReadConcern(
+                level,
+                _aggregationRequest.getExplain(),
+                serverGlobalParams.enableMajorityReadConcern);
+        }
+
+        bool allowsSpeculativeMajorityReads() const override {
+            // Currently only change stream aggregation queries are allowed to use speculative
+            // majority. The aggregation command itself will check this internally and fail if
+            // necessary.
+            return true;
+        }
+
+        void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* reply) override {
+            CommandHelpers::handleMarkKillOnClientDisconnect(
+                opCtx, !Pipeline::aggHasWriteStage(_request.body));
+
+            uassertStatusOK(runAggregate(opCtx,
+                                         _aggregationRequest.getNamespace(),
+                                         _aggregationRequest,
+                                         _liteParsedPipeline,
+                                         _request.body,
+                                         _privileges,
+                                         reply));
+
+            // The aggregate command's response is unstable when 'explain' or 'exchange' fields are
+            // set.
+            if (!_aggregationRequest.getExplain() && !_aggregationRequest.getExchange()) {
+                query_request_helper::validateCursorResponse(reply->getBodyBuilder().asTempObj());
+            }
+        }
+
+        NamespaceString ns() const override {
+            return _aggregationRequest.getNamespace();
+        }
+
+        void explain(OperationContext* opCtx,
+                     ExplainOptions::Verbosity verbosity,
+                     rpc::ReplyBuilderInterface* result) override {
+
+            uassertStatusOK(runAggregate(opCtx,
+                                         _aggregationRequest.getNamespace(),
+                                         _aggregationRequest,
+                                         _liteParsedPipeline,
+                                         _request.body,
+                                         _privileges,
+                                         result));
+        }
+
+        void doCheckAuthorization(OperationContext* opCtx) const override {
+            uassert(ErrorCodes::Unauthorized,
+                    "unauthorized",
+                    AuthorizationSession::get(opCtx->getClient())
+                        ->isAuthorizedForPrivileges(_privileges));
+        }
+
+        const OpMsgRequest& _request;
+        const std::string _dbName;
+        const AggregateCommandRequest _aggregationRequest;
+        const LiteParsedPipeline _liteParsedPipeline;
+        const PrivilegeVector _privileges;
+    };
+
+    std::string help() const override {
+        return "Runs the aggregation command. See http://dochub.mongodb.org/core/aggregation for "
+               "more details.";
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kOptIn;
+    }
+    bool maintenanceOk() const override {
+        return false;
+    }
+    ReadWriteType getReadWriteType() const {
+        return ReadWriteType::kRead;
+    }
+
+    const AuthorizationContract* getAuthorizationContract() const final {
+        return &::mongo::AggregateCommandRequest::kAuthorizationContract;
+    }
+
+} pipelineCmd;
+
+}  // namespace
+}  // namespace mongo

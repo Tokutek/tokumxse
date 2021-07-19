@@ -7,7 +7,6 @@
  * then each thread does an aggregation with an empty $match.
  */
 var $config = (function() {
-
     var data = {
         numDocs: 1000,
         // Use 12KB documents by default. This number is useful because 12,000 documents each of
@@ -31,8 +30,8 @@ var $config = (function() {
         // overhead
         doc.padding = "";
         var paddingLength = size - Object.bsonsize(doc);
-        assertAlways.lte(0, paddingLength,
-                         'document is already bigger than ' + size + ' bytes: ' + tojson(doc));
+        assertAlways.lte(
+            0, paddingLength, 'document is already bigger than ' + size + ' bytes: ' + tojson(doc));
         doc.padding = getStringOfLength(paddingLength);
         assertAlways.eq(size, Object.bsonsize(doc));
         return doc;
@@ -45,9 +44,7 @@ var $config = (function() {
         }
     };
 
-    var transitions = {
-        query: { query: 1 }
-    };
+    var transitions = {query: {query: 1}};
 
     function setup(db, collName, cluster) {
         // load example data
@@ -59,18 +56,19 @@ var $config = (function() {
                 flag: i % 2 ? true : false,
                 rand: Random.rand(),
                 randInt: Random.randInt(this.numDocs)
-            }, this.docSize));
+            },
+                               this.docSize));
         }
         var res = bulk.execute();
-        assertWhenOwnColl.writeOK(res);
+        assertWhenOwnColl.commandWorked(res);
         assertWhenOwnColl.eq(this.numDocs, res.nInserted);
         assertWhenOwnColl.eq(this.numDocs, db[collName].find().itcount());
-        assertWhenOwnColl.eq(this.numDocs / 2, db[collName].find({ flag: false }).itcount());
-        assertWhenOwnColl.eq(this.numDocs / 2, db[collName].find({ flag: true }).itcount());
+        assertWhenOwnColl.eq(this.numDocs / 2, db[collName].find({flag: false}).itcount());
+        assertWhenOwnColl.eq(this.numDocs / 2, db[collName].find({flag: true}).itcount());
     }
 
     function teardown(db, collName, cluster) {
-        assertWhenOwnColl(db[collName].drop());
+        // By default, do nothing on teardown. Workload tests may implement this function.
     }
 
     return {
@@ -84,6 +82,6 @@ var $config = (function() {
         transitions: transitions,
         data: data,
         setup: setup,
-        teardown: teardown
+        teardown: teardown,
     };
 })();

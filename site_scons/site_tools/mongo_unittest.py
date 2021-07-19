@@ -1,71 +1,72 @@
-"""Pseudo-builders for building and registering unit tests.
-"""
+# Copyright 2020 MongoDB Inc.
+#
+# Permission is hereby granted, free of charge, to any person obtaining
+# a copy of this software and associated documentation files (the
+# "Software"), to deal in the Software without restriction, including
+# without limitation the rights to use, copy, modify, merge, publish,
+# distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so, subject to
+# the following conditions:
+#
+# The above copyright notice and this permission notice shall be included
+# in all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+# KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+# NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+# LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+# WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
 
-import os
-import json
+"""Pseudo-builders for building and registering unit tests."""
+from SCons.Script import Action
 
-from buildscripts import smoke
+from site_scons.mongo import insort_wrapper
 
 def exists(env):
     return True
 
-def register_unit_test(env, test):
-    env['UNITTEST_LIST_ENV']._UnitTestList('$UNITTEST_LIST', test)
-    env.Alias('$UNITTEST_ALIAS', test)
-
-def unit_test_list_builder_action(env, target, source):
-    print "Generating " + str(target[0])
-    ofile = open(str(target[0]), 'wb')
-    try:
-        for s in source:
-            print '\t' + str(s)
-            ofile.write('%s\n' % s)
-    finally:
-        ofile.close()
-        
-    dir, filename = os.path.split(str(target[0]))
-    filebase, ext = os.path.splitext(filename)
-    
-    # Generate metadata file for unit tests
-    metadata_filename = os.path.join(dir, ".".join([filebase, "json"]))        
-    print "Generating metadata file %s" % metadata_filename
-    
-    tests = []
-    for s in source:
-        tests.append(smoke.tests.Test(filename=str(s), test_type="exe_test"))
-        print '\t' + str(s)
-    
-    # For now, write JSON to avoid YAML parsing dependency
-    smoke.tests.write_metadata(tests, metadata_filename, json_only=True)
 
 def build_cpp_unit_test(env, target, source, **kwargs):
+    if not isinstance(target, list):
+        target = [target]
 
-    libdeps = kwargs.get('LIBDEPS', [])
-    libdeps.append( '$BUILD_DIR/mongo/unittest/unittest_main' )
+    for t in target:
+        if not t.endswith('_test'):
+            env.ConfError(f"CppUnitTest target `{t}' does not end in `_test'")
 
-    includeCrutch = True
-    if "NO_CRUTCH" in kwargs:
-        includeCrutch = not kwargs["NO_CRUTCH"]
+    if not kwargs.get("UNITTEST_HAS_CUSTOM_MAINLINE", False):
+        libdeps = kwargs.get("LIBDEPS", env.get("LIBDEPS", [])).copy()
+        insort_wrapper(libdeps, "$BUILD_DIR/mongo/unittest/unittest_main")
+        kwargs["LIBDEPS"] = libdeps
 
-    if includeCrutch:
-        libdeps.append( '$BUILD_DIR/mongo/unittest/unittest_crutch' )
+    unit_test_components = {"tests", "unittests"}
+    primary_component = kwargs.get("AIB_COMPONENT", env.get("AIB_COMPONENT", ""))
+    if primary_component and not primary_component.endswith("-test"):
+        kwargs["AIB_COMPONENT"] = primary_component + "-test"
+    elif primary_component:
+        kwargs["AIB_COMPONENT"] = primary_component
+    else:
+        kwargs["AIB_COMPONENT"] = "unittests"
+        unit_test_components = {"tests"}
 
-    kwargs['LIBDEPS'] = libdeps
+    if "AIB_COMPONENTS_EXTRA" in kwargs:
+        kwargs["AIB_COMPONENTS_EXTRA"] = set(kwargs["AIB_COMPONENTS_EXTRA"]).union(
+            unit_test_components
+        )
+    else:
+        kwargs["AIB_COMPONENTS_EXTRA"] = list(unit_test_components)
 
     result = env.Program(target, source, **kwargs)
-    env.RegisterUnitTest(result[0])
-    env.Install("#/build/unittests/", target)
+    env.RegisterTest("$UNITTEST_LIST", result[0])
+    env.Alias("$UNITTEST_ALIAS", result[0])
+
     return result
 
+
 def generate(env):
-    # Capture the top level env so we can use it to generate the unit test list file
-    # indepenently of which environment CppUnitTest was called in. Otherwise we will get "Two
-    # different env" warnings for the unit_test_list_builder_action.
-    env['UNITTEST_LIST_ENV'] = env;
-    unit_test_list_builder = env.Builder(
-        action=env.Action(unit_test_list_builder_action, "Generating $TARGET"),
-        multi=True)
-    env.Append(BUILDERS=dict(_UnitTestList=unit_test_list_builder))
-    env.AddMethod(register_unit_test, 'RegisterUnitTest')
-    env.AddMethod(build_cpp_unit_test, 'CppUnitTest')
-    env.Alias('$UNITTEST_ALIAS', '$UNITTEST_LIST')
+    env.TestList("$UNITTEST_LIST", source=[])
+    env.AddMethod(build_cpp_unit_test, "CppUnitTest")
+    env.Alias("$UNITTEST_ALIAS", "$UNITTEST_LIST")

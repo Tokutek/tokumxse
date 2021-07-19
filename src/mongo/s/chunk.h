@@ -1,289 +1,216 @@
-// @file chunk.h
-
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects
-*    for all of the code used other than as permitted herein. If you modify
-*    file(s) with this exception, you may extend this exception to your
-*    version of the file(s), but you are not obligated to do so. If you do not
-*    wish to do so, delete this exception statement from your version. If you
-*    delete this exception statement from all source files in the program,
-*    then also delete it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
-#include <boost/shared_ptr.hpp>
-
-#include "mongo/db/keypattern.h"
-#include "mongo/platform/atomic_word.h"
+#include "mongo/s/catalog/type_chunk.h"
 #include "mongo/s/chunk_version.h"
-#include "mongo/s/shard.h"
-#include "mongo/s/shard_key_pattern.h"
-#include "mongo/util/concurrency/ticketholder.h"
-#include "mongo/util/debug_util.h"
-#include "mongo/util/ptr.h"
+#include "mongo/s/shard_id.h"
 
 namespace mongo {
 
-    class ChunkManager;
-    struct WriteConcernOptions;
+class BSONObj;
+class ChunkWritesTracker;
+
+/**
+ * Represents a cache entry for a single Chunk. Owned by a RoutingTableHistory.
+ */
+class ChunkInfo {
+public:
+    explicit ChunkInfo(const ChunkType& from);
+
+    ChunkInfo(ChunkRange range,
+              std::string maxKeyString,
+              ShardId shardId,
+              ChunkVersion version,
+              std::vector<ChunkHistory> history,
+              bool jumbo,
+              std::shared_ptr<ChunkWritesTracker> writesTracker);
+
+    const auto& getRange() const {
+        return _range;
+    }
+
+    const BSONObj& getMin() const {
+        return _range.getMin();
+    }
+
+    const BSONObj& getMax() const {
+        return _range.getMax();
+    }
+
+    const std::string& getMaxKeyString() const {
+        return _maxKeyString;
+    }
+
+    const ShardId& getShardId() const {
+        return _shardId;
+    }
+
+    const ShardId& getShardIdAt(const boost::optional<Timestamp>& ts) const;
 
     /**
-       config.chunks
-       { ns : "alleyinsider.fs.chunks" , min : {} , max : {} , server : "localhost:30001" }
-
-       x is in a shard iff
-       min <= x < max
+     * Throws MigrationConflict if the history entry valid for the given timestamp is not the most
+     * recent entry (meaning the chunk has moved).
+     *
+     * Throws StaleChunkHistory if no history entry is valid for the given timestamp.
      */
-    class Chunk {
-        MONGO_DISALLOW_COPYING(Chunk);
-    public:
-        enum SplitPointMode {
-            // Determines the split points that will make the current chunk smaller than
-            // the current chunk size setting. Gives empty result if chunk is not big enough.
-            normal,
+    void throwIfMovedSince(const Timestamp& ts) const;
 
-            // Will get a split which approximately splits the chunk into 2 halves,
-            // regardless of the size of the chunk.
-            atMedian,
+    ChunkVersion getLastmod() const {
+        return _lastmod;
+    }
 
-            // Behaves like normal, with additional special heuristics for "top chunks"
-            // (the 1 or 2 chunks in the extreme ends of the chunk key space).
-            autoSplitInternal
-        };
+    const auto& getHistory() const {
+        return _history;
+    }
 
-        Chunk( const ChunkManager * info , BSONObj from);
-        Chunk( const ChunkManager * info ,
-               const BSONObj& min,
-               const BSONObj& max,
-               const Shard& shard,
-               ChunkVersion lastmod = ChunkVersion() );
+    bool isJumbo() const {
+        return _jumbo;
+    }
 
-        //
-        // serialization support
-        //
+    /**
+     * Get writes tracker for this chunk.
+     */
+    std::shared_ptr<ChunkWritesTracker> getWritesTracker() const {
+        return _writesTracker;
+    }
 
-        void serialize(BSONObjBuilder& to, ChunkVersion myLastMod = ChunkVersion(0, 0, OID()));
+    /**
+     * Returns a string represenation of the chunk for logging.
+     */
+    std::string toString() const;
 
-        //
-        // chunk boundary support
-        //
+    // Returns true if this chunk contains the given shard key, and false otherwise
+    //
+    // Note: this function takes an extracted *key*, not an original document (the point may be
+    // computed by, say, hashing a given field or projecting to a subset of fields).
+    bool containsKey(const BSONObj& shardKey) const;
 
-        const BSONObj& getMin() const { return _min; }
-        const BSONObj& getMax() const { return _max; }
+    /**
+     * Marks this chunk as jumbo. Only moves from false to true once and is used by the balancer.
+     */
+    void markAsJumbo();
 
-        // Returns true if this chunk contains the given shard key, and false otherwise
-        //
-        // Note: this function takes an extracted *key*, not an original document
-        // (the point may be computed by, say, hashing a given field or projecting
-        //  to a subset of fields).
-        bool containsKey( const BSONObj& shardKey ) const;
+private:
+    const ChunkRange _range;
+    const std::string _maxKeyString;
 
-        std::string genID() const;
-        static std::string genID( const std::string& ns , const BSONObj& min );
+    const ShardId _shardId;
 
-        //
-        // chunk version support
-        //
+    const ChunkVersion _lastmod;
 
-        void appendShortVersion( const char * name , BSONObjBuilder& b ) const;
+    const std::vector<ChunkHistory> _history;
 
-        ChunkVersion getLastmod() const { return _lastmod; }
-        void setLastmod( ChunkVersion v ) { _lastmod = v; }
+    // Indicates whether this chunk should be treated as jumbo and not attempted to be moved or
+    // split
+    mutable bool _jumbo;
 
-        //
-        // split support
-        //
+    // Used for tracking writes to this chunk, to estimate its size for the autosplitter. Since
+    // ChunkInfo objects are always treated as const, and this contains metadata about the chunk
+    // that needs to change, it's okay (and necessary) to mark it mutable.
+    mutable std::shared_ptr<ChunkWritesTracker> _writesTracker;
+};
 
-        long long getBytesWritten() const { return _dataWritten; }
-        // Const since _dataWritten is mutable and a heuristic
-        // TODO: Split data tracking and chunk information
-        void setBytesWritten(long long bytesWritten) const { _dataWritten = bytesWritten; }
+class Chunk {
+public:
+    Chunk(ChunkInfo& chunkInfo, const boost::optional<Timestamp>& atClusterTime)
+        : _chunkInfo(chunkInfo), _atClusterTime(atClusterTime) {}
 
-        /**
-         * if the amount of data written nears the max size of a shard
-         * then we check the real size, and if its too big, we split
-         * @return if something was split
-         */
-        bool splitIfShould( long dataWritten ) const;
+    const BSONObj& getMin() const {
+        return _chunkInfo.getMin();
+    }
 
-        /**
-         * Splits this chunk at a non-specificed split key to be chosen by the mongod holding this chunk.
-         *
-         * @param mode
-         * @param res the object containing details about the split execution
-         * @param resultingSplits the number of resulting split points. Set to NULL to ignore.
-         *
-         * @throws UserException
-         */
-        Status split(SplitPointMode mode,
-                     size_t* resultingSplits,
-                     BSONObj* res) const;
+    const BSONObj& getMax() const {
+        return _chunkInfo.getMax();
+    }
 
-        /**
-         * Splits this chunk at the given key (or keys)
-         *
-         * @param splitPoints the vector of keys that should be used to divide this chunk
-         * @param res the object containing details about the split execution
-         *
-         * @throws UserException
-         */
-        Status multiSplit(const std::vector<BSONObj>& splitPoints, BSONObj* res) const;
+    const ShardId& getShardId() const {
+        return _chunkInfo.getShardIdAt(_atClusterTime);
+    }
 
-        /**
-         * Asks the mongod holding this chunk to find a key that approximately divides this chunk in two
-         *
-         * @param medianKey the key that divides this chunk, if there is one, or empty
-         */
-        void pickMedianKey( BSONObj& medianKey ) const;
+    const auto& getRange() const {
+        return _chunkInfo.getRange();
+    }
 
-        /**
-         * @param splitPoints vector to be filled in
-         * @param chunkSize chunk size to target in bytes
-         * @param maxPoints limits the number of split points that are needed, zero is max (optional)
-         * @param maxObjs limits the number of objects in each chunk, zero is as max (optional)
-         */
-        void pickSplitVector(std::vector<BSONObj>& splitPoints,
-                             long long chunkSize,
-                             int maxPoints = 0,
-                             int maxObjs = 0) const;
+    /**
+     * Throws MigrationConflict if the history entry valid for the chunk's pinned cluster time, if
+     * it has one, is not the most recent entry (meaning the chunk has moved).
+     *
+     * Throws StaleChunkHistory if no history entry is valid for the chunk's cluster time.
+     */
+    void throwIfMoved() const;
 
-        //
-        // migration support
-        //
+    ChunkVersion getLastmod() const {
+        return _chunkInfo.getLastmod();
+    }
 
-        /**
-         * Issues a migrate request for this chunk
-         *
-         * @param to shard to move this chunk to
-         * @param chunSize maximum number of bytes beyond which the migrate should no go trhough
-         * @param writeConcern detailed write concern. NULL means the default write concern.
-         * @param waitForDelete whether chunk move should wait for cleanup or return immediately
-         * @param maxTimeMS max time for the migrate request
-         * @param res the object containing details about the migrate execution
-         * @return true if move was successful
-         */
-        bool moveAndCommit(const Shard& to,
-                           long long chunkSize,
-                           const WriteConcernOptions* writeConcern,
-                           bool waitForDelete,
-                           int maxTimeMS,
-                           BSONObj& res) const;
+    const auto& getHistory() const {
+        return _chunkInfo.getHistory();
+    }
 
-        /**
-         * @return size of shard in bytes
-         *  talks to mongod to do this
-         */
-        long getPhysicalSize() const;
+    bool isJumbo() const {
+        return _chunkInfo.isJumbo();
+    }
 
-        /**
-         * marks this chunk as a jumbo chunk
-         * that means the chunk will be inelligble for migrates
-         */
-        void markAsJumbo() const;
+    /**
+     * Get writes tracker for this chunk.
+     */
+    std::shared_ptr<ChunkWritesTracker> getWritesTracker() const {
+        return _chunkInfo.getWritesTracker();
+    }
 
-        bool isJumbo() const { return _jumbo; }
+    /**
+     * Returns a string represenation of the chunk for logging.
+     */
+    std::string toString() const {
+        return _chunkInfo.toString();
+    }
 
-        /**
-         * Attempt to refresh maximum chunk size from config.
-         */
-        static void refreshChunkSize();
+    // Returns true if this chunk contains the given shard key, and false otherwise
+    //
+    // Note: this function takes an extracted *key*, not an original document (the point may be
+    // computed by, say, hashing a given field or projecting to a subset of fields).
+    bool containsKey(const BSONObj& shardKey) const {
+        return _chunkInfo.containsKey(shardKey);
+    }
 
-        /**
-         * sets MaxChunkSize
-         * 1 <= newMaxChunkSize <= 1024
-         * @return true if newMaxChunkSize is valid and was set
-         */
-        static bool setMaxChunkSizeSizeMB( int newMaxChunkSize );
+    /**
+     * Marks this chunk as jumbo. Only moves from false to true once and is used by the balancer.
+     */
+    void markAsJumbo() {
+        _chunkInfo.markAsJumbo();
+    }
 
-        //
-        // public constants
-        //
+private:
+    ChunkInfo& _chunkInfo;
+    const boost::optional<Timestamp> _atClusterTime;
+};
 
-        static long long MaxChunkSize;
-        static int MaxObjectPerChunk;
-        static bool ShouldAutoSplit;
-
-        //
-        // accessors and helpers
-        //
-
-        std::string toString() const;
-
-        friend std::ostream& operator << (std::ostream& out, const Chunk& c) { return (out << c.toString()); }
-
-        // chunk equality is determined by comparing the min and max bounds of the chunk
-        bool operator==(const Chunk& s) const;
-        bool operator!=(const Chunk& s) const { return ! ( *this == s ); }
-
-        std::string getns() const;
-        Shard getShard() const { return _shard; }
-        const ChunkManager* getManager() const { return _manager; }
-        
-
-    private:
-        // if min/max key is pos/neg infinity
-        bool _minIsInf() const;
-        bool _maxIsInf() const;
-
-        // The chunk manager, which owns this chunk. Not owned by the chunk.
-        const ChunkManager* _manager;
-
-        BSONObj _min;
-        BSONObj _max;
-        Shard _shard;
-        ChunkVersion _lastmod;
-        mutable bool _jumbo;
-
-        // transient stuff
-
-        mutable long long _dataWritten;
-
-        // methods, etc..
-
-        /**
-         * Returns the split point that will result in one of the chunk having exactly one
-         * document. Also returns an empty document if the split point cannot be determined.
-         *
-         * @param doSplitAtLower determines which side of the split will have exactly one document.
-         *        True means that the split point chosen will be closer to the lower bound.
-         *
-         * Warning: this assumes that the shard key is not "special"- that is, the shardKeyPattern
-         *          is simply an ordered list of ascending/descending field names. Examples:
-         *          {a : 1, b : -1} is not special. {a : "hashed"} is.
-         */
-        BSONObj _getExtremeKey(bool doSplitAtLower) const;
-
-        /**
-         * Determines the appropriate split points for this chunk.
-         *
-         * @param atMedian perform a single split at the middle of this chunk.
-         * @param splitPoints out parameter containing the chosen split points. Can be empty.
-         */
-        void determineSplitPoints(bool atMedian, std::vector<BSONObj>* splitPoints) const;
-
-        /** initializes _dataWritten with a random value so that a mongos restart wouldn't cause delay in splitting */
-        static int mkDataWritten();
-    };
-
-    typedef boost::shared_ptr<const Chunk> ChunkPtr;
-
-} // namespace mongo
+}  // namespace mongo

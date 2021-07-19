@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,92 +27,119 @@
  *    it in the license file.
  */
 
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kSharding
+
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/action_set.h"
 #include "mongo/db/auth/action_type.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_session.h"
-#include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/chunk_manager.h"
+#include "mongo/logv2/log.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/cluster_commands_helpers.h"
+#include "mongo/s/database_version.h"
 #include "mongo/s/grid.h"
 
 namespace mongo {
 namespace {
 
-    class GetShardVersion : public Command {
-    public:
-        GetShardVersion() : Command("getShardVersion", false, "getshardversion") { }
+class GetShardVersion : public BasicCommand {
+public:
+    GetShardVersion() : BasicCommand("getShardVersion", "getshardversion") {}
 
-        virtual bool slaveOk() const {
-            return true;
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
+
+    bool adminOnly() const override {
+        return true;
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    std::string help() const override {
+        return " example: { getShardVersion : 'alleyinsider.foo'  } ";
+    }
+
+    Status checkAuthForCommand(Client* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) const override {
+        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
+                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
+                ActionType::getShardVersion)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
 
-        virtual bool adminOnly() const {
-            return true;
-        }
+        return Status::OK();
+    }
 
-        virtual bool isWriteCommandForConfigServer() const {
-            return false;
-        }
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+        BSONElement first = cmdObj.firstElement();
+        uassert(ErrorCodes::BadValue,
+                str::stream() << "namespace has invalid type " << typeName(first.type()),
+                first.canonicalType() == canonicalizeBSONType(mongo::String));
+        const NamespaceString nss(first.valueStringData());
+        return nss.ns();
+    }
 
-        virtual void help(std::stringstream& help) const {
-            help << " example: { getShardVersion : 'alleyinsider.foo'  } ";
-        }
+    bool run(OperationContext* opCtx,
+             const std::string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        const NamespaceString nss(parseNs(dbname, cmdObj));
 
-        virtual Status checkAuthForCommand(ClientBasic* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) {
+        const auto catalogCache = Grid::get(opCtx)->catalogCache();
 
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
-                                                        ResourcePattern::forExactNamespace(
-                                                            NamespaceString(parseNs(dbname,
-                                                                                    cmdObj))),
-                                                        ActionType::getShardVersion)) {
-                return Status(ErrorCodes::Unauthorized, "Unauthorized");
+        if (nss.coll().empty()) {
+            // Return the database's information.
+            auto cachedDbInfo = uassertStatusOK(catalogCache->getDatabase(opCtx, nss.ns()));
+            result.append("primaryShard", cachedDbInfo.primaryId().toString());
+            result.append("shardingEnabled", cachedDbInfo.shardingEnabled());
+            result.append("version", cachedDbInfo.databaseVersion().toBSON());
+        } else {
+            // Return the collection's information.
+            const auto cm = uassertStatusOK(catalogCache->getCollectionRoutingInfo(opCtx, nss));
+            uassert(ErrorCodes::NamespaceNotSharded,
+                    str::stream() << "Collection " << nss.ns() << " is not sharded.",
+                    cm.isSharded());
+            cm.getVersion().appendLegacyWithField(&result, "version");
+
+            if (cmdObj["fullMetadata"].trueValue()) {
+                BSONArrayBuilder chunksArrBuilder;
+                bool exceedsSizeLimit = false;
+
+                LOGV2(22753,
+                      "Routing info requested by getShardVersion: {routingInfo}",
+                      "Routing info requested by getShardVersion",
+                      "routingInfo"_attr = redact(cm.toString()));
+
+                cm.forEachChunk([&](const auto& chunk) {
+                    if (!exceedsSizeLimit) {
+                        BSONArrayBuilder chunkBB(chunksArrBuilder.subarrayStart());
+                        chunkBB.append(chunk.getMin());
+                        chunkBB.append(chunk.getMax());
+                        chunkBB.done();
+                        if (chunksArrBuilder.len() + result.len() > BSONObjMaxUserSize) {
+                            exceedsSizeLimit = true;
+                        }
+                    }
+
+                    return true;
+                });
+
+                if (!exceedsSizeLimit) {
+                    result.append("chunks", chunksArrBuilder.arr());
+                }
             }
-
-            return Status::OK();
         }
 
-        virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
-            return parseNsFullyQualified(dbname, cmdObj);
-        }
+        return true;
+    }
 
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+} getShardVersionCmd;
 
-            const std::string ns = parseNs(dbname, cmdObj);
-            if (ns.size() == 0) {
-                errmsg = "need to specify full namespace";
-                return false;
-            }
-
-            DBConfigPtr config = grid.getDBConfig(ns);
-            if (!config->isSharded(ns)) {
-                errmsg = "ns not sharded.";
-                return false;
-            }
-
-            ChunkManagerPtr cm = config->getChunkManagerIfExists(ns);
-            if (!cm) {
-                errmsg = "no chunk manager?";
-                return false;
-            }
-
-            cm->_printChunks();
-            cm->getVersion().addToBSON(result);
-
-            return true;
-        }
-
-    } getShardVersionCmd;
-
-} // namespace
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

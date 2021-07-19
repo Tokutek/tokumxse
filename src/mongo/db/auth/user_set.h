@@ -1,119 +1,127 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
-#include <string>
-#include <vector>
+#include <list>
 
-#include "mongo/base/disallow_copying.h"
-#include "mongo/base/string_data.h"
-#include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/user.h"
-#include "mongo/db/auth/user_name.h"
-
 
 namespace mongo {
 
+/**
+ * A collection of authenticated users.
+ * This class does not do any locking/synchronization, the consumer will be responsible for
+ * synchronizing access.
+ */
+class UserSet {
+public:
+    using iterator = std::list<UserHandle>::iterator;
+    using const_iterator = std::list<UserHandle>::const_iterator;
+
+    UserSet();
+    UserSet(const UserSet&) = default;
+    UserSet& operator=(const UserSet&) = default;
+
     /**
-     * A collection of authenticated users.
-     * This class does not do any locking/synchronization, the consumer will be responsible for
-     * synchronizing access.
+     * Adds a User to the UserSet.
+     *
+     * As there can only be one user per database in the UserSet, if a User already exists for
+     * the new User's database, the old user will be removed from the set and returned.  It is
+     * the caller's responsibility to then release that user.  If no user already exists for the
+     * new user's database, returns NULL.
+     *
+     * Invalidates any outstanding iterators or NameIterators.
      */
-    class UserSet {
-        MONGO_DISALLOW_COPYING(UserSet);
-    public:
-        typedef std::vector<User*>::const_iterator iterator;
+    void add(UserHandle user);
 
-        UserSet();
-        ~UserSet();
+    /**
+     * Replaces the user at "it" with "replacement."  Does not take ownership of the User.
+     * Returns a pointer to the old user referenced by "it".  Does _not_ invalidate "iterator"
+     * instances.
+     */
+    void replaceAt(iterator it, UserHandle replacement);
 
-        /**
-         * Adds a User to the UserSet.
-         *
-         * The UserSet does not take ownership of the User.
-         *
-         * As there can only be one user per database in the UserSet, if a User already exists for
-         * the new User's database, the old user will be removed from the set and returned.  It is
-         * the caller's responsibility to then release that user.  If no user already exists for the
-         * new user's database, returns NULL.
-         *
-         * Invalidates any outstanding iterators or NameIterators.
-         */
-        User* add(User* user);
+    /**
+     * Removes the user at "it", and returns a pointer to it.  After this call, "it" remains
+     * valid.  It will either equal "end()", or refer to some user between the values of "it"
+     * and "end()" before this call was made.
+     */
+    void removeAt(iterator it);
 
-        /**
-         * Replaces the user at "it" with "replacement."  Does not take ownership of the User.
-         * Returns a pointer to the old user referenced by "it".  Does _not_ invalidate "iterator"
-         * instances.
-         */
-        User* replaceAt(iterator it, User* replacement);
+    /**
+     * Removes the User whose authentication credentials came from dbname, and returns that
+     * user.  It is the caller's responsibility to then release that user back to the
+     * authorizationManger.  If no user exists for the given database, returns NULL;
+     */
+    void removeByDBName(StringData dbname);
 
-        /**
-         * Removes the user at "it", and returns a pointer to it.  After this call, "it" remains
-         * valid.  It will either equal "end()", or refer to some user between the values of "it"
-         * and "end()" before this call was made.
-         */
-        User* removeAt(iterator it);
+    // Returns the User with the given name, or NULL if not found.
+    // Ownership of the returned User remains with the UserSet.  The pointer
+    // returned is only guaranteed to remain valid until the next non-const method is called
+    // on the UserSet.
+    UserHandle lookup(const UserName& name) const;
 
-        /**
-         * Removes the User whose authentication credentials came from dbname, and returns that
-         * user.  It is the caller's responsibility to then release that user back to the
-         * authorizationManger.  If no user exists for the given database, returns NULL;
-         */
-        User* removeByDBName(StringData dbname);
+    // Gets the user whose authentication credentials came from dbname, or NULL if none
+    // exist.  There should be at most one such user.
+    UserHandle lookupByDBName(StringData dbname) const;
 
-        // Returns the User with the given name, or NULL if not found.
-        // Ownership of the returned User remains with the UserSet.  The pointer
-        // returned is only guaranteed to remain valid until the next non-const method is called
-        // on the UserSet.
-        User* lookup(const UserName& name) const;
+    // Gets an iterator over the names of the users stored in the set.  The iterator is
+    // valid until the next non-const method is called on the UserSet.
+    UserNameIterator getNames() const;
 
-        // Gets the user whose authentication credentials came from dbname, or NULL if none
-        // exist.  There should be at most one such user.
-        User* lookupByDBName(StringData dbname) const;
+    iterator begin() {
+        return _users.begin();
+    }
 
-        // Gets an iterator over the names of the users stored in the set.  The iterator is
-        // valid until the next non-const method is called on the UserSet.
-        UserNameIterator getNames() const;
+    iterator end() {
+        return _users.end();
+    }
 
-        iterator begin() const { return _users.begin(); }
-        iterator end() const { return _usersEnd; }
+    // Returns the number of users stored in the set.
+    std::size_t count() const {
+        return _users.size();
+    }
 
-    private:
-        typedef std::vector<User*>::iterator mutable_iterator;
+    // Generates a BSONArray representation of the UserSet.
+    BSONArray toBSON() const {
+        BSONArrayBuilder userNamesArray;
+        for (const auto& userHandle : _users) {
+            userHandle->getName().serializeToBSON(&userNamesArray);
+        }
+        return userNamesArray.arr();
+    }
 
-        mutable_iterator mbegin() { return _users.begin(); }
-        mutable_iterator mend() { return _usersEnd; }
+private:
+    // The UserSet maintains ownership of the Users in it, and is responsible for
+    // returning them to the AuthorizationManager when done with them.
+    std::list<UserHandle> _users;
+};
 
-        // The UserSet maintains ownership of the Users in it, and is responsible for
-        // returning them to the AuthorizationManager when done with them.
-        std::vector<User*> _users;
-        std::vector<User*>::iterator _usersEnd;
-    };
-
-} // namespace mongo
+}  // namespace mongo

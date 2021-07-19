@@ -2,126 +2,252 @@
 
 Import("env")
 
+env = env.Clone()
+
+env.SConscript(
+    dirs=[
+        "collation",
+        "datetime",
+    ],
+    exports=[
+        'env'
+    ],
+)
+
+env.Library(
+    target='canonical_query',
+    source=[
+        "canonical_query.cpp",
+        "canonical_query_encoder.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/db/cst/cst",
+        "$BUILD_DIR/mongo/db/matcher/expressions",
+        "collation/collator_factory_interface",
+        "collation/collator_interface",
+        "projection_ast",
+        "sort_pattern",
+    ],
+    LIBDEPS_PRIVATE=[
+    ],
+)
+
 env.Library(
     target='query_planner',
     source=[
-        "canonical_query.cpp",
-        "query_settings.cpp",
         "index_tag.cpp",
-        "parsed_projection.cpp",
         "plan_cache.cpp",
+        "plan_cache_indexability.cpp",
         "plan_enumerator.cpp",
         "planner_access.cpp",
+        "planner_wildcard_helpers.cpp",
         "planner_analysis.cpp",
         "planner_ixselect.cpp",
-        "query_knobs.cpp",
         "query_planner.cpp",
-        "query_planner_common.cpp",
-        "query_solution.cpp",
-    ],
-    LIBDEPS=[
-        "explain_common",
-        "getmore_request",
-        "index_bounds",
-        "lite_parsed_query",
-        "$BUILD_DIR/mongo/bson",
-        "$BUILD_DIR/mongo/expressions",
-        "$BUILD_DIR/mongo/expressions_text",
-        "$BUILD_DIR/mongo/index_names",
-        "$BUILD_DIR/mongo/server_parameters",
-    ],
-)
-
-env.Library(
-    target='query',
-    source=[
-        "explain.cpp",
-        "get_executor.cpp",
-        "find.cpp",
-        "plan_executor.cpp",
-        "plan_ranker.cpp",
-        "plan_yield_policy.cpp",
-        "query_yield.cpp",
-        "stage_builder.cpp",
-    ],
-    LIBDEPS=[
-        "query_planner",
-        "query_planner_test_lib",
-        "$BUILD_DIR/mongo/db/exec/exec"
-    ],
-)
-
-env.CppUnitTest(
-    target="get_executor_test",
-    source=[
-        "get_executor_test.cpp"
-    ],
-    LIBDEPS=[
-        "query",
-        "$BUILD_DIR/mongo/serveronly",
-        "$BUILD_DIR/mongo/coreserver",
-        "$BUILD_DIR/mongo/coredb",
-        "$BUILD_DIR/mongo/mocklib",
-        "$BUILD_DIR/mongo/ntservice_mock",
-    ],
-    NO_CRUTCH = True,
-)
-
-env.Library(
-    target="index_bounds",
-    source=[
         "expression_index.cpp",
-        "expression_index_knobs.cpp",
         "index_bounds.cpp",
         "index_bounds_builder.cpp",
+        "index_entry.cpp",
         "interval.cpp",
+        "query_planner_common.cpp",
+        "query_settings.cpp",
+        "query_solution.cpp",
+        "expression_index_knobs.idl",
+        "stage_types.cpp",
     ],
     LIBDEPS=[
-        "$BUILD_DIR/mongo/bson",
-        "$BUILD_DIR/mongo/expressions_geo",
-        "$BUILD_DIR/mongo/index_names",
-        "$BUILD_DIR/mongo/mongohasher",
-        "$BUILD_DIR/mongo/server_parameters",
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/bson/dotted_path_support",
+        '$BUILD_DIR/mongo/db/commands/server_status_core',
+        "$BUILD_DIR/mongo/db/exec/projection_executor",
+        "$BUILD_DIR/mongo/db/exec/sbe/query_sbe_plan_stats",
+        "$BUILD_DIR/mongo/db/index/expression_params",
+        "$BUILD_DIR/mongo/db/index/key_generator",
+        "$BUILD_DIR/mongo/db/index_names",
+        "$BUILD_DIR/mongo/db/mongohasher",
+        'canonical_query',
+        "command_request_response",
+        "query_knobs",
+    ],
+    LIBDEPS_PRIVATE=[
+        "$BUILD_DIR/mongo/db/record_id_helpers",
+        "$BUILD_DIR/mongo/idl/server_parameter",
     ],
 )
 
 env.Library(
-    target="explain_common",
+    target='sbe_stage_builder_helpers',
     source=[
-        "explain_common.cpp"
+        "sbe_stage_builder_helpers.cpp",
     ],
     LIBDEPS=[
-        "$BUILD_DIR/mongo/bson",
+        "$BUILD_DIR/mongo/base",
+        '$BUILD_DIR/mongo/db/exec/sbe/query_sbe',
+        "$BUILD_DIR/mongo/db/matcher/expressions",
     ],
 )
 
 env.Library(
-    target="getmore_request",
+    target='projection_ast',
     source=[
-        "getmore_request.cpp"
+        "projection.cpp",
+        "projection_ast_util.cpp",
+        "projection_parser.cpp",
     ],
     LIBDEPS=[
-        "$BUILD_DIR/mongo/bson",
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/matcher/expressions",
     ],
 )
 
-env.CppUnitTest(
-    target="getmore_request_test",
+# Shared mongod/mongos query code.
+env.Library(
+    target="query_common",
     source=[
-        "getmore_request_test.cpp"
+        "explain_common.cpp",
+        "find_common.cpp",
+        "parsed_distinct.cpp",
     ],
     LIBDEPS=[
-        "getmore_request",
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/util/fail_point",
+        "collation/collator_factory_icu",
+        "collation/collator_icu",
+        "datetime/init_timezone_data",
+        "explain_options",
+        "query_planner",
+        "query_request",
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/curop_failpoint_helpers',
     ],
 )
 
 env.Library(
-    target="lite_parsed_query",
+    target="explain_options",
     source=[
-        "lite_parsed_query.cpp"
+        "explain_options.cpp",
+        "explain_verbosity.idl"
     ],
     LIBDEPS=[
-        "$BUILD_DIR/mongo/bson",
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/idl/idl_parser",
+    ],
+)
+
+env.Library(
+    target='map_reduce_output_format',
+    source=[
+        'map_reduce_output_format.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/namespace_string',
+    ],
+)
+
+env.Library(
+    target='cursor_response_idl',
+    source=[
+        'cursor_response.idl',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/idl/basic_types',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+    ],
+)
+
+env.Library(
+    target='command_request_response',
+    source=[
+        "count_command_as_aggregation_command.cpp",
+        "count_request.cpp",
+        'cursor_request.cpp',
+        'cursor_response.cpp',
+        'getmore_request.cpp',
+        'view_response_formatter.cpp',
+        'count_command.idl',
+        'kill_cursors.idl',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/bson/util/bson_extract',
+        '$BUILD_DIR/mongo/db/common',
+        '$BUILD_DIR/mongo/db/namespace_string',
+        '$BUILD_DIR/mongo/db/ops/write_ops_parsers',
+        '$BUILD_DIR/mongo/db/query/hint_parser',
+        '$BUILD_DIR/mongo/db/repl/optime',
+        '$BUILD_DIR/mongo/idl/idl_parser',
+        '$BUILD_DIR/mongo/rpc/command_status',
+        '$BUILD_DIR/mongo/rpc/rpc',
+        'query_request',
+    ],
+    LIBDEPS_PRIVATE=[
+        "cursor_response_idl",
+    ],
+)
+
+env.Library(
+    target="query_request",
+    source=[
+        "distinct_command.idl",
+        "find_command.idl",
+        "getmore_command.idl",
+        "query_request_helper.cpp",
+        "max_time_ms_parser.cpp",
+        "tailable_mode.cpp",
+        "tailable_mode.idl",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/api_parameters",
+        '$BUILD_DIR/mongo/db/auth/authprivilege',
+        "$BUILD_DIR/mongo/db/catalog/collection_catalog",
+        "$BUILD_DIR/mongo/db/commands/test_commands_enabled",
+        "$BUILD_DIR/mongo/db/pipeline/runtime_constants_idl",
+        "$BUILD_DIR/mongo/db/repl/read_concern_args",
+        "hint_parser",
+    ],
+    LIBDEPS_PRIVATE=[
+        "cursor_response_idl",
+    ],
+)
+
+env.Library(
+    target="query_knobs",
+    source=[
+        'query_knobs.idl',
+        'query_feature_flags.idl',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/idl/feature_flag',
+        '$BUILD_DIR/mongo/idl/server_parameter'
+    ]
+)
+
+env.Library(
+    target="query_test_service_context",
+    source=[
+        "query_test_service_context.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/db/logical_session_id",
+        "$BUILD_DIR/mongo/db/service_context",
+        "collation/collator_factory_mock",
+    ],
+    LIBDEPS_PRIVATE=[
+    ],
+)
+
+env.Library(
+    target="query_planner_test_fixture",
+    source=[
+        "query_planner_test_fixture.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/unittest/unittest",
+        "query_planner_test_lib",
     ],
 )
 
@@ -131,134 +257,129 @@ env.Library(
         "query_planner_test_lib.cpp",
     ],
     LIBDEPS=[
+        "collation/collator_factory_mock",
         "query_planner",
+        "query_test_service_context",
     ],
 )
 
-env.CppUnitTest(
-    target="canonical_query_test",
+env.Library(
+    target="hint_parser",
     source=[
-        "canonical_query_test.cpp"
+        "hint_parser.cpp",
+        'hint.idl',
     ],
     LIBDEPS=[
-        "query_planner",
-        "$BUILD_DIR/mongo/expressions_text",
+        '$BUILD_DIR/mongo/base',
     ],
 )
 
-env.CppUnitTest(
-    target="index_bounds_test",
+env.Library(
+    target="sort_pattern",
     source=[
-        "index_bounds_test.cpp"
+        "sort_pattern.cpp",
     ],
     LIBDEPS=[
-        "index_bounds",
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/exec/document_value/document_value',
+        '$BUILD_DIR/mongo/db/pipeline/expression_context',
     ],
-)
+ )
 
-env.CppUnitTest(
-    target="index_bounds_builder_test",
+env.Library(
+    target="plan_yield_policy",
     source=[
-        "index_bounds_builder_test.cpp"
+        "plan_yield_policy.cpp",
     ],
     LIBDEPS=[
-        "index_bounds",
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/util/elapsed_tracker',
+        '$BUILD_DIR/mongo/util/fail_point',
     ],
-)
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/concurrency/write_conflict_exception',
+        '$BUILD_DIR/mongo/db/storage/recovery_unit_base',
+    ],
+    LIBDEPS_TYPEINFO=[
+        '$BUILD_DIR/mongo/db/service_context',
+    ],
+ )
 
 env.CppUnitTest(
-    target="interval_test",
+    target="db_query_test",
     source=[
-        "interval_test.cpp"
-    ],
-    LIBDEPS=[
-        "index_bounds",
-    ],
-)
-
-env.CppUnitTest(
-    target="lite_parsed_query_test",
-    source=[
-        "lite_parsed_query_test.cpp"
-    ],
-    LIBDEPS=[
-        "lite_parsed_query",
-    ],
-)
-
-env.CppUnitTest(
-    target="lru_key_value_test",
-    source=[
+        "canonical_query_encoder_test.cpp",
+        "canonical_query_test.cpp",
+        "classic_stage_builder_test.cpp",
+        "count_command_test.cpp",
+        "cursor_response_test.cpp",
+        "get_executor_test.cpp",
+        "getmore_request_test.cpp",
+        "hint_parser_test.cpp",
+        "index_bounds_builder_collator_test.cpp",
+        "index_bounds_builder_eq_null_test.cpp",
+        "index_bounds_builder_interval_test.cpp",
+        "index_bounds_builder_regex_test.cpp",
+        "index_bounds_builder_test.cpp",
+        "index_bounds_builder_type_test.cpp",
+        "index_bounds_test.cpp",
+        "index_entry_test.cpp",
+        "interval_test.cpp",
+        "killcursors_request_test.cpp",
         "lru_key_value_test.cpp",
+        'map_reduce_output_format_test.cpp',
+        "parsed_distinct_test.cpp",
+        "plan_cache_indexability_test.cpp",
+        "plan_cache_test.cpp",
+        "plan_ranker_test.cpp",
+        "planner_access_test.cpp",
+        "planner_analysis_test.cpp",
+        "planner_ixselect_test.cpp",
+        "projection_ast_test.cpp",
+        "projection_test.cpp",
+        "query_planner_array_test.cpp",
+        "query_planner_collation_test.cpp",
+        "query_planner_geo_test.cpp",
+        "query_planner_hashed_index_test.cpp",
+        "query_planner_partialidx_test.cpp",
+        "query_planner_index_test.cpp",
+        "query_planner_operator_test.cpp",
+        "query_planner_options_test.cpp",
+        "query_planner_tree_test.cpp",
+        "query_planner_text_test.cpp",
+        "query_planner_wildcard_index_test.cpp",
+        "query_request_test.cpp",
+        "query_settings_test.cpp",
+        "query_solution_test.cpp",
+        "sbe_and_hash_test.cpp",
+        "sbe_and_sorted_test.cpp",
+        "sbe_stage_builder_test_fixture.cpp",
+        "sbe_stage_builder_test.cpp",
+        "sbe_shard_filter_test.cpp",
+        "shard_filterer_factory_mock.cpp",
+        "view_response_formatter_test.cpp",
     ],
     LIBDEPS=[
-    ],
-)
-
-env.CppUnitTest(
-    target="parsed_projection_test",
-    source=[
-        "parsed_projection_test.cpp"
-    ],
-    LIBDEPS=[
+        "$BUILD_DIR/mongo/db/auth/authmocks",
+        "$BUILD_DIR/mongo/db/concurrency/lock_manager",
+        "$BUILD_DIR/mongo/db/exec/sbe/sbe_plan_stage_test",
+        "$BUILD_DIR/mongo/db/pipeline/aggregation_request_helper",
+        "$BUILD_DIR/mongo/db/query_exec",
+        "$BUILD_DIR/mongo/db/service_context_d_test_fixture",
+        "$BUILD_DIR/mongo/db/service_context_test_fixture",
+        "$BUILD_DIR/mongo/dbtests/mocklib",
+        "$BUILD_DIR/mongo/rpc/rpc",
+        "$BUILD_DIR/mongo/util/clock_source_mock",
+        "collation/collator_factory_mock",
+        "collation/collator_interface_mock",
+        "command_request_response",
+        "explain_options",
+        "hint_parser",
+        "map_reduce_output_format",
+        "query_common",
         "query_planner",
+        "query_planner_test_fixture",
+        "query_request",
+        "query_test_service_context",
     ],
-)
-
-env.CppUnitTest(
-    target="plan_cache_test",
-    source=[
-        "plan_cache_test.cpp"
-    ],
-    LIBDEPS=[
-        "query_planner_test_lib",
-    ],
-)
-
-env.CppUnitTest(
-    target="planner_analysis_test",
-    source=[
-        "planner_analysis_test.cpp"
-    ],
-    LIBDEPS=[
-        "query_planner",
-    ],
-)
-
-env.CppUnitTest(
-    target="planner_ixselect_test",
-    source=[
-        "planner_ixselect_test.cpp"
-    ],
-    LIBDEPS=[
-        "query_planner",
-    ],
-)
-
-env.CppUnitTest(
-    target="query_planner_test",
-    source=[
-        "query_planner_test.cpp"
-    ],
-    LIBDEPS=[
-        "query_planner_test_lib",
-    ],
-)
-
-# $text pulls in a lot of stuff so we test it here.
-env.CppUnitTest(
-    target="query_planner_text_test",
-    source=[
-        "query_planner_text_test.cpp"
-    ],
-    LIBDEPS=[
-        "query",
-        "query_planner_test_lib",
-        "$BUILD_DIR/mongo/serveronly",
-        "$BUILD_DIR/mongo/coreserver",
-        "$BUILD_DIR/mongo/coredb",
-        "$BUILD_DIR/mongo/mocklib",
-        "$BUILD_DIR/mongo/ntservice_mock",
-    ],
-    NO_CRUTCH = True,
 )

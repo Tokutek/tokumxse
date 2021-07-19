@@ -1,25 +1,24 @@
-// sorted_data_interface_test_bulkbuilder.cpp
-
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,174 +29,356 @@
 
 #include "mongo/db/storage/sorted_data_interface_test_harness.h"
 
-#include <boost/scoped_ptr.hpp>
+#include <memory>
 
+#include "mongo/db/record_id_helpers.h"
 #include "mongo/db/storage/sorted_data_interface.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
+namespace {
 
-    using boost::scoped_ptr;
+// Add a key using a bulk builder.
+TEST(SortedDataInterface, BuilderAddKey) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
-    // Add a key using a bulk builder.
-    TEST( SortedDataInterface, BuilderAddKey ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataBuilderInterface> builder(
-                    sorted->getBulkBuilder( opCtx.get(), true ) );
-
-            ASSERT_OK( builder->addKey( key1, loc1 ) );
-            builder->commit( false );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 1, sorted->numEntries( opCtx.get() ) );
-        }
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
     }
 
-    // Add a compound key using a bulk builder.
-    TEST( SortedDataInterface, BuilderAddCompoundKey ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataBuilderInterface> builder(
+            sorted->makeBulkBuilder(opCtx.get(), true));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataBuilderInterface> builder(
-                    sorted->getBulkBuilder( opCtx.get(), true ) );
-
-            ASSERT_OK( builder->addKey( compoundKey1a, loc1 ) );
-            builder->commit( false );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 1, sorted->numEntries( opCtx.get() ) );
-        }
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), key1, loc1)));
+        wuow.commit();
     }
 
-    // Add the same key multiple times using a bulk builder and verify that
-    // the returned status is ErrorCodes::DuplicateKey when duplicates are
-    // not allowed.
-    TEST( SortedDataInterface, BuilderAddSameKey ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( true ) );
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+    }
+}
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+/*
+ * Add a KeyString using a bulk builder.
+ */
+TEST(SortedDataInterface, BuilderAddKeyString) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataBuilderInterface> builder(
-                    sorted->getBulkBuilder( opCtx.get(), false ) );
+    KeyString::Builder keyString1(sorted->getKeyStringVersion(), key1, sorted->getOrdering(), loc1);
 
-            ASSERT_OK( builder->addKey( key1, loc1 ) );
-            ASSERT_EQUALS( ErrorCodes::DuplicateKey, builder->addKey( key1, loc2 ) );
-            builder->commit( false );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 1, sorted->numEntries( opCtx.get() ) );
-        }
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
     }
 
-    // Add the same key multiple times using a bulk builder and verify that
-    // the returned status is OK when duplicates are allowed.
-    TEST( SortedDataInterface, BuilderAddSameKeyWithDupsAllowed ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataBuilderInterface> builder(
+            sorted->makeBulkBuilder(opCtx.get(), true));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataBuilderInterface> builder(
-                    sorted->getBulkBuilder( opCtx.get(), true /* allow duplicates */ ) );
-
-            ASSERT_OK( builder->addKey( key1, loc1 ) );
-            ASSERT_OK( builder->addKey( key1, loc2 ) );
-            builder->commit( false );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 2, sorted->numEntries( opCtx.get() ) );
-        }
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(builder->addKey(keyString1.getValueCopy()));
+        wuow.commit();
     }
 
-    // Add multiple keys using a bulk builder.
-    TEST( SortedDataInterface, BuilderAddMultipleKeys ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+    }
+}
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataBuilderInterface> builder(
-                    sorted->getBulkBuilder( opCtx.get(), true ) );
-
-            ASSERT_OK( builder->addKey( key1, loc1 ) );
-            ASSERT_OK( builder->addKey( key2, loc2 ) );
-            ASSERT_OK( builder->addKey( key3, loc3 ) );
-            builder->commit( false );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 3, sorted->numEntries( opCtx.get() ) );
-        }
+// Add a reserved RecordId using a bulk builder.
+TEST(SortedDataInterface, BuilderAddKeyWithReservedRecordIdLong) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
     }
 
-    // Add multiple compound keys using a bulk builder.
-    TEST( SortedDataInterface, BuilderAddMultipleCompoundKeys ) {
-        scoped_ptr<HarnessHelper> harnessHelper( newHarnessHelper() );
-        scoped_ptr<SortedDataInterface> sorted( harnessHelper->newSortedDataInterface( false ) );
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataBuilderInterface> builder(
+            sorted->makeBulkBuilder(opCtx.get(), true));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT( sorted->isEmpty( opCtx.get() ) );
-        }
+        RecordId reservedLoc(record_id_helpers::reservedIdFor(
+            record_id_helpers::ReservationId::kWildcardMultikeyMetadataId, KeyFormat::Long));
+        ASSERT(record_id_helpers::isReserved(reservedLoc));
 
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            scoped_ptr<SortedDataBuilderInterface> builder(
-                    sorted->getBulkBuilder( opCtx.get(), true ) );
-
-            ASSERT_OK( builder->addKey( compoundKey1a, loc1 ) );
-            ASSERT_OK( builder->addKey( compoundKey1b, loc2 ) );
-            ASSERT_OK( builder->addKey( compoundKey1c, loc4 ) );
-            ASSERT_OK( builder->addKey( compoundKey2b, loc3 ) );
-            ASSERT_OK( builder->addKey( compoundKey3a, loc5 ) );
-            builder->commit( false );
-        }
-
-        {
-            scoped_ptr<OperationContext> opCtx( harnessHelper->newOperationContext() );
-            ASSERT_EQUALS( 5, sorted->numEntries( opCtx.get() ) );
-        }
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), key1, reservedLoc)));
+        wuow.commit();
     }
 
-} // namespace mongo
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+    }
+}
+
+// Add a compound key using a bulk builder.
+TEST(SortedDataInterface, BuilderAddCompoundKey) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataBuilderInterface> builder(
+            sorted->makeBulkBuilder(opCtx.get(), true));
+
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), compoundKey1a, loc1)));
+        wuow.commit();
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+    }
+}
+
+// Add the same key multiple times using a bulk builder and verify that
+// the returned status is ErrorCodes::DuplicateKey when duplicates are
+// not allowed.
+TEST(SortedDataInterface, BuilderAddSameKey) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/true, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataBuilderInterface> builder(
+            sorted->makeBulkBuilder(opCtx.get(), false));
+
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), key1, loc1)));
+        ASSERT_EQUALS(ErrorCodes::DuplicateKey,
+                      builder->addKey(makeKeyString(sorted.get(), key1, loc2)));
+        wuow.commit();
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+    }
+}
+
+/*
+ * Add the same KeyString multiple times using a bulk builder and verify that the returned status is
+ * ErrorCodes::DuplicateKey when duplicates are not allowed.
+ */
+TEST(SortedDataInterface, BuilderAddSameKeyString) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/true, /*partial=*/false));
+
+    KeyString::Builder keyStringLoc1(
+        sorted->getKeyStringVersion(), key1, sorted->getOrdering(), loc1);
+    KeyString::Builder keyStringLoc2(
+        sorted->getKeyStringVersion(), key1, sorted->getOrdering(), loc2);
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataBuilderInterface> builder(
+            sorted->makeBulkBuilder(opCtx.get(), false));
+
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(builder->addKey(keyStringLoc1.getValueCopy()));
+        ASSERT_EQUALS(ErrorCodes::DuplicateKey, builder->addKey(keyStringLoc2.getValueCopy()));
+        wuow.commit();
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(1, sorted->numEntries(opCtx.get()));
+    }
+}
+
+// Add the same key multiple times using a bulk builder and verify that
+// the returned status is OK when duplicates are allowed.
+TEST(SortedDataInterface, BuilderAddSameKeyWithDupsAllowed) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataBuilderInterface> builder(
+            sorted->makeBulkBuilder(opCtx.get(), true /* allow duplicates */));
+
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), key1, loc1)));
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), key1, loc2)));
+        wuow.commit();
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
+    }
+}
+
+/*
+ * Add the same KeyString multiple times using a bulk builder and verify that the returned status is
+ * OK when duplicates are allowed.
+ */
+TEST(SortedDataInterface, BuilderAddSameKeyStringWithDupsAllowed) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    KeyString::Builder keyStringLoc1(
+        sorted->getKeyStringVersion(), key1, sorted->getOrdering(), loc1);
+    KeyString::Builder keyStringLoc2(
+        sorted->getKeyStringVersion(), key1, sorted->getOrdering(), loc2);
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataBuilderInterface> builder(
+            sorted->makeBulkBuilder(opCtx.get(), true /* allow duplicates */));
+
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(builder->addKey(keyStringLoc1.getValueCopy()));
+        ASSERT_OK(builder->addKey(keyStringLoc2.getValueCopy()));
+        wuow.commit();
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(2, sorted->numEntries(opCtx.get()));
+    }
+}
+
+// Add multiple keys using a bulk builder.
+TEST(SortedDataInterface, BuilderAddMultipleKeys) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataBuilderInterface> builder(
+            sorted->makeBulkBuilder(opCtx.get(), true));
+
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), key1, loc1)));
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), key2, loc2)));
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), key3, loc3)));
+        wuow.commit();
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(3, sorted->numEntries(opCtx.get()));
+    }
+}
+
+/*
+ * Add multiple KeyStrings using a bulk builder.
+ */
+TEST(SortedDataInterface, BuilderAddMultipleKeyStrings) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    KeyString::Builder keyString1(sorted->getKeyStringVersion(), key1, sorted->getOrdering(), loc1);
+    KeyString::Builder keyString2(sorted->getKeyStringVersion(), key2, sorted->getOrdering(), loc2);
+    KeyString::Builder keyString3(sorted->getKeyStringVersion(), key3, sorted->getOrdering(), loc3);
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataBuilderInterface> builder(
+            sorted->makeBulkBuilder(opCtx.get(), true));
+
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(builder->addKey(keyString1.getValueCopy()));
+        ASSERT_OK(builder->addKey(keyString2.getValueCopy()));
+        ASSERT_OK(builder->addKey(keyString3.getValueCopy()));
+        wuow.commit();
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(3, sorted->numEntries(opCtx.get()));
+    }
+}
+
+// Add multiple compound keys using a bulk builder.
+TEST(SortedDataInterface, BuilderAddMultipleCompoundKeys) {
+    const auto harnessHelper(newSortedDataInterfaceHarnessHelper());
+    const std::unique_ptr<SortedDataInterface> sorted(
+        harnessHelper->newSortedDataInterface(/*unique=*/false, /*partial=*/false));
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT(sorted->isEmpty(opCtx.get()));
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        const std::unique_ptr<SortedDataBuilderInterface> builder(
+            sorted->makeBulkBuilder(opCtx.get(), true));
+
+        WriteUnitOfWork wuow(opCtx.get());
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), compoundKey1a, loc1)));
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), compoundKey1b, loc2)));
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), compoundKey1c, loc4)));
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), compoundKey2b, loc3)));
+        ASSERT_OK(builder->addKey(makeKeyString(sorted.get(), compoundKey3a, loc5)));
+        wuow.commit();
+    }
+
+    {
+        const ServiceContext::UniqueOperationContext opCtx(harnessHelper->newOperationContext());
+        ASSERT_EQUALS(5, sorted->numEntries(opCtx.get()));
+    }
+}
+
+}  // namespace
+}  // namespace mongo

@@ -1,10 +1,14 @@
 // This test is related to mixed_mode_repl_nossl.js in
 // the sslSpecial test set. This test must be run with --use-ssl
+// @tags: [live_record_incompatible]
 
-// If we are running in use-x509 passthrough mode, turn it off
-// since it is not necessary for this test.
-TestData.useX509 = false;
-load("jstests/ssl/libs/ssl_helpers.js")
+load("jstests/ssl/libs/ssl_helpers.js");
+
+// Limit the amount of time we'll wait on a failure.
+// Apply equally to success tests as well so that
+// a failure to complete replication is more likely to
+// give us a false negative, than a false positive.
+ReplSetTest.kDefaultTimeoutMS = 3 * 60 * 1000;
 
 // Verify that requireSSL allows ssl connections
 print("=== Testing requireSSL/requireSSL cluster ===");
@@ -15,7 +19,7 @@ print("=== Testing allowSSL/preferSSL cluster ===");
 replShouldSucceed("allow-prefer", allowSSL, preferSSL);
 
 // Test mixed sslMode preferSSL/requireSSL
-print("=== Testing preferSSL/requireSSL cluster ===")
+print("=== Testing preferSSL/requireSSL cluster ===");
 replShouldSucceed("prefer-require", preferSSL, requireSSL);
 
 // Test mixed sslMode disabled/preferSSL - should fail

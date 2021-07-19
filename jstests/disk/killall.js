@@ -6,20 +6,21 @@
  * would not result in a zero return code.
  */
 
-var port = allocatePorts( 1 )[ 0 ]
-
 var baseName = "jstests_disk_killall";
 var dbpath = MongoRunner.dataPath + baseName;
 
-var mongod = startMongod( "--port", port, "--dbpath", dbpath, "--nohttpinterface" );
-var db = mongod.getDB( "test" );
-var collection = db.getCollection( baseName );
-assert.writeOK(collection.insert({}));
+var mongod = MongoRunner.runMongod({dbpath: dbpath});
+var db = mongod.getDB("test");
+var collection = db.getCollection(baseName);
+assert.commandWorked(collection.insert({}));
 
-var s1 = startParallelShell(
-            "db." + baseName + ".count( { $where: function() { while( 1 ) { ; } } } )",
-            port);
-sleep( 1000 );
+// set timeout for js function execution to 100 ms to speed up the test.
+assert.commandWorked(
+    db.adminCommand({setParameter: 1, internalQueryJavaScriptFnTimeoutMillis: 100}));
+
+var awaitShell = startParallelShell(
+    "db." + baseName + ".count( { $where: function() { while( 1 ) { ; } } } )", mongod.port);
+sleep(1000);
 
 /**
  * 0 == mongod's exit code on Windows, or when it receives TERM, HUP or INT signals.  On UNIX
@@ -28,17 +29,19 @@ sleep( 1000 );
  * will not exit cleanly.  We're checking in this assert that mongod will stop quickly even while
  * evaling an infinite loop in server side js.
  */
-var exitCode = stopMongod( port );
+var exitCode = MongoRunner.stopMongod(mongod);
 assert.eq(0, exitCode, "got unexpected exitCode");
 
 // Waits for shell to complete
-s1();
+exitCode = awaitShell({checkExitSuccess: false});
+assert.neq(0, exitCode, "expected shell to exit abnormally due to mongod being terminated");
 
-mongod = startMongoProgram( "mongod", "--port", port, "--dbpath", dbpath );
-db = mongod.getDB( "test" );
-collection = db.getCollection( baseName );
+mongod = MongoRunner.runMongod(
+    {port: mongod.port, restart: true, cleanData: false, dbpath: mongod.dbpath});
+db = mongod.getDB("test");
+collection = db.getCollection(baseName);
 
-assert( collection.stats().ok );
-assert( collection.drop() );
+assert(collection.stats().ok);
+assert(collection.drop());
 
-stopMongod( port );
+MongoRunner.stopMongod(mongod);

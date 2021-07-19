@@ -10,13 +10,15 @@
  *
  * Uses the "replace" action to overwrite the entire contents of the
  * collection.
+ * @tags: [
+ *   # mapReduce does not support afterClusterTime.
+ *   does_not_support_causal_consistency
+ * ]
  */
-load('jstests/concurrency/fsm_libs/extend_workload.js'); // for extendWorkload
-load('jstests/concurrency/fsm_workloads/map_reduce_inline.js'); // for $config
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js'); // for dropCollections
+load('jstests/concurrency/fsm_libs/extend_workload.js');         // for extendWorkload
+load('jstests/concurrency/fsm_workloads/map_reduce_inline.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     // Use the workload name as a prefix for the collection name,
     // since the workload name is assumed to be unique.
     var prefix = 'map_reduce_replace';
@@ -39,18 +41,13 @@ var $config = extendWorkload($config, function($config, $super) {
 
         var options = {
             finalize: this.finalizer,
-            out: { replace: this.outCollName },
-            query: { key: { $exists: true }, value: { $exists: true } },
-            sort: { _id: -1 } // sort key must be an existing index
+            out: {replace: this.outCollName},
+            query: {key: {$exists: true}, value: {$exists: true}},
+            sort: {_id: -1}  // sort key must be an existing index
         };
 
         var res = db[collName].mapReduce(this.mapper, this.reducer, options);
         assertAlways.commandWorked(res);
-    };
-
-    $config.teardown = function teardown(db, collName, cluster) {
-        var pattern = new RegExp('^' + prefix + '\\d+$');
-        dropCollections(db, pattern);
     };
 
     return $config;

@@ -1,248 +1,140 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #pragma once
 
+#include <boost/optional.hpp>
 #include <string>
 
-#include "mongo/base/disallow_copying.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/util/time_support.h"
 
 namespace mongo {
 
+/**
+ * This class represents the layout and contents of documents contained in the config.changelog or
+ * config.actionlog collections. All manipulation of documents coming from that collection should be
+ * done with this class.
+ */
+class ChangeLogType {
+public:
+    // Field names and types in the changelog collection type.
+    static const BSONField<std::string> changeId;
+    static const BSONField<std::string> server;
+    static const BSONField<std::string> shard;
+    static const BSONField<std::string> clientAddr;
+    static const BSONField<Date_t> time;
+    static const BSONField<std::string> what;
+    static const BSONField<std::string> ns;
+    static const BSONField<BSONObj> details;
+
     /**
-     * This class represents the layout and contents of documents contained in the
-     * config.changelog collection. All manipulation of documents coming from that
-     * collection should be done with this class.
-     *
-     * Usage Example:
-     *
-     *     // Contact the config. 'conn' has been obtained before.
-     *     DBClientBase* conn;
-     *     BSONObj query = QUERY(ChangelogType::exampleField("exampleFieldName"));
-     *     exampleDoc = conn->findOne(ChangelogType::ConfigNS, query);
-     *
-     *     // Process the response.
-     *     ChangelogType exampleType;
-     *     std::string errMsg;
-     *     if (!exampleType.parseBSON(exampleDoc, &errMsg) || !exampleType.isValid(&errMsg)) {
-     *         // Can't use 'exampleType'. Take action.
-     *     }
-     *     // use 'exampleType'
-     *
+     * Returns the BSON representation of the entry.
      */
-    class ChangelogType {
-        MONGO_DISALLOW_COPYING(ChangelogType);
-    public:
+    BSONObj toBSON() const;
 
-        //
-        // schema declarations
-        //
+    /**
+     * Constructs a new ChangeLogType object from BSON.
+     * Also does validation of the contents.
+     */
+    static StatusWith<ChangeLogType> fromBSON(const BSONObj& source);
 
-        // Name of the changelog collection in the config server.
-        static const std::string ConfigNS;
+    /**
+     * Returns OK if all fields have been set. Otherwise, returns NoSuchKey
+     * and information about the first field that is missing.
+     */
+    Status validate() const;
 
-        // Field names and types in the changelog collection type.
-        static const BSONField<std::string> changeID;
-        static const BSONField<std::string> server;
-        static const BSONField<std::string> clientAddr;
-        static const BSONField<Date_t> time;
-        static const BSONField<std::string> what;
-        static const BSONField<std::string> ns;
-        static const BSONField<BSONObj> details;
+    /**
+     * Returns a std::string representation of the current internal state.
+     */
+    std::string toString() const;
 
-        //
-        // changelog type methods
-        //
+    const std::string& getChangeId() const {
+        return _changeId.get();
+    }
+    void setChangeId(const std::string& changeId);
 
-        ChangelogType();
-        ~ChangelogType();
+    const std::string& getServer() const {
+        return _server.get();
+    }
+    void setServer(const std::string& server);
 
-        /**
-         * Returns true if all the mandatory fields are present and have valid
-         * representations. Otherwise returns false and fills in the optional 'errMsg' string.
-         */
-        bool isValid(std::string* errMsg) const;
+    const std::string& getShard() const {
+        return _shard.get();
+    }
+    void setShard(const std::string& shard);
 
-        /**
-         * Returns the BSON representation of the entry.
-         */
-        BSONObj toBSON() const;
+    const std::string& getClientAddr() const {
+        return _clientAddr.get();
+    }
+    void setClientAddr(const std::string& clientAddr);
 
-        /**
-         * Clears and populates the internal state using the 'source' BSON object if the
-         * latter contains valid values. Otherwise sets errMsg and returns false.
-         */
-        bool parseBSON(const BSONObj& source, std::string* errMsg);
+    const Date_t& getTime() const {
+        return _time.get();
+    }
+    void setTime(const Date_t& time);
 
-        /**
-         * Clears the internal state.
-         */
-        void clear();
+    const std::string& getWhat() const {
+        return _what.get();
+    }
+    void setWhat(const std::string& what);
 
-        /**
-         * Copies all the fields present in 'this' to 'other'.
-         */
-        void cloneTo(ChangelogType* other) const;
+    const std::string& getNS() const {
+        return _ns.get();
+    }
+    void setNS(const std::string& ns);
 
-        /**
-         * Returns a std::string representation of the current internal state.
-         */
-        std::string toString() const;
+    const BSONObj& getDetails() const {
+        return _details.get();
+    }
+    void setDetails(const BSONObj& details);
 
-        //
-        // individual field accessors
-        //
+private:
+    // Convention: (M)andatory, (O)ptional, (S)pecial rule.
 
-        // Mandatory Fields
-        void setChangeID(StringData changeID) {
-            _changeID = changeID.toString();
-            _isChangeIDSet = true;
-        }
+    // (M)  id for this change "<hostname>-<current_time>-<increment>"
+    boost::optional<std::string> _changeId;
+    // (M)  hostname of server that we are making the change on.
+    boost::optional<std::string> _server;
+    // (O) id of shard making the change, or "config" for configSvrs
+    boost::optional<std::string> _shard;
+    // (M)  hostname:port of the client that made this change
+    boost::optional<std::string> _clientAddr;
+    // (M)  time this change was made
+    boost::optional<Date_t> _time;
+    // (M)  description of the change
+    boost::optional<std::string> _what;
+    // (O) database or collection this change applies to
+    boost::optional<std::string> _ns;
+    // (M)  A BSONObj containing extra information about some operations
+    boost::optional<BSONObj> _details;
+};
 
-        void unsetChangeID() { _isChangeIDSet = false; }
-
-        bool isChangeIDSet() const { return _isChangeIDSet; }
-
-        // Calling get*() methods when the member is not set results in undefined behavior
-        const std::string& getChangeID() const {
-            dassert(_isChangeIDSet);
-            return _changeID;
-        }
-
-        void setServer(StringData server) {
-            _server = server.toString();
-            _isServerSet = true;
-        }
-
-        void unsetServer() { _isServerSet = false; }
-
-        bool isServerSet() const { return _isServerSet; }
-
-        // Calling get*() methods when the member is not set results in undefined behavior
-        const std::string& getServer() const {
-            dassert(_isServerSet);
-            return _server;
-        }
-
-        void setClientAddr(StringData clientAddr) {
-            _clientAddr = clientAddr.toString();
-            _isClientAddrSet = true;
-        }
-
-        void unsetClientAddr() { _isClientAddrSet = false; }
-
-        bool isClientAddrSet() const { return _isClientAddrSet; }
-
-        // Calling get*() methods when the member is not set results in undefined behavior
-        const std::string& getClientAddr() const {
-            dassert(_isClientAddrSet);
-            return _clientAddr;
-        }
-
-        void setTime(const Date_t time) {
-            _time = time;
-            _isTimeSet = true;
-        }
-
-        void unsetTime() { _isTimeSet = false; }
-
-        bool isTimeSet() const { return _isTimeSet; }
-
-        // Calling get*() methods when the member is not set results in undefined behavior
-        const Date_t getTime() const {
-            dassert(_isTimeSet);
-            return _time;
-        }
-
-        void setWhat(StringData what) {
-            _what = what.toString();
-            _isWhatSet = true;
-        }
-
-        void unsetWhat() { _isWhatSet = false; }
-
-        bool isWhatSet() const { return _isWhatSet; }
-
-        // Calling get*() methods when the member is not set results in undefined behavior
-        const std::string& getWhat() const {
-            dassert(_isWhatSet);
-            return _what;
-        }
-
-        void setNS(StringData ns) {
-            _ns = ns.toString();
-            _isNsSet = true;
-        }
-
-        void unsetNS() { _isNsSet = false; }
-
-        bool isNSSet() const { return _isNsSet; }
-
-        // Calling get*() methods when the member is not set results in undefined behavior
-        const std::string& getNS() const {
-            dassert(_isNsSet);
-            return _ns;
-        }
-
-        void setDetails(const BSONObj& details) {
-            _details = details.getOwned();
-            _isDetailsSet = true;
-        }
-
-        void unsetDetails() { _isDetailsSet = false; }
-
-        bool isDetailsSet() const { return _isDetailsSet; }
-
-        // Calling get*() methods when the member is not set results in undefined behavior
-        const BSONObj getDetails() const {
-            dassert(_isDetailsSet);
-            return _details;
-        }
-
-        // Optional Fields
-
-    private:
-        // Convention: (M)andatory, (O)ptional, (S)pecial rule.
-        std::string _changeID;     // (M)  id for this change "<hostname>-<current_time>-<increment>"
-        bool _isChangeIDSet;
-        std::string _server;     // (M)  hostname of server that we are making the change on.  Does not include port.
-        bool _isServerSet;
-        std::string _clientAddr;     // (M)  hostname:port of the client that made this change
-        bool _isClientAddrSet;
-        Date_t _time;     // (M)  time this change was made
-        bool _isTimeSet;
-        std::string _what;     // (M)  description of the change
-        bool _isWhatSet;
-        std::string _ns;     // (M)  database or collection this change applies to
-        bool _isNsSet;
-        BSONObj _details;     // (M)  A BSONObj containing extra information about some operations
-        bool _isDetailsSet;
-    };
-
-} // namespace mongo
+}  // namespace mongo

@@ -12,7 +12,6 @@
  */
 
 var AssertLevel = (function() {
-
     function AssertLevel(level) {
         this.level = level;
 
@@ -34,7 +33,6 @@ var AssertLevel = (function() {
         OWN_DB: new AssertLevel(2),
         isAssertLevel: isAssertLevel
     };
-
 })();
 
 if (typeof globalAssertLevel === 'undefined') {
@@ -44,20 +42,27 @@ if (typeof globalAssertLevel === 'undefined') {
 var assertWithLevel = function(level) {
     assert(AssertLevel.isAssertLevel(level), 'expected AssertLevel as first argument');
 
-    function quietlyDoAssert(msg) {
+    function quietlyDoAssert(msg, obj) {
         // eval if msg is a function
         if (typeof msg === 'function') {
             msg = msg();
         }
 
-        throw new Error(msg);
+        var ex;
+        if (obj) {
+            ex = _getErrorWithCode(obj, msg);
+        } else {
+            ex = new Error(msg);
+        }
+
+        throw ex;
     }
 
     function wrapAssertFn(fn, args) {
         var doassertSaved = doassert;
         try {
             doassert = quietlyDoAssert;
-            fn.apply(assert, args); // functions typically get called on 'assert'
+            fn.apply(assert, args);  // functions typically get called on 'assert'
         } finally {
             doassert = doassertSaved;
         }

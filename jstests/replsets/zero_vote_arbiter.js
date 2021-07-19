@@ -1,10 +1,15 @@
 /*
  * Test that replSetInitiate and replSetReconfig prohibit zero-vote arbiters,
  * SERVER-13627.
+ *
+ * @tags: [multiversion_incompatible]
  */
 
 var NewReplicaSetConfigurationIncompatible = 103;
 var InvalidReplicaSetConfig = 93;
+
+// Skip db hash check since replsets are assigned invalid configs.
+TestData.skipCheckDBHashes = true;
 
 /*
  * Create replica set with 3 nodes, add new node as 0-vote arbiter.
@@ -17,18 +22,13 @@ var InvalidReplicaSetConfig = 93;
     var arbiterConn = replTest.add();
     var admin = replTest.getPrimary().getDB("admin");
     var conf = admin.runCommand({replSetGetConfig: 1}).config;
-    conf.members.push({
-        _id: 3,
-        host: arbiterConn.host,
-        arbiterOnly: true,
-        votes: 0
-    });
+    conf.members.push({_id: 3, host: arbiterConn.host, arbiterOnly: true, votes: 0});
     conf.version++;
 
     jsTestLog('Add arbiter with zero votes:');
     var response = admin.runCommand({replSetReconfig: conf});
     assert.commandFailed(response);
-    assert.eq(response.code, NewReplicaSetConfigurationIncompatible);
+    assert.eq(response.code, InvalidReplicaSetConfig);
     assert(/.*arbiter must vote.*/i.test(response.errmsg));
 
     replTest.stopSet();
@@ -54,12 +54,11 @@ var InvalidReplicaSetConfig = 93;
     var response = admin.runCommand({replSetReconfig: conf});
     printjson(response);
     assert.commandFailed(response);
-    assert.eq(response.code, NewReplicaSetConfigurationIncompatible);
+    assert.eq(response.code, InvalidReplicaSetConfig);
     assert(/.*arbiter must vote.*/i.test(response.errmsg));
 
     replTest.stopSet();
 })();
-
 
 /*
  * replSetInitiate with a 0-vote arbiter.
@@ -96,18 +95,13 @@ var InvalidReplicaSetConfig = 93;
     var arbiterConn = replTest.add();
     var admin = replTest.getPrimary().getDB("admin");
     var conf = admin.runCommand({replSetGetConfig: 1}).config;
-    conf.members.push({
-        _id: 7,
-        host: arbiterConn.host,
-        arbiterOnly: true,
-        votes: 0
-    });
+    conf.members.push({_id: 7, host: arbiterConn.host, arbiterOnly: true, votes: 0});
     conf.version++;
 
     jsTestLog('Add arbiter with zero votes:');
     var response = admin.runCommand({replSetReconfig: conf});
     assert.commandFailed(response);
-    assert.eq(response.code, NewReplicaSetConfigurationIncompatible);
+    assert.eq(response.code, InvalidReplicaSetConfig);
     assert(/.*arbiter must vote.*/i.test(response.errmsg));
 
     replTest.stopSet();

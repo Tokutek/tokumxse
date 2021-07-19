@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2015 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -26,14 +26,26 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-typedef enum {
-	BOOL_TYPE, CONFIG_STRING_TYPE, INT_TYPE, STRING_TYPE, UINT32_TYPE
-} CONFIG_OPT_TYPE;
+typedef enum { BOOL_TYPE, CONFIG_STRING_TYPE, INT_TYPE, STRING_TYPE, UINT32_TYPE } CONFIG_OPT_TYPE;
 
 typedef struct {
-	const char *name;
-	const char *description;
-	const char *defaultval;
-	CONFIG_OPT_TYPE type;
-	size_t offset;
+    const char *name;
+    const char *description;
+    const char *defaultval;
+    CONFIG_OPT_TYPE type;
+    size_t offset;
 } CONFIG_OPT;
+
+typedef struct __config_queue_entry {
+    char *string;
+    TAILQ_ENTRY(__config_queue_entry) q;
+} CONFIG_QUEUE_ENTRY;
+
+typedef struct { /* Option structure */
+#define OPT_DECLARE_STRUCT
+#include "wtperf_opt.i"
+#undef OPT_DECLARE_STRUCT
+
+    /* Queue head to save a copy of the config to be output */
+    TAILQ_HEAD(__config_qh, __config_queue_entry) config_head;
+} CONFIG_OPTS;

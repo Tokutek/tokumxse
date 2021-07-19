@@ -5,15 +5,15 @@
  *
  * Repeatedly creates a capped collection. Also verifies that truncation
  * occurs once the collection reaches a certain size.
+ *
+ * @tags: [requires_capped]
  */
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js'); // for dropCollections
 
 var $config = (function() {
-
     // Returns a document of the form { _id: ObjectId(...), field: '...' }
     // with specified BSON size.
     function makeDocWithSize(targetSize) {
-        var doc = { _id: new ObjectId(), field: '' };
+        var doc = {_id: new ObjectId(), field: ''};
 
         var size = Object.bsonsize(doc);
         assertAlways.gte(targetSize, size);
@@ -32,7 +32,7 @@ var $config = (function() {
         var doc = makeDocWithSize(targetSize);
 
         var res = db[collName].insert(doc);
-        assertAlways.writeOK(res);
+        assertAlways.commandWorked(res);
         assertAlways.eq(1, res.nInserted);
 
         return doc._id;
@@ -41,7 +41,7 @@ var $config = (function() {
     // Returns an array containing the _id fields of all the documents
     // in the collection, sorted according to their insertion order.
     function getObjectIds(db, collName) {
-        return db[collName].find({}, { _id: 1 }).map(function(doc) {
+        return db[collName].find({}, {_id: 1}).map(function(doc) {
             return doc._id;
         });
     }
@@ -51,14 +51,41 @@ var $config = (function() {
         // since the workload name is assumed to be unique.
         prefix: 'create_capped_collection',
         insert: insert,
-        getObjectIds: getObjectIds
+        getObjectIds: getObjectIds,
+
+        // Define this function in data so that it can be used by workloads inheriting this one
+        verifySizeTruncation: function verifySizeTruncation(db, myCollName, options) {
+            // Define a small document to be an eighth the size of the capped collection,
+            // and a large document to be half the size of the capped collection.
+            var smallDocSize = Math.floor(options.size / 8) - 1;
+            var largeDocSize = Math.floor(options.size / 2) - 1;
+
+            // Truncation of capped collections is generally unreliable. Instead of relying on it
+            // to occur after a certain size document is inserted we test its occurrence. We set a
+            // reasonable threshold of documents to insert before a user might expect truncation to
+            // occur and verify truncation occurred for the right documents.
+
+            var threshold = 1000;
+
+            var insertedIds = [];
+            for (var i = 0; i < threshold; ++i) {
+                insertedIds.push(this.insert(db, myCollName, largeDocSize));
+            }
+
+            var foundIds = this.getObjectIds(db, myCollName);
+            var count = foundIds.length;
+
+            assertWhenOwnDB.lt(count, threshold, 'expected at least one truncation to occur');
+            assertWhenOwnDB.eq(insertedIds.slice(insertedIds.length - count),
+                               foundIds,
+                               'expected truncation to remove the oldest documents');
+        }
     };
 
     var states = (function() {
-
         var options = {
             capped: true,
-            size: 8192 // multiple of 256; larger than 4096 default
+            size: 8192  // multiple of 256; larger than 4096 default
         };
 
         function uniqueCollectionName(prefix, tid, num) {
@@ -74,76 +101,19 @@ var $config = (function() {
             var myCollName = uniqueCollectionName(this.prefix, this.tid, this.num++);
             assertAlways.commandWorked(db.createCollection(myCollName, options));
 
-            // Define a large document to be half the size of the capped collection,
-            // and a small document to be an eighth the size of the capped collection.
-            var largeDocSize = Math.floor(options.size / 2) - 1;
-            var smallDocSize = Math.floor(options.size / 8) - 1;
-
-            var ids = [];
-            var count;
-
-            ids.push(this.insert(db, myCollName, largeDocSize));
-            ids.push(this.insert(db, myCollName, largeDocSize));
-
-            assertWhenOwnDB.contains(db[myCollName].find().itcount(), [1, 2]);
-
-            // Insert another large document and verify that at least one
-            // truncation has occurred. There may be 1 or 2 documents in
-            // the collection, depending on the storage engine, but they
-            // should always be the most recently inserted documents.
-
-            ids.push(this.insert(db, myCollName, largeDocSize));
-
-            count = db[myCollName].find().itcount();
-            assertWhenOwnDB.contains(count, [1, 2], 'expected truncation to occur');
-            assertWhenOwnDB.eq(ids.slice(ids.length - count), this.getObjectIds(db, myCollName));
-
-            // Insert multiple small documents and verify that at least one
-            // truncation has occurred. There may be 4 or 5 documents in
-            // the collection, depending on the storage engine, but they
-            // should always be the most recently inserted documents.
-
-            ids.push(this.insert(db, myCollName, smallDocSize));
-            ids.push(this.insert(db, myCollName, smallDocSize));
-            ids.push(this.insert(db, myCollName, smallDocSize));
-            ids.push(this.insert(db, myCollName, smallDocSize));
-
-            var prevCount = count;
-            count = db[myCollName].find().itcount();
-
-            if (prevCount === 1) {
-                assertWhenOwnDB.eq(4, count, 'expected truncation to occur');
-            } else { // prevCount === 2
-                assertWhenOwnDB.eq(5, count, 'expected truncation to occur');
-            }
-
-            assertWhenOwnDB.eq(ids.slice(ids.length - count), this.getObjectIds(db, myCollName));
+            this.verifySizeTruncation(db, myCollName, options);
         }
 
-        return {
-            init: init,
-            create: create
-        };
-
+        return {init: init, create: create};
     })();
 
-    var transitions = {
-        init: { create: 1 },
-        create: { create: 1 }
-    };
-
-    function teardown(db, collName, cluster) {
-        var pattern = new RegExp('^' + this.prefix + '\\d+_\\d+$');
-        dropCollections(db, pattern);
-    }
+    var transitions = {init: {create: 1}, create: {create: 1}};
 
     return {
         threadCount: 5,
-        iterations: 20,
+        iterations: 5,
         data: data,
         states: states,
         transitions: transitions,
-        teardown: teardown
     };
-
 })();

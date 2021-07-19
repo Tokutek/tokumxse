@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -31,170 +32,198 @@
 #include <string>
 
 #include "mongo/db/repl/member_state.h"
-#include "mongo/db/repl/replica_set_config.h"
+#include "mongo/db/repl/optime.h"
+#include "mongo/db/repl/repl_set_config.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
 
-    class BSONObj;
-    class BSONObjBuilder;
-    class Status;
+class BSONObj;
+class BSONObjBuilder;
+class Status;
 
 namespace repl {
 
+/**
+ * Response structure for the replSetHeartbeat command.
+ */
+class ReplSetHeartbeatResponse {
+public:
     /**
-     * Response structure for the replSetHeartbeat command.
+     * Initializes this ReplSetHeartbeatResponse from the contents of "doc".
      */
-    class ReplSetHeartbeatResponse {
-    public:
-        ReplSetHeartbeatResponse();
+    Status initialize(const BSONObj& doc, long long term);
 
-        /**
-         * Initializes this ReplSetHeartbeatResponse from the contents of "doc".
-         */
-        Status initialize(const BSONObj& doc);
+    /**
+     * Appends all non-default values to "builder".
+     */
+    void addToBSON(BSONObjBuilder* builder) const;
 
-        /**
-         * Appends all non-default values to "builder".
-         */
-        void addToBSON(BSONObjBuilder* builder) const;
+    /**
+     * Returns a BSONObj consisting of all non-default values to "builder".
+     */
+    BSONObj toBSON() const;
 
-        /**
-         * Returns a BSONObj consisting of all non-default values to "builder".
-         */
-        BSONObj toBSON() const;
+    /**
+     * Returns toBSON().toString()
+     */
+    const std::string toString() const {
+        return toBSON().toString();
+    }
 
-        /**
-         * Returns toBSON().toString()
-         */
-        const std::string toString() const { return toBSON().toString(); }
+    const std::string& getReplicaSetName() const {
+        return _setName;
+    }
+    bool hasState() const {
+        return _stateSet;
+    }
+    MemberState getState() const;
+    bool hasElectionTime() const {
+        return _electionTimeSet;
+    }
+    Timestamp getElectionTime() const;
+    const HostAndPort& getSyncingTo() const {
+        return _syncingTo;
+    }
+    int getConfigVersion() const {
+        return _configVersion;
+    }
+    int getConfigTerm() const {
+        return _configTerm;
+    }
+    ConfigVersionAndTerm getConfigVersionAndTerm() const {
+        return ConfigVersionAndTerm(_configVersion, _configTerm);
+    }
+    bool hasConfig() const {
+        return _configSet;
+    }
+    const ReplSetConfig& getConfig() const;
+    bool hasPrimaryId() const {
+        return _primaryIdSet;
+    }
+    long long getPrimaryId() const;
+    long long getTerm() const {
+        return _term;
+    }
+    bool hasAppliedOpTime() const {
+        return _appliedOpTimeSet;
+    }
+    OpTime getAppliedOpTime() const;
+    OpTimeAndWallTime getAppliedOpTimeAndWallTime() const;
+    bool hasDurableOpTime() const {
+        return _durableOpTimeSet;
+    }
+    OpTime getDurableOpTime() const;
+    OpTimeAndWallTime getDurableOpTimeAndWallTime() const;
+    bool hasIsElectable() const {
+        return _electableSet;
+    }
+    bool isElectable() const;
 
-        bool hasDataSet() const { return _hasDataSet; }
-        bool hasData() const { return _hasData; }
-        bool isMismatched() const { return _mismatch; }
-        bool isReplSet() const { return _isReplSet; }
-        bool isStateDisagreement() const { return _stateDisagreement; }
-        const std::string& getReplicaSetName() const { return _setName; }
-        bool hasState() const { return _stateSet; }
-        MemberState getState() const;
-        bool hasElectionTime() const { return _electionTimeSet; }
-        OpTime getElectionTime() const;
-        bool hasIsElectable() const { return _electableSet; }
-        bool isElectable() const;
-        const std::string& getHbMsg() const { return _hbmsg; }
-        bool hasTime() const { return _timeSet; }
-        Seconds getTime() const;
-        bool hasOpTime() const { return _opTimeSet; }
-        OpTime getOpTime() const;
-        const std::string& getSyncingTo() const { return _syncingTo; }
-        int getVersion() const { return _version; }
-        bool hasConfig() const { return _configSet; }
-        const ReplicaSetConfig& getConfig() const;
+    /**
+     * Sets _setName to "name".
+     */
+    void setSetName(StringData name) {
+        _setName = name.toString();
+    }
 
-        /**
-         * Sets _mismatch to true.
-         */
-        void noteMismatched() { _mismatch = true; }
+    /**
+     * Sets _state to "state".
+     */
+    void setState(MemberState state) {
+        _stateSet = true;
+        _state = state;
+    }
 
-        /**
-         * Sets _isReplSet to true.
-         */
-        void noteReplSet() { _isReplSet = true; }
+    /**
+     * Sets the optional "electionTime" field to the given Timestamp.
+     */
+    void setElectionTime(Timestamp time) {
+        _electionTimeSet = true;
+        _electionTime = time;
+    }
 
-        /**
-         * Sets _stateDisagreement to true.
-         */
-        void noteStateDisagreement() { _stateDisagreement = true; }
+    /**
+     * Sets _syncingTo to "syncingTo".
+     */
+    void setSyncingTo(const HostAndPort& syncingTo) {
+        _syncingTo = syncingTo;
+    }
 
-        /**
-         * Sets _hasData to true, and _hasDataSet to true to indicate _hasData has been modified
-         */
-        void noteHasData() { _hasDataSet = _hasData = true;}
+    /**
+     * Sets _configVersion to "configVersion".
+     */
+    void setConfigVersion(int configVersion) {
+        _configVersion = configVersion;
+    }
 
-        /**
-         * Sets _setName to "name".
-         */
-        void setSetName(std::string name) { _setName = name; }
+    /**
+     * Sets _configTerm to "configTerm".
+     */
+    void setConfigTerm(int configTerm) {
+        _configTerm = configTerm;
+    }
 
-        /**
-         * Sets _state to "state".
-         */
-        void setState(MemberState state) { _stateSet = true; _state = state; }
+    /**
+     * Initializes _config with "config".
+     */
+    void setConfig(const ReplSetConfig& config) {
+        _configSet = true;
+        _config = config;
+    }
 
-        /**
-         * Sets the optional "electionTime" field to the given OpTime.
-         */
-        void setElectionTime(OpTime time) { _electionTimeSet = true; _electionTime = time; }
+    void setPrimaryId(long long primaryId) {
+        _primaryIdSet = true;
+        _primaryId = primaryId;
+    }
+    void setAppliedOpTimeAndWallTime(OpTimeAndWallTime time) {
+        _appliedOpTimeSet = true;
+        _appliedOpTime = time.opTime;
+        _appliedWallTime = time.wallTime;
+    }
+    void setDurableOpTimeAndWallTime(OpTimeAndWallTime time) {
+        _durableOpTimeSet = true;
+        _durableOpTime = time.opTime;
+        _durableWallTime = time.wallTime;
+    }
+    void setTerm(long long term) {
+        _term = term;
+    }
+    void setElectable(bool electable) {
+        _electableSet = true;
+        _electable = electable;
+    }
 
-        /**
-         * Sets _electable to "electable" and sets _electableSet to true to indicate
-         * that the value of _electable has been modified.
-         */
-        void setElectable(bool electable) { _electableSet = true; _electable = electable; }
+private:
+    bool _electionTimeSet = false;
+    Timestamp _electionTime;
 
-        /**
-         * Sets _hbmsg to "hbmsg".
-         */
-        void setHbMsg(std::string hbmsg) { _hbmsg = hbmsg; }
+    bool _appliedOpTimeSet = false;
+    OpTime _appliedOpTime;
+    Date_t _appliedWallTime;
 
-        /**
-         * Sets the optional "time" field of the response to "theTime", which is 
-         * a count of seconds since the UNIX epoch.
-         */
-        void setTime(Seconds theTime) { _timeSet = true; _time = theTime; }
+    bool _durableOpTimeSet = false;
+    OpTime _durableOpTime;
+    Date_t _durableWallTime;
 
-        /**
-         * Sets _opTime to "time" and sets _opTimeSet to true to indicate that the value
-         * of _opTime has been modified.
-         */
-        void setOpTime(OpTime time) { _opTimeSet = true; _opTime = time; }
+    bool _stateSet = false;
+    MemberState _state;
 
-        /**
-         * Sets _syncingTo to "syncingTo".
-         */
-        void setSyncingTo(std::string syncingTo) { _syncingTo = syncingTo; }
+    int _configVersion = -1;
+    int _configTerm = OpTime::kUninitializedTerm;
+    std::string _setName;
+    HostAndPort _syncingTo;
 
-        /**
-         * Sets _version to "version".
-         */
-        void setVersion(int version) { _version = version; }
+    bool _configSet = false;
+    ReplSetConfig _config;
 
-        /**
-         * Initializes _config with "config".
-         */
-        void setConfig(const ReplicaSetConfig& config) { _configSet = true; _config = config; }
+    bool _primaryIdSet = false;
+    long long _primaryId = -1;
+    long long _term = -1;
 
-    private:
-        bool _electionTimeSet;
-        OpTime _electionTime;
+    bool _electableSet = false;
+    bool _electable = false;
+};
 
-        bool _timeSet;
-        Seconds _time;  // Seconds since UNIX epoch.
-
-        bool _opTimeSet;
-        OpTime _opTime;
-
-        bool _electableSet;
-        bool _electable;
-
-        bool _hasDataSet;
-        bool _hasData;
-
-        bool _mismatch;
-        bool _isReplSet;
-        bool _stateDisagreement;
-
-        bool _stateSet;
-        MemberState _state;
-
-        int _version;
-        std::string _setName;
-        std::string _hbmsg;
-        std::string _syncingTo;
-
-        bool _configSet;
-        ReplicaSetConfig _config;
-    };
-
-} // namespace repl
-} // namespace mongo
+}  // namespace repl
+}  // namespace mongo

@@ -1,7 +1,5 @@
 'use strict';
 
-load('jstests/concurrency/fsm_workload_helpers/server_types.js'); // for isMongod
-
 /**
  * yield.js
  *
@@ -9,13 +7,18 @@ load('jstests/concurrency/fsm_workload_helpers/server_types.js'); // for isMongo
  * removing documents that they operate on.
  */
 var $config = (function() {
-
-    // Define here so that both data.nDocs and data.genUpdateDoc can reference it
-    var nDocs = 200;
+    // The explain used to build the assertion message in advanceCursor() is the only command not
+    // allowed in a transaction used in the query state function. With shard stepdowns, getMores
+    // aren't allowed outside a transaction, so if the explain runs when the suite is configured to
+    // run with transactions and shard stepdowns, the query state function will be retried outside a
+    // transaction, which fails the test. This can be avoided by not running explain with this
+    // configuration.
+    const skipExplainInErrorMessage =
+        TestData.runInsideTransaction && TestData.runningWithShardStepdowns;
 
     var data = {
         // Number of docs to insert at the beginning.
-        nDocs: nDocs,
+        nDocs: 200,
         // Batch size of queries to introduce more saving and restoring of states.
         batchSize: 3,
         // The words that can be found in the collection.
@@ -32,11 +35,14 @@ var $config = (function() {
             while (cursor.hasNext()) {
                 prevDoc = doc;
                 doc = cursor.next();
-                assertAlways(verifier(doc, prevDoc),
-                             'Verifier failed!\nQuery: ' + tojson(cursor._query) + '\n' +
-                             'Query plan: ' + tojson(cursor.explain()) + '\n' +
-                             'Previous doc: ' + tojson(prevDoc) + '\n' +
-                             'This doc: ' + tojson(doc));
+                assertAlways(
+                    verifier(doc, prevDoc),
+                    'Verifier failed!\nQuery: ' + tojson(cursor._query) + '\n' +
+                        (skipExplainInErrorMessage ? ''
+                                                   : 'Query plan: ' + tojson(cursor.explain())) +
+                        '\n' +
+                        'Previous doc: ' + tojson(prevDoc) + '\n' +
+                        'This doc: ' + tojson(doc));
             }
             assertAlways.eq(cursor.itcount(), 0);
         },
@@ -46,8 +52,8 @@ var $config = (function() {
          * the update state should use for the update query.
          */
         genUpdateDoc: function genUpdateDoc() {
-            var newVal = Random.randInt(nDocs);
-            return { $set: { a: newVal } };
+            var newVal = Random.randInt(this.nDocs);
+            return {$set: {a: newVal}};
         }
     };
 
@@ -57,12 +63,12 @@ var $config = (function() {
          */
         update: function update(db, collName) {
             var id = Random.randInt(this.nDocs);
-            var randDoc = db[collName].findOne({ _id: id });
+            var randDoc = db[collName].findOne({_id: id});
             if (randDoc === null) {
                 return;
             }
             var updateDoc = this.genUpdateDoc();
-            assertAlways.writeOK(db[collName].update(randDoc, updateDoc));
+            assertAlways.commandWorked(db[collName].update(randDoc, updateDoc));
         },
 
         /*
@@ -71,12 +77,12 @@ var $config = (function() {
          */
         remove: function remove(db, collName) {
             var id = Random.randInt(this.nDocs);
-            var doc = db[collName].findOne({ _id: id });
+            var doc = db[collName].findOne({_id: id});
             if (doc !== null) {
-                var res = db[collName].remove({ _id: id });
-                assertAlways.writeOK(res);
+                var res = db[collName].remove({_id: id});
+                assertAlways.commandWorked(res);
                 if (res.nRemoved > 0) {
-                    assertAlways.writeOK(db[collName].insert(doc));
+                    assertAlways.commandWorked(db[collName].insert(doc));
                 }
             }
         },
@@ -87,8 +93,7 @@ var $config = (function() {
          */
         query: function collScan(db, collName) {
             var nMatches = 100;
-            var cursor = db[collName].find({ a: { $lt: nMatches } })
-                                     .batchSize(this.batchSize);
+            var cursor = db[collName].find({a: {$lt: nMatches}}).batchSize(this.batchSize);
             var collScanVerifier = function collScanVerifier(doc, prevDoc) {
                 return doc.a < nMatches;
             };
@@ -113,9 +118,9 @@ var $config = (function() {
      *
      */
     var transitions = {
-        update: { update: 0.334, remove: 0.333, query: 0.333 },
-        remove: { update: 0.333, remove: 0.334, query: 0.333 },
-        query:  { update: 0.333, remove: 0.333, query: 0.334 }
+        update: {update: 0.334, remove: 0.333, query: 0.333},
+        remove: {update: 0.333, remove: 0.334, query: 0.333},
+        query: {update: 0.333, remove: 0.333, query: 0.334}
     };
 
     /*
@@ -123,24 +128,12 @@ var $config = (function() {
      * more yielding, and inserts the documents to be used.
      */
     function setup(db, collName, cluster) {
-        // Enable this failpoint to trigger more yields. In MMAPV1, if a record fetch is about to
-        // page fault, the query will yield. This failpoint will mock page faulting on such
-        // fetches every other time.
-
-        cluster.executeOnMongodNodes(function enableFailPoint(db) {
-            assertAlways.commandWorked(
-                db.adminCommand({ configureFailPoint: 'recordNeedsFetchFail', mode: 'alwaysOn' })
-            );
-        });
-
         // Lower the following parameters to force even more yields.
         cluster.executeOnMongodNodes(function lowerYieldParams(db) {
             assertAlways.commandWorked(
-                db.adminCommand({ setParameter: 1, internalQueryExecYieldIterations: 5 })
-            );
+                db.adminCommand({setParameter: 1, internalQueryExecYieldIterations: 5}));
             assertAlways.commandWorked(
-                db.adminCommand({ setParameter: 1, internalQueryExecYieldPeriodMS: 1 })
-            );
+                db.adminCommand({setParameter: 1, internalQueryExecYieldPeriodMS: 1}));
         });
         // Set up some data to query.
         var N = this.nDocs;
@@ -148,29 +141,21 @@ var $config = (function() {
         for (var i = 0; i < N; i++) {
             // Give each doc some word of text
             var word = this.words[i % this.words.length];
-            bulk.find({ _id: i }).upsert().updateOne(
-                { $set: { a: i, b: N - i, c: i, d: N - i, yield_text: word } }
-            );
+            bulk.find({_id: i}).upsert().updateOne(
+                {$set: {a: i, b: N - i, c: i, d: N - i, yield_text: word}});
         }
-        assertAlways.writeOK(bulk.execute());
+        assertAlways.commandWorked(bulk.execute());
     }
 
     /*
      * Reset parameters and disable failpoint.
      */
     function teardown(db, collName, cluster) {
-        cluster.executeOnMongodNodes(function disableFailPoint(db) {
-            assertAlways.commandWorked(
-                db.adminCommand({ configureFailPoint: 'recordNeedsFetchFail', mode: 'off'})
-            );
-        });
         cluster.executeOnMongodNodes(function resetYieldParams(db) {
             assertAlways.commandWorked(
-                db.adminCommand({ setParameter: 1, internalQueryExecYieldIterations: 128 })
-            );
+                db.adminCommand({setParameter: 1, internalQueryExecYieldIterations: 128}));
             assertAlways.commandWorked(
-                db.adminCommand({ setParameter: 1, internalQueryExecYieldPeriodMS: 10 })
-            );
+                db.adminCommand({setParameter: 1, internalQueryExecYieldPeriodMS: 10}));
         });
     }
 
@@ -184,5 +169,4 @@ var $config = (function() {
         teardown: teardown,
         data: data
     };
-
 })();

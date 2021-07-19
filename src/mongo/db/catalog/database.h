@@ -1,168 +1,173 @@
-// database.h
-
 /**
-*    Copyright (C) 2008 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #pragma once
 
+#include <memory>
+#include <string>
+
+#include "mongo/base/status.h"
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsonobj.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_catalog.h"
 #include "mongo/db/catalog/collection_options.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/storage_options.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/repl/optime.h"
 #include "mongo/util/string_map.h"
 
 namespace mongo {
 
-    class Collection;
-    class DataFile;
-    class DatabaseCatalogEntry;
-    class ExtentManager;
-    class IndexCatalog;
-    class NamespaceDetails;
-    class OperationContext;
+class OperationContext;
+
+/**
+ * Represents a logical database containing Collections.
+ *
+ * The semantics for a const Database are that you can mutate individual collections but not add or
+ * remove them.
+ */
+class Database : public Decorable<Database> {
+public:
+    /**
+     * Creates the namespace 'ns' in the database 'db' according to 'options'. If
+     * 'createDefaultIndexes' is true, creates the _id index for the collection (and the system
+     * indexes, in the case of system collections). Creates the collection's _id index according
+     * to 'idIndex', if it is non-empty.  When 'idIndex' is empty, creates the default _id index.
+     */
+    virtual Status userCreateNS(OperationContext* opCtx,
+                                const NamespaceString& fullns,
+                                CollectionOptions collectionOptions,
+                                bool createDefaultIndexes = true,
+                                const BSONObj& idIndex = BSONObj()) const = 0;
+
+    Database() = default;
+
+    // must call close first
+    virtual ~Database() = default;
+
+    inline Database(Database&&) = delete;
+    inline Database& operator=(Database&&) = delete;
 
     /**
-     * Database represents a database database
-     * Each database database has its own set of files -- dbname.ns, dbname.0, dbname.1, ...
-     * NOT memory mapped
-    */
-    class Database {
-    public:
-        Database(OperationContext* txn, StringData name, DatabaseCatalogEntry* dbEntry);
+     * Sets up internal memory structures.
+     */
+    virtual void init(OperationContext* opCtx) const = 0;
 
-        // must call close first
-        ~Database();
+    virtual const std::string& name() const = 0;
 
-        // closes files and other cleanup see below.
-        void close( OperationContext* txn );
+    virtual void clearTmpCollections(OperationContext* const opCtx) const = 0;
 
-        const std::string& name() const { return _name; }
+    /**
+     * Sets the 'drop-pending' state of this Database.
+     * This is done at the beginning of a dropDatabase operation and is used to reject subsequent
+     * collection creation requests on this database.
+     * The database must be locked in MODE_X when calling this function.
+     */
+    virtual void setDropPending(OperationContext* opCtx, bool dropPending) = 0;
 
-        void clearTmpCollections(OperationContext* txn);
+    /**
+     * Returns the 'drop-pending' state of this Database.
+     */
+    virtual bool isDropPending(OperationContext* opCtx) const = 0;
 
-        /**
-         * Sets a new profiling level for the database and returns the outcome.
-         *
-         * @param txn Operation context which to use for creating the profiling collection.
-         * @param newLevel New profiling level to use.
-         */
-        Status setProfilingLevel(OperationContext* txn, int newLevel);
+    virtual void getStats(OperationContext* const opCtx,
+                          BSONObjBuilder* const output,
+                          const double scale = 1) const = 0;
 
-        int getProfilingLevel() const { return _profile; }
-        const char* getProfilingNS() const { return _profileName.c_str(); }
+    /**
+     * dropCollection() will refuse to drop system collections. Use dropCollectionEvenIfSystem() if
+     * that is required.
+     *
+     * If we are applying a 'drop' oplog entry on a secondary, 'dropOpTime' will contain the optime
+     * of the oplog entry.
+     *
+     * The caller should hold a DB X lock and ensure there are no index builds in progress on the
+     * collection.
+     * N.B. Namespace argument is passed by value as it may otherwise disappear or change.
+     */
+    virtual Status dropCollection(OperationContext* const opCtx,
+                                  NamespaceString nss,
+                                  repl::OpTime dropOpTime = {}) const = 0;
+    virtual Status dropCollectionEvenIfSystem(OperationContext* const opCtx,
+                                              NamespaceString nss,
+                                              repl::OpTime dropOpTime = {},
+                                              bool markFromMigrate = false) const = 0;
 
-        void getStats( OperationContext* opCtx, BSONObjBuilder* output, double scale = 1 );
+    virtual Status dropView(OperationContext* const opCtx, NamespaceString viewName) const = 0;
 
-        const DatabaseCatalogEntry* getDatabaseCatalogEntry() const;
+    /**
+     * A MODE_IX collection lock must be held for this call. Throws a WriteConflictException error
+     * if the collection already exists (say if another thread raced to create it).
+     *
+     * Surrounding writeConflictRetry loops must encompass checking that the collection exists as
+     * well as creating it. Otherwise the loop will endlessly throw WCEs: the caller must check that
+     * the collection exists to break free.
+     */
+    virtual Collection* createCollection(OperationContext* const opCtx,
+                                         const NamespaceString& nss,
+                                         const CollectionOptions& options = CollectionOptions(),
+                                         const bool createDefaultIndexes = true,
+                                         const BSONObj& idIndex = BSONObj()) const = 0;
 
-        Status dropCollection( OperationContext* txn, StringData fullns );
+    virtual Status createView(OperationContext* const opCtx,
+                              const NamespaceString& viewName,
+                              const CollectionOptions& options) const = 0;
 
-        Collection* createCollection( OperationContext* txn,
-                                      StringData ns,
-                                      const CollectionOptions& options = CollectionOptions(),
-                                      bool allocateSpace = true,
-                                      bool createDefaultIndexes = true );
+    /**
+     * Arguments are passed by value as they otherwise would be changing as result of renaming.
+     */
+    virtual Status renameCollection(OperationContext* const opCtx,
+                                    NamespaceString fromNss,
+                                    NamespaceString toNss,
+                                    const bool stayTemp) const = 0;
 
-        /**
-         * @param ns - this is fully qualified, which is maybe not ideal ???
-         */
-        Collection* getCollection( StringData ns ) const ;
+    virtual const NamespaceString& getSystemViewsName() const = 0;
 
-        Collection* getCollection( const NamespaceString& ns ) const {
-            return getCollection( ns.ns() );
-        }
+    /**
+     * Generates a collection namespace suitable for creating a temporary collection.
+     * The namespace is based on a model that replaces each percent sign in 'collectionNameModel' by
+     * a random character in the range [0-9A-Za-z].
+     * Returns FailedToParse if 'collectionNameModel' does not contain any percent signs.
+     * Returns NamespaceExists if we are unable to generate a collection name that does not conflict
+     * with an existing collection in this database.
+     *
+     * The database must be locked in MODE_IX when calling this function.
+     */
+    virtual StatusWith<NamespaceString> makeUniqueCollectionNamespace(
+        OperationContext* opCtx, StringData collectionNameModel) const = 0;
 
-        Collection* getOrCreateCollection( OperationContext* txn, StringData ns );
+    /**
+     * If we are in a replset, every replicated collection must have an _id index.  As we scan each
+     * database, we also gather a list of drop-pending collection namespaces for the
+     * DropPendingCollectionReaper to clean up eventually.
+     */
+    virtual void checkForIdIndexesAndDropPendingCollections(OperationContext* opCtx) const = 0;
+};
 
-        Status renameCollection( OperationContext* txn,
-                                 StringData fromNS,
-                                 StringData toNS,
-                                 bool stayTemp );
-
-        /**
-         * @return name of an existing database with same text name but different
-         * casing, if one exists.  Otherwise the empty std::string is returned.  If
-         * 'duplicates' is specified, it is filled with all duplicate names.
-         // TODO move???
-         */
-        static std::string duplicateUncasedName( const std::string &name,
-                                                 std::set< std::string > *duplicates = 0 );
-
-        static Status validateDBName( StringData dbname );
-
-        const std::string& getSystemIndexesName() const { return _indexesName; }
-    private:
-
-        /**
-         * Gets or creates collection instance from existing metadata,
-         * Returns NULL if invalid
-         *
-         * Note: This does not add the collection to _collections map, that must be done
-         * by the caller, who takes onership of the Collection*
-         */
-        Collection* _getOrCreateCollectionInstance(OperationContext* txn, StringData fullns);
-
-        void _clearCollectionCache(OperationContext* txn, StringData fullns );
-
-        class AddCollectionChange;
-        class RemoveCollectionChange;
-
-        const std::string _name; // "alleyinsider"
-
-        DatabaseCatalogEntry* _dbEntry; // not owned here
-
-        const std::string _profileName; // "alleyinsider.system.profile"
-        const std::string _indexesName; // "alleyinsider.system.indexes"
-
-        int _profile; // 0=off.
-
-        // TODO: make sure deletes go through
-        // this in some ways is a dupe of _namespaceIndex
-        // but it points to a much more useful data structure
-        typedef StringMap< Collection* > CollectionMap;
-        CollectionMap _collections;
-
-        friend class Collection;
-        friend class NamespaceDetails;
-        friend class IndexCatalog;
-    };
-
-    void dropDatabase(OperationContext* txn, Database* db );
-
-    void dropAllDatabasesExceptLocal(OperationContext* txn);
-
-    Status userCreateNS( OperationContext* txn,
-                         Database* db,
-                         StringData ns,
-                         BSONObj options,
-                         bool logForReplication,
-                         bool createDefaultIndexes = true );
-
-} // namespace mongo
+}  // namespace mongo

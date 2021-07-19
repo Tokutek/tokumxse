@@ -1,60 +1,104 @@
+// Tests the 'merge' output mode for mapReduce.
+// Cannot implicitly shard accessed collections because of following errmsg: Cannot output to a
+// non-sharded collection because sharded collection exists already.
+// @tags: [
+//   assumes_unsharded_collection,
+//   # mapReduce does not support afterClusterTime.
+//   does_not_support_causal_consistency,
+//   does_not_support_stepdowns,
+//   uses_map_reduce_with_temp_collections,
+// ]
+(function() {
+"use strict";
+(function() {
+const source = db.mr_merge;
+source.drop();
 
-t = db.mr_merge;
-t.drop();
+assert.commandWorked(source.insert({_id: 1, a: [1, 2]}));
+assert.commandWorked(source.insert({_id: 2, a: [2, 3]}));
+assert.commandWorked(source.insert({_id: 3, a: [3, 4]}));
 
-t.insert( { a : [ 1 , 2 ] } )
-t.insert( { a : [ 2 , 3 ] } )
-t.insert( { a : [ 3 , 4 ] } )
-
-outName = "mr_merge_out";
-out = db[outName];
+const out = db.mr_merge_out;
+const outName = out.getName();
 out.drop();
 
-m = function(){ for (i=0; i<this.a.length; i++ ) emit( this.a[i] , 1 ); } 
-r = function(k,vs){ return Array.sum( vs ); }
+const map = function() {
+    for (let i = 0; i < this.a.length; i++)
+        emit(this.a[i], 1);
+};
+const reduce = function(k, vs) {
+    return Array.sum(vs);
+};
 
-function tos( o ){
-    var s = "";
-    for ( var i=0; i<100; i++ ){
-        if ( o[i] )
-            s += i + "_" + o[i];
-    }
-    return s;
-}
+assert.commandWorked(source.mapReduce(map, reduce, {out: outName}));
 
+let expected = [{_id: 1, value: 1}, {_id: 2, value: 2}, {_id: 3, value: 2}, {_id: 4, value: 1}];
+assert.docEq(expected, out.find().sort({_id: 1}).toArray());
 
-res = t.mapReduce( m , r , { out : outName } )
+assert.commandWorked(source.insert({_id: 4, a: [4, 5]}));
+// Insert something that should be unaltered by the mapReduce into the output collection.
+assert.commandWorked(out.insert({_id: 10, value: 5}));
+assert.commandWorked(
+    source.mapReduce(map, reduce, {out: {merge: outName}, query: {_id: {$gt: 3}}}));
 
+expected = [
+    {_id: 1, value: 1},
+    {_id: 2, value: 2},
+    {_id: 3, value: 2},
+    {_id: 4, value: 1},
+    {_id: 5, value: 1},
+    {_id: 10, value: 5}
+];
+assert.docEq(expected, out.find().sort({_id: 1}).toArray());
 
-expected = { "1" : 1 , "2" : 2 , "3" : 2 , "4" : 1 }
-assert.eq( tos( expected ) , tos( res.convertToSingleObject() ) , "A" );
+assert.commandWorked(source.insert({_id: 5, a: [5, 6]}));
+// Insert something that should be unaltered by the mapReduce into the output collection.
+assert.commandWorked(out.insert({_id: 20, value: 10}));
+assert.commandWorked(
+    source.mapReduce(map, reduce, {out: {merge: outName}, query: {_id: {$gt: 4}}}));
 
-t.insert( { a : [ 4 , 5 ] } )
-out.insert( { _id : 10 , value : "5" } )
-res = t.mapReduce( m , r , { out : outName } )
+expected = [
+    {_id: 1, value: 1},
+    {_id: 2, value: 2},
+    {_id: 3, value: 2},
+    {_id: 4, value: 1},
+    {_id: 5, value: 1},
+    {_id: 6, value: 1},
+    {_id: 10, value: 5},
+    {_id: 20, value: 10}
+];
+assert.docEq(expected, out.find().sort({_id: 1}).toArray());
+}());
+(function() {
+const source = db.mr_merge;
+source.drop();
 
-expected["4"]++;
-expected["5"] = 1
-assert.eq( tos( expected ) , tos( res.convertToSingleObject() ) , "B" );
+assert.commandWorked(source.insert({_id: 1, x: 1}));
+assert.commandWorked(source.insert({_id: 2, x: 1}));
+assert.commandWorked(source.insert({_id: 3, x: 2}));
 
-t.insert( { a : [ 5 , 6 ] } )
-out.insert( { _id : 10 , value : "5" } )
-res = t.mapReduce( m , r , { out : { merge : outName } } )
+const out = db.mr_merge_out;
+const outName = out.getName();
+out.drop();
 
-expected["5"]++;
-expected["10"] = 5
-expected["6"] = 1
+const map = function() {
+    emit(this.x, 1);
+};
+const reduce = function(k, v) {
+    return Array.sum(v);
+};
 
-assert.eq( tos( expected ) , tos( res.convertToSingleObject() ) , "C" );
+assert.commandWorked(
+    source.mapReduce(map, reduce, {out: {merge: outName}, query: {_id: {$gt: 0}}}));
 
-// test that the nonAtomic output gives valid result
-t.insert( { a : [ 6 , 7 ] } )
-out.insert( { _id : 20 , value : "10" } )
-res = t.mapReduce( m , r , { out : { merge : outName, nonAtomic: true } } )
+assert.eq(2, out.findOne({_id: 1}).value);
+assert.eq(1, out.findOne({_id: 2}).value);
 
-expected["6"]++;
-expected["20"] = 10
-expected["7"] = 1
+assert.commandWorked(source.insert({_id: 4, x: 2}));
+assert.commandWorked(
+    source.mapReduce(map, reduce, {out: {merge: outName}, query: {_id: {$gt: 3}}}));
 
-assert.eq( tos( expected ) , tos( res.convertToSingleObject() ) , "D" );
-
+assert.eq(2, out.findOne({_id: 1}).value);
+assert.eq(1, out.findOne({_id: 2}).value);
+}());
+}());

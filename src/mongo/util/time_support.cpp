@@ -1,997 +1,899 @@
-/*    Copyright 2010 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/time_support.h"
 
+#include <cstdint>
 #include <cstdio>
-#include <string>
 #include <iostream>
-#include <boost/thread/thread.hpp>
-#include <boost/thread/tss.hpp>
-#include <boost/thread/xtime.hpp>
+#include <string>
+
+#include <fmt/compile.h>
 
 #include "mongo/base/init.h"
 #include "mongo/base/parse_number.h"
 #include "mongo/bson/util/builder.h"
-#include "mongo/platform/cstdint.h"
+#include "mongo/stdx/thread.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
 
-#ifdef _WIN32
-#include <boost/date_time/filetime_functions.hpp>
+#if defined(_WIN32)
 #include "mongo/util/concurrency/mutex.h"
+#include "mongo/util/system_tick_source.h"
 #include "mongo/util/timer.h"
-
-// NOTE(schwerin): MSVC's _snprintf is not a drop-in replacement for C99's snprintf().  In
-// particular, when the target buffer is too small, behaviors differ.  Consult the documentation
-// from MSDN and form the BSD or Linux man pages before using.
-#if _MSC_VER < 1900
-#define snprintf _snprintf
+#include <mmsystem.h>
+#elif defined(__linux__)
+#include <time.h>
+#elif defined(__APPLE__)
+#include <mach/clock.h>
+#include <mach/mach.h>
 #endif
+
+#if !defined(_WIN32)
+#include <sys/time.h>
 #endif
 
 #ifdef __sun
 // Some versions of Solaris do not have timegm defined, so fall back to our implementation when
 // building on Solaris.  See SERVER-13446.
-extern "C" time_t
-timegm(struct tm *const tmp);
+extern "C" time_t timegm(struct tm* const tmp);
 #endif
 
 namespace mongo {
 
-    bool Date_t::isFormatable() const {
-        if (sizeof(time_t) == sizeof(int32_t)) {
-            return millis < 2147483647000ULL; // "2038-01-19T03:14:07Z"
-        }
-        else {
-            return millis < 32535215999000ULL; // "3000-12-31T23:59:59Z"
-        }
+AtomicWord<long long> Date_t::lastNowVal;
+
+Date_t Date_t::now() {
+    decltype(lastNowVal)::WordType curTime = curTimeMillis64();
+    auto oldLastNow = lastNowVal.loadRelaxed();
+
+    // If curTime is different than old last now, unconditionally try to cas it to the new value.
+    // This is an optimization to avoid performing stores for multiple clock reads in the same
+    // millisecond.
+    //
+    // It's important that this is a non-equality (rather than a >), so that we avoid stalling time
+    // if someone moves the system clock backwards.
+    if (curTime != oldLastNow) {
+        // If we fail to comp exchange, it means someone else concurrently called Date_t::now(), in
+        // which case it's likely their time is also recent.  It's important that we don't loop so
+        // that we avoid forcing time backwards if we have multiple callers at a millisecond
+        // boundary.
+        lastNowVal.compareAndSwap(&oldLastNow, curTime);
     }
 
-    // jsTime_virtual_skew is just for testing. a test command manipulates it.
-    long long jsTime_virtual_skew = 0;
-    boost::thread_specific_ptr<long long> jsTime_virtual_thread_skew;
+    return fromMillisSinceEpoch(curTime);
+}
 
-    using std::string;
+Date_t::Date_t(stdx::chrono::system_clock::time_point tp)
+    : millis(durationCount<Milliseconds>(tp - stdx::chrono::system_clock::from_time_t(0))) {}
 
-    void time_t_to_Struct(time_t t, struct tm * buf , bool local) {
+stdx::chrono::system_clock::time_point Date_t::toSystemTimePoint() const {
+    return stdx::chrono::system_clock::from_time_t(0) + toDurationSinceEpoch().toSystemDuration();
+}
+
+bool Date_t::isFormattable() const {
+    if (millis < 0) {
+        return false;
+    }
+    if (sizeof(time_t) == sizeof(int32_t)) {
+        return millis < 2147483647000LL;  // "2038-01-19T03:14:07Z"
+    } else {
+        return millis < 32535215999000LL;  // "3000-12-31T23:59:59Z"
+    }
+}
+
+
+// jsTime_virtual_skew is just for testing. a test command manipulates it.
+long long jsTime_virtual_skew = 0;
+thread_local long long jsTime_virtual_thread_skew = 0;
+
+void time_t_to_Struct(time_t t, struct tm* buf, bool local) {
 #if defined(_WIN32)
-        if ( local )
-            localtime_s( buf , &t );
-        else
-            gmtime_s(buf, &t);
+    if (local)
+        localtime_s(buf, &t);
+    else
+        gmtime_s(buf, &t);
 #else
-        if ( local )
-            localtime_r(&t, buf);
-        else
-            gmtime_r(&t, buf);
+    if (local)
+        localtime_r(&t, buf);
+    else
+        gmtime_r(&t, buf);
 #endif
-    }
+}
 
-    std::string time_t_to_String(time_t t) {
-        char buf[64];
+std::string time_t_to_String_short(time_t t) {
+    char buf[64];
 #if defined(_WIN32)
-        ctime_s(buf, sizeof(buf), &t);
+    ctime_s(buf, sizeof(buf), &t);
 #else
-        ctime_r(&t, buf);
+    ctime_r(&t, buf);
 #endif
-        buf[24] = 0; // don't want the \n
-        return buf;
+    buf[19] = 0;
+    if (buf[0] && buf[1] && buf[2] && buf[3])
+        return buf + 4;  // skip day of week
+    return buf;
+}
+
+constexpr auto kUTCFilenameFormat = "%Y-%m-%dT%H-%M-%S"_sd;
+constexpr auto kUTCFilenameFormatZ = "%Y-%m-%dT%H-%M-%SZ"_sd;
+
+// Produces a UTC datetime string suitable for use in filenames.
+std::string terseCurrentTimeForFilename(bool appendZed) {
+    struct tm t;
+    time_t_to_Struct(time(nullptr), &t);
+
+    const auto fmt = appendZed ? kUTCFilenameFormatZ : kUTCFilenameFormat;
+    const std::size_t expLen = appendZed ? 20 : 19;
+
+    char buf[32];
+    fassert(16226, strftime(buf, sizeof(buf), fmt.rawData(), &t) == expLen);
+    return buf;
+}
+
+DateStringBuffer& DateStringBuffer::iso8601(Date_t date, bool local) {
+    invariant(date.isFormattable());
+
+    struct tm t;
+    time_t_to_Struct(date.toTimeT(), &t, local);
+
+    char* cur = _data.data();
+    char* end = _data.data() + _data.size();
+
+    {
+        static constexpr char kIsoDateFmtNoTz[] = "%Y-%m-%dT%H:%M:%S";
+        size_t n = strftime(cur, end - cur, kIsoDateFmtNoTz, &t);
+        dassert(n > 0);
+        cur += n;
     }
 
-    std::string time_t_to_String_short(time_t t) {
-        char buf[64];
-#if defined(_WIN32)
-        ctime_s(buf, sizeof(buf), &t);
-#else
-        ctime_r(&t, buf);
-#endif
-        buf[19] = 0;
-        if( buf[0] && buf[1] && buf[2] && buf[3] )
-            return buf + 4; // skip day of week
-        return buf;
+    {
+        auto res = fmt::format_to_n(cur, end - cur, FMT_COMPILE(".{:03}"), date.asInt64() % 1000);
+        cur = res.out;
+        dassert(cur < end && res.size > 0);
     }
 
-
-    // uses ISO 8601 dates without trailing Z
-    // colonsOk should be false when creating filenames
-    string terseCurrentTime(bool colonsOk) {
-        struct tm t;
-        time_t_to_Struct( time(0) , &t );
-
-        const char* fmt = (colonsOk ? "%Y-%m-%dT%H:%M:%S" : "%Y-%m-%dT%H-%M-%S");
-        char buf[32];
-        fassert(16226, strftime(buf, sizeof(buf), fmt, &t) == 19);
-        return buf;
-    }
-
-#define MONGO_ISO_DATE_FMT_NO_TZ "%Y-%m-%dT%H:%M:%S"
-    string timeToISOString(time_t time) {
-        struct tm t;
-        time_t_to_Struct( time, &t );
-
-        const char* fmt = MONGO_ISO_DATE_FMT_NO_TZ "Z";
-        char buf[32];
-        fassert(16227, strftime(buf, sizeof(buf), fmt, &t) == 20);
-        return buf;
-    }
-
-namespace {
-    struct DateStringBuffer {
-        static const int dataCapacity = 64;
-        char data[dataCapacity];
-        int size;
-    };
-
-    void _dateToISOString(Date_t date, bool local, DateStringBuffer* result) {
-        invariant(date.isFormatable());
-        static const int bufSize = DateStringBuffer::dataCapacity;
-        char* const buf = result->data;
-        struct tm t;
-        time_t_to_Struct(date.toTimeT(), &t, local);
-        int pos = strftime(buf, bufSize, MONGO_ISO_DATE_FMT_NO_TZ, &t);
-        dassert(0 < pos);
-        char* cur = buf + pos;
-        int bufRemaining = bufSize - pos;
-        pos = snprintf(cur, bufRemaining, ".%03d", static_cast<int32_t>(date.asInt64() % 1000));
-        dassert(bufRemaining > pos && pos > 0);
-        cur += pos;
-        bufRemaining -= pos;
-        if (local) {
-            static const int localTzSubstrLen = 5;
-            dassert(bufRemaining >= localTzSubstrLen + 1);
+    if (local) {
+        static const size_t localTzSubstrLen = 6;
+        dassert(static_cast<size_t>(end - cur) >= localTzSubstrLen + 1);
 #ifdef _WIN32
-            // NOTE(schwerin): The value stored by _get_timezone is the value one adds to local time
-            // to get UTC.  This is opposite of the ISO-8601 meaning of the timezone offset.
-            // NOTE(schwerin): Microsoft's timezone code always assumes US rules for daylight
-            // savings time.  We can do no better without completely reimplementing localtime_s and
-            // related time library functions.
-            long msTimeZone;
-            _get_timezone(&msTimeZone);
-            if (t.tm_isdst) msTimeZone -= 3600;
-            const bool tzIsWestOfUTC = msTimeZone > 0;
-            const long tzOffsetSeconds = msTimeZone* (tzIsWestOfUTC ? 1 : -1);
-            const long tzOffsetHoursPart = tzOffsetSeconds / 3600;
-            const long tzOffsetMinutesPart = (tzOffsetSeconds / 60) % 60;
-            snprintf(cur, localTzSubstrLen + 1, "%c%02ld%02ld",
-                     tzIsWestOfUTC ? '-' : '+',
-                     tzOffsetHoursPart,
-                     tzOffsetMinutesPart);
+        // NOTE(schwerin): The value stored by _get_timezone is the value one adds to local time
+        // to get UTC.  This is opposite of the ISO-8601 meaning of the timezone offset.
+        // NOTE(schwerin): Microsoft's timezone code always assumes US rules for daylight
+        // savings time.  We can do no better without completely reimplementing localtime_s and
+        // related time library functions.
+        long msTimeZone;
+        _get_timezone(&msTimeZone);
+        if (t.tm_isdst)
+            msTimeZone -= 3600;
+        const bool tzIsWestOfUTC = msTimeZone > 0;
+        const long tzOffsetSeconds = msTimeZone * (tzIsWestOfUTC ? 1 : -1);
+        const long tzOffsetHoursPart = tzOffsetSeconds / 3600;
+        const long tzOffsetMinutesPart = (tzOffsetSeconds / 60) % 60;
+
+        // "+hh:mm"
+        cur = fmt::format_to_n(cur,
+                               localTzSubstrLen + 1,
+                               FMT_COMPILE("{}{:02}:{:02}"),
+                               tzIsWestOfUTC ? '-' : '+',
+                               tzOffsetHoursPart,
+                               tzOffsetMinutesPart)
+                  .out;
 #else
-            strftime(cur, bufRemaining, "%z", &t);
+        // ISO 8601 requires the timezone to be in hh:mm format which strftime can't produce
+        // See https://tools.ietf.org/html/rfc3339#section-5.6
+        strftime(cur, end - cur, "%z:", &t);
+        // cur will be written as +hhmm:, transform to +hh:mm
+        std::rotate(cur + 3, cur + 5, cur + 6);
+        cur += 6;
 #endif
-            cur += localTzSubstrLen;
-        }
-        else {
-            dassert(bufRemaining >= 2);
-            *cur = 'Z';
-            ++cur;
-        }
-        result->size = cur - buf;
-        dassert(result->size < DateStringBuffer::dataCapacity);
+    } else {
+        dassert(cur + 2 <= end);
+        *cur++ = 'Z';
     }
 
-    void _dateToCtimeString(Date_t date, DateStringBuffer* result) {
-        static const size_t ctimeSubstrLen = 19;
-        static const size_t millisSubstrLen = 4;
-        time_t t = date.toTimeT();
+    dassert(cur <= end);
+    _size = cur - _data.data();
+    return *this;
+}
+
+DateStringBuffer& DateStringBuffer::ctime(Date_t date) {
+    // "Wed Jun 30 21:49:08 1993\n" // full asctime/ctime format
+    // "Wed Jun 30 21:49:08"        // clip after position 19.
+    // "Wed Jun 30 21:49:08.996"    // append millis
+    //  12345678901234567890123456
+    time_t t = date.toTimeT();
 #if defined(_WIN32)
-        ctime_s(result->data, sizeof(result->data), &t);
+    ctime_s(_data.data(), _data.size(), &t);
 #else
-        ctime_r(&t, result->data);
+    ctime_r(&t, _data.data());
 #endif
-        char* milliSecStr = result->data + ctimeSubstrLen;
-        snprintf(milliSecStr, millisSubstrLen + 1, ".%03d", static_cast<int32_t>(date.asInt64() % 1000));
-        result->size = ctimeSubstrLen + millisSubstrLen;
-    }
-}  // namespace
 
-    std::string dateToISOStringUTC(Date_t date) {
-        DateStringBuffer buf;
-        _dateToISOString(date, false, &buf);
-        return std::string(buf.data, buf.size);
-    }
-
-    std::string dateToISOStringLocal(Date_t date) {
-        DateStringBuffer buf;
-        _dateToISOString(date, true, &buf);
-        return std::string(buf.data, buf.size);
-    }
-
-    std::string dateToCtimeString(Date_t date) {
-        DateStringBuffer buf;
-        _dateToCtimeString(date, &buf);
-        return std::string(buf.data, buf.size);
-    }
-
-    void outputDateAsISOStringUTC(std::ostream& os, Date_t date) {
-        DateStringBuffer buf;
-        _dateToISOString(date, false, &buf);
-        os << StringData(buf.data, buf.size);
-    }
-
-    void outputDateAsISOStringLocal(std::ostream& os, Date_t date) {
-        DateStringBuffer buf;
-        _dateToISOString(date, true, &buf);
-        os << StringData(buf.data, buf.size);
-
-    }
-
-    void outputDateAsCtime(std::ostream& os, Date_t date) {
-        DateStringBuffer buf;
-        _dateToCtimeString(date, &buf);
-        os << StringData(buf.data, buf.size);
-    }
+    static constexpr size_t ctimeSubstrLen = 19;
+    static constexpr size_t millisSubstrLen = 4;
+    char* milliSecStr = _data.data() + ctimeSubstrLen;
+    snprintf(milliSecStr,
+             millisSubstrLen + 1,
+             ".%03u",
+             static_cast<unsigned>(date.toMillisSinceEpoch() % 1000));
+    _size = ctimeSubstrLen + millisSubstrLen;
+    return *this;
+}
 
 namespace {
-    StringData getNextToken(StringData currentString,
-                            StringData terminalChars,
-                            size_t startIndex,
-                            size_t* endIndex) {
-        size_t index = startIndex;
 
-        if (index == std::string::npos) {
-            *endIndex = std::string::npos;
-            return StringData();
-        }
+#if defined(_WIN32)
 
-        for (; index < currentString.size(); index++) {
-            if (terminalChars.find(currentString[index]) != std::string::npos) {
-                break;
-            }
-        }
+uint64_t fileTimeToMicroseconds(FILETIME const ft) {
+    // Microseconds between 1601-01-01 00:00:00 UTC and 1970-01-01 00:00:00 UTC
+    constexpr uint64_t kEpochDifferenceMicros = 11644473600000000ull;
 
-        // substr just returns the rest of the string if the length passed in is greater than the
-        // number of characters remaining, and since std::string::npos is the length of the largest
-        // possible string we know (std::string::npos - startIndex) is at least as long as the rest
-        // of the string.  That means this handles both the case where we hit a terminating
-        // character and we want a substring, and the case where didn't and just want the rest of
-        // the string.
-        *endIndex = (index < currentString.size() ? index : std::string::npos);
-        return currentString.substr(startIndex, index - startIndex);
+    // Construct a 64 bit value that is the number of nanoseconds from the
+    // Windows epoch which is 1601-01-01 00:00:00 UTC
+    auto totalMicros = static_cast<uint64_t>(ft.dwHighDateTime) << 32;
+    totalMicros |= static_cast<uint64_t>(ft.dwLowDateTime);
+
+    // FILETIME is 100's of nanoseconds since Windows epoch
+    totalMicros /= 10;
+
+    // Move it from micros since the Windows epoch to micros since the Unix epoch
+    totalMicros -= kEpochDifferenceMicros;
+
+    return totalMicros;
+}
+
+#endif
+
+StringData getNextToken(StringData currentString,
+                        StringData terminalChars,
+                        size_t startIndex,
+                        size_t* endIndex) {
+    size_t index = startIndex;
+
+    if (index == std::string::npos) {
+        *endIndex = std::string::npos;
+        return StringData();
     }
 
-    // Check to make sure that the string only consists of digits
-    bool isOnlyDigits(StringData toCheck) {
-        StringData digits("0123456789");
-        for (StringData::const_iterator iterator = toCheck.begin();
-             iterator != toCheck.end(); iterator++) {
-            if (digits.find(*iterator) == std::string::npos) {
-                return false;
-            }
+    for (; index < currentString.size(); index++) {
+        if (terminalChars.find(currentString[index]) != std::string::npos) {
+            break;
         }
-        return true;
     }
 
-    Status parseTimeZoneFromToken(StringData tzStr, int* tzAdjSecs) {
+    // substr just returns the rest of the string if the length passed in is greater than the
+    // number of characters remaining, and since std::string::npos is the length of the largest
+    // possible string we know (std::string::npos - startIndex) is at least as long as the rest
+    // of the string.  That means this handles both the case where we hit a terminating
+    // character and we want a substring, and the case where didn't and just want the rest of
+    // the string.
+    *endIndex = (index < currentString.size() ? index : std::string::npos);
+    return currentString.substr(startIndex, index - startIndex);
+}
 
-        *tzAdjSecs = 0;
+// Check to make sure that the string only consists of digits
+bool isOnlyDigits(StringData toCheck) {
+    StringData digits("0123456789");
+    for (StringData::const_iterator iterator = toCheck.begin(); iterator != toCheck.end();
+         iterator++) {
+        if (digits.find(*iterator) == std::string::npos) {
+            return false;
+        }
+    }
+    return true;
+}
 
-        if (!tzStr.empty()) {
-            if (tzStr[0] == 'Z') {
-                if (tzStr.size() != 1) {
-                    StringBuilder sb;
-                    sb << "Found trailing characters in time zone specifier:  " << tzStr;
-                    return Status(ErrorCodes::BadValue, sb.str());
-                }
-            }
-            else if (tzStr[0] == '+' || tzStr[0] == '-') {
-                if (tzStr.size() != 5 || !isOnlyDigits(tzStr.substr(1, 4))) {
-                    StringBuilder sb;
-                    sb << "Time zone adjustment string should be four digits:  " << tzStr;
-                    return Status(ErrorCodes::BadValue, sb.str());
-                }
+Status parseTimeZoneFromToken(StringData tzStr, int* tzAdjSecs) {
+    *tzAdjSecs = 0;
 
-                // Parse the hours component of the time zone offset.  Note that
-                // parseNumberFromStringWithBase correctly handles the sign bit, so leave that in.
-                StringData tzHoursStr = tzStr.substr(0, 3);
-                int tzAdjHours = 0;
-                Status status = parseNumberFromStringWithBase(tzHoursStr, 10, &tzAdjHours);
-                if (!status.isOK()) {
-                    return status;
-                }
-
-                if (tzAdjHours < -23 || tzAdjHours > 23) {
-                    StringBuilder sb;
-                    sb << "Time zone hours adjustment out of range:  " << tzAdjHours;
-                    return Status(ErrorCodes::BadValue, sb.str());
-                }
-
-                StringData tzMinutesStr = tzStr.substr(3, 2);
-                int tzAdjMinutes = 0;
-                status = parseNumberFromStringWithBase(tzMinutesStr, 10, &tzAdjMinutes);
-                if (!status.isOK()) {
-                    return status;
-                }
-
-                if (tzAdjMinutes < 0 || tzAdjMinutes > 59) {
-                    StringBuilder sb;
-                    sb << "Time zone minutes adjustment out of range:  " << tzAdjMinutes;
-                    return Status(ErrorCodes::BadValue, sb.str());
-                }
-
-                // Use the sign that parseNumberFromStringWithBase found to determine if we need to
-                // flip the sign of our minutes component.  Also, we need to flip the sign of our
-                // final result, because the offset passed in by the user represents how far off the
-                // time they are giving us is from UTC, which means that we have to go the opposite
-                // way to compensate and get the UTC time
-                *tzAdjSecs = (-1) * ((tzAdjHours < 0 ? -1 : 1) * (tzAdjMinutes * 60) +
-                                     (tzAdjHours * 60 * 60));
-
-                // Disallow adjustiment of 24 hours or more in either direction (should be checked
-                // above as the separate components of minutes and hours)
-                fassert(17318, *tzAdjSecs > -86400 && *tzAdjSecs < 86400);
-            }
-            else {
+    if (!tzStr.empty()) {
+        if (tzStr[0] == 'Z') {
+            if (tzStr.size() != 1) {
                 StringBuilder sb;
-                sb << "Invalid time zone string:  \"" << tzStr
-                   << "\".  Found invalid character at the beginning of time "
-                   << "zone specifier: " << tzStr[0];
+                sb << "Found trailing characters in time zone specifier:  " << tzStr;
                 return Status(ErrorCodes::BadValue, sb.str());
             }
-        }
-        else {
-            return Status(ErrorCodes::BadValue, "Missing required time zone specifier for date");
-        }
-
-        return Status::OK();
-    }
-
-    Status parseMillisFromToken(
-            StringData millisStr,
-            int* resultMillis) {
-
-        *resultMillis = 0;
-
-        if (!millisStr.empty()) {
-            if (millisStr.size() > 3 || !isOnlyDigits(millisStr)) {
+        } else if (tzStr[0] == '+' || tzStr[0] == '-') {
+            // See https://tools.ietf.org/html/rfc3339#section-5.6
+            bool validLegacyFormat = tzStr.size() == 5 && isOnlyDigits(tzStr.substr(1, 4));
+            bool validISO8601Format = tzStr.size() == 6 && isOnlyDigits(tzStr.substr(1, 2)) &&
+                tzStr[3] == ':' && isOnlyDigits(tzStr.substr(4, 2));
+            if (!validLegacyFormat && !validISO8601Format) {
                 StringBuilder sb;
-                sb << "Millisecond string should be at most three digits:  " << millisStr;
+                sb << "Time zone adjustment string should be four digits:  " << tzStr;
                 return Status(ErrorCodes::BadValue, sb.str());
             }
 
-            Status status = parseNumberFromStringWithBase(millisStr, 10, resultMillis);
+            // Parse the hours component of the time zone offset.  Note that
+            // NumberParser correctly handles the sign bit, so leave that in.
+            StringData tzHoursStr = tzStr.substr(0, 3);
+            int tzAdjHours = 0;
+            Status status = NumberParser().base(10)(tzHoursStr, &tzAdjHours);
             if (!status.isOK()) {
                 return status;
             }
 
-            // Treat the digits differently depending on how many there are.  1 digit = hundreds of
-            // milliseconds, 2 digits = tens of milliseconds, 3 digits = milliseconds.
-            int millisMagnitude = 1;
-            if (millisStr.size() == 2) {
-                millisMagnitude = 10;
-            }
-            else if (millisStr.size() == 1) {
-                millisMagnitude = 100;
-            }
-
-            *resultMillis = *resultMillis * millisMagnitude;
-
-            if (*resultMillis < 0 || *resultMillis > 1000) {
+            if (tzAdjHours < -23 || tzAdjHours > 23) {
                 StringBuilder sb;
-                sb << "Millisecond out of range:  " << *resultMillis;
+                sb << "Time zone hours adjustment out of range:  " << tzAdjHours;
                 return Status(ErrorCodes::BadValue, sb.str());
             }
+
+            size_t minStart = validISO8601Format ? 4 : 3;
+            StringData tzMinutesStr = tzStr.substr(minStart, 2);
+            int tzAdjMinutes = 0;
+            status = NumberParser().base(10)(tzMinutesStr, &tzAdjMinutes);
+            if (!status.isOK()) {
+                return status;
+            }
+
+            if (tzAdjMinutes < 0 || tzAdjMinutes > 59) {
+                StringBuilder sb;
+                sb << "Time zone minutes adjustment out of range:  " << tzAdjMinutes;
+                return Status(ErrorCodes::BadValue, sb.str());
+            }
+
+            // Use the sign that NumberParser::parse found to determine if we need to
+            // flip the sign of our minutes component.  Also, we need to flip the sign of our
+            // final result, because the offset passed in by the user represents how far off the
+            // time they are giving us is from UTC, which means that we have to go the opposite
+            // way to compensate and get the UTC time
+            *tzAdjSecs =
+                (-1) * ((tzAdjHours < 0 ? -1 : 1) * (tzAdjMinutes * 60) + (tzAdjHours * 60 * 60));
+
+            // Disallow adjustiment of 24 hours or more in either direction (should be checked
+            // above as the separate components of minutes and hours)
+            fassert(17318, *tzAdjSecs > -86400 && *tzAdjSecs < 86400);
+        } else {
+            StringBuilder sb;
+            sb << "Invalid time zone string:  \"" << tzStr
+               << "\".  Found invalid character at the beginning of time "
+               << "zone specifier: " << tzStr[0];
+            return Status(ErrorCodes::BadValue, sb.str());
+        }
+    } else {
+        return Status(ErrorCodes::BadValue, "Missing required time zone specifier for date");
+    }
+
+    return Status::OK();
+}
+
+Status parseMillisFromToken(StringData millisStr, int* resultMillis) {
+    *resultMillis = 0;
+
+    if (!millisStr.empty()) {
+        if (millisStr.size() > 3 || !isOnlyDigits(millisStr)) {
+            StringBuilder sb;
+            sb << "Millisecond string should be at most three digits:  " << millisStr;
+            return Status(ErrorCodes::BadValue, sb.str());
         }
 
+        Status status = NumberParser().base(10)(millisStr, resultMillis);
+        if (!status.isOK()) {
+            return status;
+        }
+
+        // Treat the digits differently depending on how many there are.  1 digit = hundreds of
+        // milliseconds, 2 digits = tens of milliseconds, 3 digits = milliseconds.
+        int millisMagnitude = 1;
+        if (millisStr.size() == 2) {
+            millisMagnitude = 10;
+        } else if (millisStr.size() == 1) {
+            millisMagnitude = 100;
+        }
+
+        *resultMillis = *resultMillis * millisMagnitude;
+
+        if (*resultMillis < 0 || *resultMillis > 1000) {
+            StringBuilder sb;
+            sb << "Millisecond out of range:  " << *resultMillis;
+            return Status(ErrorCodes::BadValue, sb.str());
+        }
+    }
+
+    return Status::OK();
+}
+
+Status parseTmFromTokens(StringData yearStr,
+                         StringData monthStr,
+                         StringData dayStr,
+                         StringData hourStr,
+                         StringData minStr,
+                         StringData secStr,
+                         std::tm* resultTm) {
+    memset(resultTm, 0, sizeof(*resultTm));
+
+    // Parse year
+    if (yearStr.size() != 4 || !isOnlyDigits(yearStr)) {
+        StringBuilder sb;
+        sb << "Year string should be four digits:  " << yearStr;
+        return Status(ErrorCodes::BadValue, sb.str());
+    }
+
+    Status status = NumberParser().base(10)(yearStr, &resultTm->tm_year);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    if (resultTm->tm_year < 1970 || resultTm->tm_year > 9999) {
+        StringBuilder sb;
+        sb << "Year out of range:  " << resultTm->tm_year;
+        return Status(ErrorCodes::BadValue, sb.str());
+    }
+
+    resultTm->tm_year -= 1900;
+
+    // Parse month
+    if (monthStr.size() != 2 || !isOnlyDigits(monthStr)) {
+        StringBuilder sb;
+        sb << "Month string should be two digits:  " << monthStr;
+        return Status(ErrorCodes::BadValue, sb.str());
+    }
+
+    status = NumberParser().base(10)(monthStr, &resultTm->tm_mon);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    if (resultTm->tm_mon < 1 || resultTm->tm_mon > 12) {
+        StringBuilder sb;
+        sb << "Month out of range:  " << resultTm->tm_mon;
+        return Status(ErrorCodes::BadValue, sb.str());
+    }
+
+    resultTm->tm_mon -= 1;
+
+    // Parse day
+    if (dayStr.size() != 2 || !isOnlyDigits(dayStr)) {
+        StringBuilder sb;
+        sb << "Day string should be two digits:  " << dayStr;
+        return Status(ErrorCodes::BadValue, sb.str());
+    }
+
+    status = NumberParser().base(10)(dayStr, &resultTm->tm_mday);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    if (resultTm->tm_mday < 1 || resultTm->tm_mday > 31) {
+        StringBuilder sb;
+        sb << "Day out of range:  " << resultTm->tm_mday;
+        return Status(ErrorCodes::BadValue, sb.str());
+    }
+
+    // Parse hour
+    if (hourStr.size() != 2 || !isOnlyDigits(hourStr)) {
+        StringBuilder sb;
+        sb << "Hour string should be two digits:  " << hourStr;
+        return Status(ErrorCodes::BadValue, sb.str());
+    }
+
+    status = NumberParser().base(10)(hourStr, &resultTm->tm_hour);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    if (resultTm->tm_hour < 0 || resultTm->tm_hour > 23) {
+        StringBuilder sb;
+        sb << "Hour out of range:  " << resultTm->tm_hour;
+        return Status(ErrorCodes::BadValue, sb.str());
+    }
+
+    // Parse minute
+    if (minStr.size() != 2 || !isOnlyDigits(minStr)) {
+        StringBuilder sb;
+        sb << "Minute string should be two digits:  " << minStr;
+        return Status(ErrorCodes::BadValue, sb.str());
+    }
+
+    status = NumberParser().base(10)(minStr, &resultTm->tm_min);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    if (resultTm->tm_min < 0 || resultTm->tm_min > 59) {
+        StringBuilder sb;
+        sb << "Minute out of range:  " << resultTm->tm_min;
+        return Status(ErrorCodes::BadValue, sb.str());
+    }
+
+    // Parse second if it exists
+    if (secStr.empty()) {
         return Status::OK();
     }
 
-    Status parseTmFromTokens(
-            StringData yearStr,
-            StringData monthStr,
-            StringData dayStr,
-            StringData hourStr,
-            StringData minStr,
-            StringData secStr,
-            std::tm* resultTm) {
+    if (secStr.size() != 2 || !isOnlyDigits(secStr)) {
+        StringBuilder sb;
+        sb << "Second string should be two digits:  " << secStr;
+        return Status(ErrorCodes::BadValue, sb.str());
+    }
 
-        memset(resultTm, 0, sizeof(*resultTm));
+    status = NumberParser().base(10)(secStr, &resultTm->tm_sec);
+    if (!status.isOK()) {
+        return status;
+    }
 
-        // Parse year
-        if (yearStr.size() != 4 || !isOnlyDigits(yearStr)) {
+    if (resultTm->tm_sec < 0 || resultTm->tm_sec > 59) {
+        StringBuilder sb;
+        sb << "Second out of range:  " << resultTm->tm_sec;
+        return Status(ErrorCodes::BadValue, sb.str());
+    }
+
+    return Status::OK();
+}
+
+Status parseTm(StringData dateString, std::tm* resultTm, int* resultMillis, int* tzAdjSecs) {
+    size_t yearEnd = std::string::npos;
+    size_t monthEnd = std::string::npos;
+    size_t dayEnd = std::string::npos;
+    size_t hourEnd = std::string::npos;
+    size_t minEnd = std::string::npos;
+    size_t secEnd = std::string::npos;
+    size_t millisEnd = std::string::npos;
+    size_t tzEnd = std::string::npos;
+    StringData yearStr, monthStr, dayStr, hourStr, minStr, secStr, millisStr, tzStr;
+
+    yearStr = getNextToken(dateString, "-", 0, &yearEnd);
+    monthStr = getNextToken(dateString, "-", yearEnd + 1, &monthEnd);
+    dayStr = getNextToken(dateString, "T", monthEnd + 1, &dayEnd);
+    hourStr = getNextToken(dateString, ":", dayEnd + 1, &hourEnd);
+    minStr = getNextToken(dateString, ":+-Z", hourEnd + 1, &minEnd);
+
+    // Only look for seconds if the character we matched for the end of the minutes token is a
+    // colon
+    if (minEnd != std::string::npos && dateString[minEnd] == ':') {
+        // Make sure the string doesn't end with ":"
+        if (minEnd == dateString.size() - 1) {
             StringBuilder sb;
-            sb << "Year string should be four digits:  " << yearStr;
+            sb << "Invalid date:  " << dateString << ".  Ends with \"" << dateString[minEnd]
+               << "\" character";
             return Status(ErrorCodes::BadValue, sb.str());
         }
 
-        Status status = parseNumberFromStringWithBase(yearStr, 10, &resultTm->tm_year);
-        if (!status.isOK()) {
-            return status;
-        }
+        secStr = getNextToken(dateString, ".+-Z", minEnd + 1, &secEnd);
 
-        if (resultTm->tm_year < 1970 || resultTm->tm_year > 9999) {
-            StringBuilder sb;
-            sb << "Year out of range:  " << resultTm->tm_year;
-            return Status(ErrorCodes::BadValue, sb.str());
-        }
-
-        resultTm->tm_year -= 1900;
-
-        // Parse month
-        if (monthStr.size() != 2 || !isOnlyDigits(monthStr)) {
-            StringBuilder sb;
-            sb << "Month string should be two digits:  " << monthStr;
-            return Status(ErrorCodes::BadValue, sb.str());
-        }
-
-        status = parseNumberFromStringWithBase(monthStr, 10, &resultTm->tm_mon);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        if (resultTm->tm_mon < 1 || resultTm->tm_mon > 12) {
-            StringBuilder sb;
-            sb << "Month out of range:  " << resultTm->tm_mon;
-            return Status(ErrorCodes::BadValue, sb.str());
-        }
-
-        resultTm->tm_mon -= 1;
-
-        // Parse day
-        if (dayStr.size() != 2 || !isOnlyDigits(dayStr)) {
-            StringBuilder sb;
-            sb << "Day string should be two digits:  " << dayStr;
-            return Status(ErrorCodes::BadValue, sb.str());
-        }
-
-        status = parseNumberFromStringWithBase(dayStr, 10, &resultTm->tm_mday);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        if (resultTm->tm_mday < 1 || resultTm->tm_mday > 31) {
-            StringBuilder sb;
-            sb << "Day out of range:  " << resultTm->tm_mday;
-            return Status(ErrorCodes::BadValue, sb.str());
-        }
-
-        // Parse hour
-        if (hourStr.size() != 2 || !isOnlyDigits(hourStr)) {
-            StringBuilder sb;
-            sb << "Hour string should be two digits:  " << hourStr;
-            return Status(ErrorCodes::BadValue, sb.str());
-        }
-
-        status = parseNumberFromStringWithBase(hourStr, 10, &resultTm->tm_hour);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        if (resultTm->tm_hour < 0 || resultTm->tm_hour > 23) {
-            StringBuilder sb;
-            sb << "Hour out of range:  " << resultTm->tm_hour;
-            return Status(ErrorCodes::BadValue, sb.str());
-        }
-
-        // Parse minute
-        if (minStr.size() != 2 || !isOnlyDigits(minStr)) {
-            StringBuilder sb;
-            sb << "Minute string should be two digits:  " << minStr;
-            return Status(ErrorCodes::BadValue, sb.str());
-        }
-
-        status = parseNumberFromStringWithBase(minStr, 10, &resultTm->tm_min);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        if (resultTm->tm_min < 0 || resultTm->tm_min > 59) {
-            StringBuilder sb;
-            sb << "Minute out of range:  " << resultTm->tm_min;
-            return Status(ErrorCodes::BadValue, sb.str());
-        }
-
-        // Parse second if it exists
+        // Make sure we actually got something for seconds, since here we know they are expected
         if (secStr.empty()) {
-            return Status::OK();
-        }
-
-        if (secStr.size() != 2 || !isOnlyDigits(secStr)) {
             StringBuilder sb;
-            sb << "Second string should be two digits:  " << secStr;
+            sb << "Missing seconds in date: " << dateString;
+            return Status(ErrorCodes::BadValue, sb.str());
+        }
+    }
+
+    // Only look for milliseconds if the character we matched for the end of the seconds token
+    // is a period
+    if (secEnd != std::string::npos && dateString[secEnd] == '.') {
+        // Make sure the string doesn't end with "."
+        if (secEnd == dateString.size() - 1) {
+            StringBuilder sb;
+            sb << "Invalid date:  " << dateString << ".  Ends with \"" << dateString[secEnd]
+               << "\" character";
             return Status(ErrorCodes::BadValue, sb.str());
         }
 
-        status = parseNumberFromStringWithBase(secStr, 10, &resultTm->tm_sec);
-        if (!status.isOK()) {
-            return status;
-        }
+        millisStr = getNextToken(dateString, "+-Z", secEnd + 1, &millisEnd);
 
-        if (resultTm->tm_sec < 0 || resultTm->tm_sec > 59) {
+        // Make sure we actually got something for millis, since here we know they are expected
+        if (millisStr.empty()) {
             StringBuilder sb;
-            sb << "Second out of range:  " << resultTm->tm_sec;
+            sb << "Missing seconds in date: " << dateString;
             return Status(ErrorCodes::BadValue, sb.str());
         }
-
-        return Status::OK();
     }
 
-    Status parseTm(StringData dateString,
-                   std::tm* resultTm,
-                   int* resultMillis,
-                   int* tzAdjSecs) {
-        size_t yearEnd = std::string::npos;
-        size_t monthEnd = std::string::npos;
-        size_t dayEnd = std::string::npos;
-        size_t hourEnd = std::string::npos;
-        size_t minEnd = std::string::npos;
-        size_t secEnd = std::string::npos;
-        size_t millisEnd = std::string::npos;
-        size_t tzEnd = std::string::npos;
-        StringData yearStr, monthStr, dayStr, hourStr, minStr, secStr, millisStr, tzStr;
-
-        yearStr = getNextToken(dateString, "-", 0, &yearEnd);
-        monthStr = getNextToken(dateString, "-", yearEnd + 1, &monthEnd);
-        dayStr = getNextToken(dateString, "T", monthEnd + 1, &dayEnd);
-        hourStr = getNextToken(dateString, ":", dayEnd + 1, &hourEnd);
-        minStr = getNextToken(dateString, ":+-Z", hourEnd + 1, &minEnd);
-
-        // Only look for seconds if the character we matched for the end of the minutes token is a
-        // colon
-        if (minEnd != std::string::npos && dateString[minEnd] == ':') {
-            // Make sure the string doesn't end with ":"
-            if (minEnd == dateString.size() - 1) {
-                StringBuilder sb;
-                sb << "Invalid date:  " << dateString << ".  Ends with \"" << dateString[minEnd]
-                   << "\" character";
-                return Status(ErrorCodes::BadValue, sb.str());
-            }
-
-            secStr = getNextToken(dateString, ".+-Z", minEnd + 1, &secEnd);
-
-            // Make sure we actually got something for seconds, since here we know they are expected
-            if (secStr.empty()) {
-                StringBuilder sb;
-                sb << "Missing seconds in date: " << dateString;
-                return Status(ErrorCodes::BadValue, sb.str());
-            }
-        }
-
-        // Only look for milliseconds if the character we matched for the end of the seconds token
-        // is a period
-        if (secEnd != std::string::npos && dateString[secEnd] == '.') {
-            // Make sure the string doesn't end with "."
-            if (secEnd == dateString.size() - 1) {
-                StringBuilder sb;
-                sb << "Invalid date:  " << dateString << ".  Ends with \"" << dateString[secEnd]
-                   << "\" character";
-                return Status(ErrorCodes::BadValue, sb.str());
-            }
-
-            millisStr = getNextToken(dateString, "+-Z", secEnd + 1, &millisEnd);
-
-            // Make sure we actually got something for millis, since here we know they are expected
-            if (millisStr.empty()) {
-                StringBuilder sb;
-                sb << "Missing seconds in date: " << dateString;
-                return Status(ErrorCodes::BadValue, sb.str());
-            }
-        }
-
-        // Now look for the time zone specifier depending on which prefix of the time we provided
-        if (millisEnd != std::string::npos) {
-            tzStr = getNextToken(dateString, "", millisEnd, &tzEnd);
-        }
-        else if (secEnd != std::string::npos && dateString[secEnd] != '.') {
-            tzStr = getNextToken(dateString, "", secEnd, &tzEnd);
-        }
-        else if (minEnd != std::string::npos && dateString[minEnd] != ':') {
-            tzStr = getNextToken(dateString, "", minEnd, &tzEnd);
-        }
-
-        Status status = parseTmFromTokens(yearStr, monthStr, dayStr, hourStr, minStr, secStr,
-                                          resultTm);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        status = parseTimeZoneFromToken(tzStr, tzAdjSecs);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        status = parseMillisFromToken(millisStr, resultMillis);
-        if (!status.isOK()) {
-            return status;
-        }
-
-        return Status::OK();
+    // Now look for the time zone specifier depending on which prefix of the time we provided
+    if (millisEnd != std::string::npos) {
+        tzStr = getNextToken(dateString, "", millisEnd, &tzEnd);
+    } else if (secEnd != std::string::npos && dateString[secEnd] != '.') {
+        tzStr = getNextToken(dateString, "", secEnd, &tzEnd);
+    } else if (minEnd != std::string::npos && dateString[minEnd] != ':') {
+        tzStr = getNextToken(dateString, "", minEnd, &tzEnd);
     }
+
+    Status status = parseTmFromTokens(yearStr, monthStr, dayStr, hourStr, minStr, secStr, resultTm);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    status = parseTimeZoneFromToken(tzStr, tzAdjSecs);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    status = parseMillisFromToken(millisStr, resultMillis);
+    if (!status.isOK()) {
+        return status;
+    }
+
+    return Status::OK();
+}
 
 }  // namespace
 
-    StatusWith<Date_t> dateFromISOString(StringData dateString) {
-        std::tm theTime;
-        int millis = 0;
-        int tzAdjSecs = 0;
-        Status status = parseTm(dateString, &theTime, &millis, &tzAdjSecs);
-        if (!status.isOK()) {
-            return StatusWith<Date_t>(ErrorCodes::BadValue, status.reason());
-        }
+StatusWith<Date_t> dateFromISOString(StringData dateString) {
+    std::tm theTime;
+    int millis = 0;
+    int tzAdjSecs = 0;
+    Status status = parseTm(dateString, &theTime, &millis, &tzAdjSecs);
+    if (!status.isOK()) {
+        return StatusWith<Date_t>(ErrorCodes::BadValue, status.reason());
+    }
 
-        unsigned long long resultMillis = 0;
+    unsigned long long resultMillis = 0;
 
 #if defined(_WIN32)
-        SYSTEMTIME dateStruct;
-        dateStruct.wMilliseconds = millis;
-        dateStruct.wSecond = theTime.tm_sec;
-        dateStruct.wMinute = theTime.tm_min;
-        dateStruct.wHour = theTime.tm_hour;
-        dateStruct.wDay = theTime.tm_mday;
-        dateStruct.wDayOfWeek = -1; /* ignored */
-        dateStruct.wMonth = theTime.tm_mon + 1;
-        dateStruct.wYear = theTime.tm_year + 1900;
+    SYSTEMTIME dateStruct;
+    dateStruct.wMilliseconds = millis;
+    dateStruct.wSecond = theTime.tm_sec;
+    dateStruct.wMinute = theTime.tm_min;
+    dateStruct.wHour = theTime.tm_hour;
+    dateStruct.wDay = theTime.tm_mday;
+    dateStruct.wDayOfWeek = -1; /* ignored */
+    dateStruct.wMonth = theTime.tm_mon + 1;
+    dateStruct.wYear = theTime.tm_year + 1900;
 
-        // Output parameter for SystemTimeToFileTime
-        FILETIME fileTime;
+    // Output parameter for SystemTimeToFileTime
+    FILETIME fileTime;
 
-        // the wDayOfWeek member of SYSTEMTIME is ignored by this function
-        if (SystemTimeToFileTime(&dateStruct, &fileTime) == 0) {
-            StringBuilder sb;
-            sb << "Error converting Windows system time to file time for date:  " << dateString
-               << ".  Error code:  " << GetLastError();
-            return StatusWith<Date_t>(ErrorCodes::BadValue, sb.str());
-        }
+    // the wDayOfWeek member of SYSTEMTIME is ignored by this function
+    if (SystemTimeToFileTime(&dateStruct, &fileTime) == 0) {
+        StringBuilder sb;
+        sb << "Error converting Windows system time to file time for date:  " << dateString
+           << ".  Error code:  " << GetLastError();
+        return StatusWith<Date_t>(ErrorCodes::BadValue, sb.str());
+    }
 
-        // The Windows FILETIME structure contains two parts of a 64-bit value representing the
-        // number of 100-nanosecond intervals since January 1, 1601
-        unsigned long long windowsTimeOffset =
-            (static_cast<unsigned long long>(fileTime.dwHighDateTime) << 32) |
-             fileTime.dwLowDateTime;
+    // The Windows FILETIME structure contains two parts of a 64-bit value representing the
+    // number of 100-nanosecond intervals since January 1, 1601
+    unsigned long long windowsTimeOffset =
+        (static_cast<unsigned long long>(fileTime.dwHighDateTime) << 32) | fileTime.dwLowDateTime;
 
-        // There are 11644473600 seconds between the unix epoch and the windows epoch
-        // 100-nanoseconds = milliseconds * 10000
-        unsigned long long epochDifference = 11644473600000 * 10000;
+    // There are 11644473600 seconds between the unix epoch and the windows epoch
+    // 100-nanoseconds = milliseconds * 10000
+    unsigned long long epochDifference = 11644473600000 * 10000;
 
-        // removes the diff between 1970 and 1601
-        windowsTimeOffset -= epochDifference;
+    // removes the diff between 1970 and 1601
+    windowsTimeOffset -= epochDifference;
 
-        // 1 milliseconds = 1000000 nanoseconds = 10000 100-nanosecond intervals
-        resultMillis = windowsTimeOffset / 10000;
+    // 1 milliseconds = 1000000 nanoseconds = 10000 100-nanosecond intervals
+    resultMillis = windowsTimeOffset / 10000;
 #else
-        struct tm dateStruct = { 0 };
-        dateStruct.tm_sec = theTime.tm_sec;
-        dateStruct.tm_min = theTime.tm_min;
-        dateStruct.tm_hour = theTime.tm_hour;
-        dateStruct.tm_mday = theTime.tm_mday;
-        dateStruct.tm_mon = theTime.tm_mon;
-        dateStruct.tm_year = theTime.tm_year;
-        dateStruct.tm_wday = 0;
-        dateStruct.tm_yday = 0;
+    struct tm dateStruct = {0};
+    dateStruct.tm_sec = theTime.tm_sec;
+    dateStruct.tm_min = theTime.tm_min;
+    dateStruct.tm_hour = theTime.tm_hour;
+    dateStruct.tm_mday = theTime.tm_mday;
+    dateStruct.tm_mon = theTime.tm_mon;
+    dateStruct.tm_year = theTime.tm_year;
+    dateStruct.tm_wday = 0;
+    dateStruct.tm_yday = 0;
 
-        resultMillis = (1000 * static_cast<unsigned long long>(timegm(&dateStruct))) + millis;
+    resultMillis = (1000 * static_cast<unsigned long long>(timegm(&dateStruct))) + millis;
 #endif
 
-        resultMillis += (tzAdjSecs * 1000);
+    resultMillis += (tzAdjSecs * 1000);
 
-        return StatusWith<Date_t>(resultMillis);
+    if (resultMillis > static_cast<unsigned long long>(std::numeric_limits<long long>::max())) {
+        return {ErrorCodes::BadValue, str::stream() << dateString << " is too far in the future"};
     }
+    return Date_t::fromMillisSinceEpoch(static_cast<long long>(resultMillis));
+}
 
-#undef MONGO_ISO_DATE_FMT_NO_TZ
-
-    void Date_t::toTm(tm* buf) {
-        time_t dtime = toTimeT();
-#if defined(_WIN32)
-        gmtime_s(buf, &dtime);
-#else
-        gmtime_r(&dtime, buf);
-#endif
+std::string Date_t::toString() const {
+    if (isFormattable()) {
+        return dateToISOStringLocal(*this);
+    } else {
+        return str::stream() << "Date(" << millis << ")";
     }
+}
 
-    std::string Date_t::toString() const {
-        return time_t_to_String(toTimeT());
-    }
+time_t Date_t::toTimeT() const {
+    const auto secs = millis / 1000;
+    verify(secs >= std::numeric_limits<time_t>::min());
+    verify(secs <= std::numeric_limits<time_t>::max());
+    return secs;
+}
 
-    time_t Date_t::toTimeT() const {
-        verify((long long)millis >= 0); // TODO when millis is signed, delete 
-        verify(((long long)millis/1000) < (std::numeric_limits<time_t>::max)());
-        return millis / 1000;
-    }
+void sleepsecs(int s) {
+    stdx::this_thread::sleep_for(Seconds(s).toSystemDuration());
+}
 
-    boost::gregorian::date currentDate() {
-        boost::posix_time::ptime now = boost::posix_time::second_clock::local_time();
-        return now.date();
-    }
+void sleepmillis(long long s) {
+    stdx::this_thread::sleep_for(Milliseconds(s).toSystemDuration());
+}
+void sleepmicros(long long s) {
+    stdx::this_thread::sleep_for(Microseconds(s).toSystemDuration());
+}
 
-    // parses time of day in "hh:mm" format assuming 'hh' is 00-23
-    bool toPointInTime( const string& str , boost::posix_time::ptime* timeOfDay ) {
-        int hh = 0;
-        int mm = 0;
-        if ( 2 != sscanf( str.c_str() , "%d:%d" , &hh , &mm ) ) {
-            return false;
-        }
+Milliseconds Backoff::nextSleep() {
+    // Get the current time
+    unsigned long long currTimeMillis = curTimeMillis64();
 
-        // verify that time is well formed
-        if ( ( hh / 24 ) || ( mm / 60 ) ) {
-            return false;
-        }
+    int lastSleepMillis = _lastSleepMillis;
 
-        boost::posix_time::ptime res( currentDate() , boost::posix_time::hours( hh ) + boost::posix_time::minutes( mm ) );
-        *timeOfDay = res;
-        return true;
-    }
-
-#if defined(_WIN32)
-    void sleepsecs(int s) {
-        Sleep(s*1000);
-    }
-    void sleepmillis(long long s) {
-        fassert(16228, s <= 0xffffffff );
-        Sleep((DWORD) s);
-    }
-    void sleepmicros(long long s) {
-        if ( s <= 0 )
-            return;
-        boost::xtime xt;
-        boost::xtime_get(&xt, MONGO_BOOST_TIME_UTC);
-        xt.sec += (int)( s / 1000000 );
-        xt.nsec += (int)(( s % 1000000 ) * 1000);
-        if ( xt.nsec >= 1000000000 ) {
-            xt.nsec -= 1000000000;
-            xt.sec++;
-        }
-        boost::thread::sleep(xt);
-    }
-#else
-    void sleepsecs(int s) {
-        struct timespec t;
-        t.tv_sec = s;
-        t.tv_nsec = 0;
-        if ( nanosleep( &t , 0 ) ) {
-            std::cout << "nanosleep failed" << std::endl;
-        }
-    }
-    void sleepmicros(long long s) {
-        if ( s <= 0 )
-            return;
-        struct timespec t;
-        t.tv_sec = (int)(s / 1000000);
-        t.tv_nsec = 1000 * ( s % 1000000 );
-        struct timespec out;
-        if ( nanosleep( &t , &out ) ) {
-            std::cout << "nanosleep failed" << std::endl;
-        }
-    }
-    void sleepmillis(long long s) {
-        sleepmicros( s * 1000 );
-    }
-#endif
-
-    void Backoff::nextSleepMillis(){
-
-        // Get the current time
-        unsigned long long currTimeMillis = curTimeMillis64();
-
-        int lastSleepMillis = _lastSleepMillis;
-
-        if( _lastErrorTimeMillis == 0 || _lastErrorTimeMillis > currTimeMillis /* VM bugs exist */ )
-            _lastErrorTimeMillis = currTimeMillis;
-        unsigned long long lastErrorTimeMillis = _lastErrorTimeMillis;
+    if (!_lastErrorTimeMillis || _lastErrorTimeMillis > currTimeMillis /* VM bugs exist */)
         _lastErrorTimeMillis = currTimeMillis;
 
-        lastSleepMillis = getNextSleepMillis(lastSleepMillis, currTimeMillis, lastErrorTimeMillis);
+    unsigned long long lastErrorTimeMillis = _lastErrorTimeMillis;
+    _lastErrorTimeMillis = currTimeMillis;
 
-        // Store the last slept time
-        _lastSleepMillis = lastSleepMillis;
-        sleepmillis( lastSleepMillis );
-    }
+    lastSleepMillis = getNextSleepMillis(lastSleepMillis, currTimeMillis, lastErrorTimeMillis);
 
-    int Backoff::getNextSleepMillis(int lastSleepMillis, unsigned long long currTimeMillis,
-                                    unsigned long long lastErrorTimeMillis) const {
-        // Backoff logic
+    // Store the last slept time
+    _lastSleepMillis = lastSleepMillis;
+    return Milliseconds(lastSleepMillis);
+}
 
-        // Get the time since the last error
-        unsigned long long timeSinceLastErrorMillis = currTimeMillis - lastErrorTimeMillis;
+int Backoff::getNextSleepMillis(long long lastSleepMillis,
+                                unsigned long long currTimeMillis,
+                                unsigned long long lastErrorTimeMillis) const {
+    // Backoff logic
 
-        // Makes the cast below safe
-        verify( _resetAfterMillis >= 0 );
+    // Get the time since the last error
+    const long long timeSinceLastErrorMillis = currTimeMillis - lastErrorTimeMillis;
 
-        // If we haven't seen another error recently (3x the max wait time), reset our
-        // wait counter.
-        if( timeSinceLastErrorMillis > (unsigned)( _resetAfterMillis ) ) lastSleepMillis = 0;
+    // If we haven't seen another error recently (3x the max wait time), reset our wait counter
+    if (timeSinceLastErrorMillis > _resetAfterMillis)
+        lastSleepMillis = 0;
 
-        // Makes the test below sane
-        verify( _maxSleepMillis > 0 );
+    // Wait a power of two millis
+    if (lastSleepMillis == 0)
+        lastSleepMillis = 1;
+    else
+        lastSleepMillis = std::min(lastSleepMillis * 2, _maxSleepMillis);
 
-        // Wait a power of two millis
-        if( lastSleepMillis == 0 ) lastSleepMillis = 1;
-        else lastSleepMillis = std::min( lastSleepMillis * 2, _maxSleepMillis );
+    return lastSleepMillis;
+}
 
-        return lastSleepMillis;
-    }
+// DO NOT TOUCH except for testing
+void jsTimeVirtualSkew(long long skew) {
+    jsTime_virtual_skew = skew;
+}
+long long getJSTimeVirtualSkew() {
+    return jsTime_virtual_skew;
+}
 
-    extern long long jsTime_virtual_skew;
-    extern boost::thread_specific_ptr<long long> jsTime_virtual_thread_skew;
+void jsTimeVirtualThreadSkew(long long skew) {
+    jsTime_virtual_thread_skew = skew;
+}
 
-    // DO NOT TOUCH except for testing
-    void jsTimeVirtualSkew( long long skew ){
-        jsTime_virtual_skew = skew;
-    }
-    long long getJSTimeVirtualSkew(){
-        return jsTime_virtual_skew;
-    }
+long long getJSTimeVirtualThreadSkew() {
+    return jsTime_virtual_thread_skew;
+}
 
-    void jsTimeVirtualThreadSkew( long long skew ){
-        jsTime_virtual_thread_skew.reset(new long long(skew));
-    }
-    long long getJSTimeVirtualThreadSkew(){
-        if(jsTime_virtual_thread_skew.get()){
-            return *(jsTime_virtual_thread_skew.get());
-        }
-        else return 0;
-    }
+/** Date_t is milliseconds since epoch */
+Date_t jsTime() {
+    return Date_t::now() + Milliseconds(getJSTimeVirtualThreadSkew()) +
+        Milliseconds(getJSTimeVirtualSkew());
+}
 
-    /** Date_t is milliseconds since epoch */
-    Date_t jsTime();
+#ifdef _WIN32  // no gettimeofday on windows
+unsigned long long curTimeMillis64() {
+    using stdx::chrono::system_clock;
+    return static_cast<unsigned long long>(
+        durationCount<Milliseconds>(system_clock::now() - system_clock::from_time_t(0)));
+}
 
-    /** warning this will wrap */
-    unsigned curTimeMicros();
+unsigned long long curTimeMicros64() {
+    // Windows 8/2012 & later support a <1us time function
+    FILETIME time;
+    GetSystemTimePreciseAsFileTime(&time);
+    return fileTimeToMicroseconds(time);
+}
 
-    unsigned long long curTimeMicros64();
-#ifdef _WIN32 // no gettimeofday on windows
-    unsigned long long curTimeMillis64() {
-        boost::xtime xt;
-        boost::xtime_get(&xt, MONGO_BOOST_TIME_UTC);
-        return ((unsigned long long)xt.sec) * 1000 + xt.nsec / 1000000;
-    }
-    Date_t jsTime() {
-        boost::xtime xt;
-        boost::xtime_get(&xt, MONGO_BOOST_TIME_UTC);
-        unsigned long long t = xt.nsec / 1000000;
-        return ((unsigned long long) xt.sec * 1000) + t + getJSTimeVirtualSkew() + getJSTimeVirtualThreadSkew();
-    }
-
-    static unsigned long long getFiletime() {
-        FILETIME ft;
-        GetSystemTimeAsFileTime(&ft);
-        return *reinterpret_cast<unsigned long long*>(&ft);
-    }
-
-    static unsigned long long getPerfCounter() {
-        LARGE_INTEGER li;
-        QueryPerformanceCounter(&li);
-        return li.QuadPart;
-    }
-
-    static unsigned long long baseFiletime = 0;
-    static unsigned long long basePerfCounter = 0;
-    static unsigned long long resyncInterval = 0;
-    static SimpleMutex _curTimeMicros64ReadMutex("curTimeMicros64Read");
-    static SimpleMutex _curTimeMicros64ResyncMutex("curTimeMicros64Resync");
-
-    typedef WINBASEAPI VOID (WINAPI *pGetSystemTimePreciseAsFileTime)
-        (_Out_ LPFILETIME lpSystemTimeAsFileTime);
-
-    static pGetSystemTimePreciseAsFileTime GetSystemTimePreciseAsFileTimeFunc;
-
-    MONGO_INITIALIZER(Init32TimeSupport)(InitializerContext*) {
-        HINSTANCE kernelLib = LoadLibraryA("kernel32.dll");
-        if (kernelLib) {
-            GetSystemTimePreciseAsFileTimeFunc = reinterpret_cast<pGetSystemTimePreciseAsFileTime>
-                (GetProcAddress(kernelLib, "GetSystemTimePreciseAsFileTime"));
-        }
-
-        return Status::OK();
-    }
-
-    static unsigned long long resyncTime() {
-        SimpleMutex::scoped_lock lkResync(_curTimeMicros64ResyncMutex);
-        unsigned long long ftOld;
-        unsigned long long ftNew;
-        ftOld = ftNew = getFiletime();
-        do {
-            ftNew = getFiletime();
-        } while (ftOld == ftNew);   // wait for filetime to change
-
-        unsigned long long newPerfCounter = getPerfCounter();
-
-        // Make sure that we use consistent values for baseFiletime and basePerfCounter.
-        //
-        SimpleMutex::scoped_lock lkRead(_curTimeMicros64ReadMutex);
-        baseFiletime = ftNew;
-        basePerfCounter = newPerfCounter;
-        resyncInterval = 60 * Timer::getCountsPerSecond();
-        return newPerfCounter;
-    }
-
-    unsigned long long curTimeMicros64() {
-
-        // Windows 8/2012 & later support a <1us time function
-        if (GetSystemTimePreciseAsFileTimeFunc != NULL) {
-            FILETIME time;
-            GetSystemTimePreciseAsFileTimeFunc(&time);
-            return boost::date_time::winapi::file_time_to_microseconds(time);
-        }
-
-        // Get a current value for QueryPerformanceCounter; if it is not time to resync we will
-        // use this value.
-        //
-        unsigned long long perfCounter = getPerfCounter();
-
-        // Periodically resync the timer so that we don't let timer drift accumulate.  Testing
-        // suggests that we drift by about one microsecond per minute, so resynching once per
-        // minute should keep drift to no more than one microsecond.
-        //
-        if ((perfCounter - basePerfCounter) > resyncInterval) {
-            perfCounter = resyncTime();
-        }
-
-        // Make sure that we use consistent values for baseFiletime and basePerfCounter.
-        //
-        SimpleMutex::scoped_lock lkRead(_curTimeMicros64ReadMutex);
-
-        // Compute the current time in FILETIME format by adding our base FILETIME and an offset
-        // from that time based on QueryPerformanceCounter.  The math is (logically) to compute the
-        // fraction of a second elapsed since 'baseFiletime' by taking the difference in ticks
-        // and dividing by the tick frequency, then scaling this fraction up to units of 100
-        // nanoseconds to match the FILETIME format.  We do the multiplication first to avoid
-        // truncation while using only integer instructions.
-        //
-        unsigned long long computedTime = baseFiletime +
-                ((perfCounter - basePerfCounter) * 10 * 1000 * 1000) / Timer::getCountsPerSecond();
-
-        // Convert the computed FILETIME into microseconds since the Unix epoch (1/1/1970).
-        //
-        return boost::date_time::winapi::file_time_to_microseconds(computedTime);
-    }
-
-    unsigned curTimeMicros() {
-        boost::xtime xt;
-        boost::xtime_get(&xt, MONGO_BOOST_TIME_UTC);
-        unsigned t = xt.nsec / 1000;
-        unsigned secs = xt.sec % 1024;
-        return secs*1000000 + t;
-    }
 #else
-#  include <sys/time.h>
-    unsigned long long curTimeMillis64() {
-        timeval tv;
-        gettimeofday(&tv, NULL);
-        return ((unsigned long long)tv.tv_sec) * 1000 + tv.tv_usec / 1000;
-    }
-    Date_t jsTime() {
-        timeval tv;
-        gettimeofday(&tv, NULL);
-        unsigned long long t = tv.tv_usec / 1000;
-        return ((unsigned long long) tv.tv_sec * 1000) + t + getJSTimeVirtualSkew() + getJSTimeVirtualThreadSkew();
-    }
-    unsigned long long curTimeMicros64() {
-        timeval tv;
-        gettimeofday(&tv, NULL);
-        return (((unsigned long long) tv.tv_sec) * 1000*1000) + tv.tv_usec;
-    }
-    unsigned curTimeMicros() {
-        timeval tv;
-        gettimeofday(&tv, NULL);
-        unsigned secs = tv.tv_sec % 1024;
-        return secs*1000*1000 + tv.tv_usec;
-    }
+unsigned long long curTimeMillis64() {
+    timeval tv;
+    gettimeofday(&tv, nullptr);
+    return ((unsigned long long)tv.tv_sec) * 1000 + tv.tv_usec / 1000;
+}
+
+unsigned long long curTimeMicros64() {
+    timeval tv;
+    gettimeofday(&tv, nullptr);
+    return (((unsigned long long)tv.tv_sec) * 1000 * 1000) + tv.tv_usec;
+}
 #endif
+
+#if defined(__APPLE__)
+template <typename T>
+class MachPort {
+public:
+    MachPort(T port) : _port(std::move(port)) {}
+    ~MachPort() {
+        mach_port_deallocate(mach_task_self(), _port);
+    }
+    operator T&() {
+        return _port;
+    }
+
+private:
+    T _port;
+};
+#endif
+
+// Find minimum timer resolution of OS
+Nanoseconds getMinimumTimerResolution() {
+    Nanoseconds minTimerResolution;
+#if defined(__linux__) || defined(__FreeBSD__) || defined(__EMSCRIPTEN__)
+    struct timespec tp;
+    clock_getres(CLOCK_REALTIME, &tp);
+    minTimerResolution = Nanoseconds{tp.tv_nsec};
+#elif defined(_WIN32)
+    // see https://msdn.microsoft.com/en-us/library/windows/desktop/dd743626(v=vs.85).aspx
+    TIMECAPS tc;
+    Milliseconds resMillis;
+    invariant(timeGetDevCaps(&tc, sizeof(tc)) == MMSYSERR_NOERROR);
+    resMillis = Milliseconds{static_cast<int64_t>(tc.wPeriodMin)};
+    minTimerResolution = duration_cast<Nanoseconds>(resMillis);
+#elif defined(__APPLE__)
+    // see "Mac OSX Internals: a Systems Approach" for functions and types
+    kern_return_t kr;
+    MachPort<host_name_port_t> myhost(mach_host_self());
+    MachPort<clock_serv_t> clk_system([&myhost] {
+        host_name_port_t clk;
+        invariant(host_get_clock_service(myhost, SYSTEM_CLOCK, &clk) == 0);
+        return clk;
+    }());
+    natural_t attribute[4];
+    mach_msg_type_number_t count;
+
+    count = sizeof(attribute) / sizeof(natural_t);
+    kr = clock_get_attributes(clk_system, CLOCK_GET_TIME_RES, (clock_attr_t)attribute, &count);
+    invariant(kr == 0);
+
+    minTimerResolution = Nanoseconds{attribute[0]};
+#else
+#error Dont know how to get the minimum timer resolution on this platform
+#endif
+    return minTimerResolution;
+}
+
+std::string dateToISOStringUTC(Date_t date) {
+    return std::string{DateStringBuffer{}.iso8601(date, false)};
+}
+std::string dateToISOStringLocal(Date_t date) {
+    return std::string{DateStringBuffer{}.iso8601(date, true)};
+}
+std::string dateToCtimeString(Date_t date) {
+    return std::string{DateStringBuffer{}.ctime(date)};
+}
+
+void outputDateAsISOStringUTC(std::ostream& os, Date_t date) {
+    os << StringData{DateStringBuffer{}.iso8601(date, false)};
+}
+void outputDateAsISOStringLocal(std::ostream& os, Date_t date) {
+    os << StringData{DateStringBuffer{}.iso8601(date, true)};
+}
+void outputDateAsCtime(std::ostream& os, Date_t date) {
+    os << StringData{DateStringBuffer{}.ctime(date)};
+}
 
 }  // namespace mongo

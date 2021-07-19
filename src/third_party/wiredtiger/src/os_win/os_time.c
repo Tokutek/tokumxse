@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -9,57 +9,35 @@
 #include "wt_internal.h"
 
 /*
- * __wt_seconds --
- *	Return the seconds since the Epoch.
+ * __wt_epoch_raw --
+ *     Return the time since the Epoch as reported by the system.
  */
-int
-__wt_seconds(WT_SESSION_IMPL *session, time_t *timep)
+void
+__wt_epoch_raw(WT_SESSION_IMPL *session, struct timespec *tsp)
 {
-	struct timespec t;
+    FILETIME time;
+    uint64_t ns100;
 
-	WT_RET(__wt_epoch(session, &t));
+    WT_UNUSED(session);
 
-	*timep = t.tv_sec;
+    GetSystemTimeAsFileTime(&time);
 
-	return (0);
+    ns100 = (((int64_t)time.dwHighDateTime << 32) + time.dwLowDateTime) - 116444736000000000LL;
+    tsp->tv_sec = ns100 / 10000000;
+    tsp->tv_nsec = (long)((ns100 % 10000000) * 100);
 }
 
 /*
- * __wt_epoch --
- *	Return the time since the Epoch.
+ * __wt_localtime --
+ *     Return the current local broken-down time.
  */
 int
-__wt_epoch(WT_SESSION_IMPL *session, struct timespec *tsp)
+__wt_localtime(WT_SESSION_IMPL *session, const time_t *timep, struct tm *result)
 {
-	uint64_t ns100;
-	FILETIME time;
+    errno_t err;
 
-	WT_UNUSED(session);
+    if ((err = localtime_s(result, timep)) == 0)
+        return (0);
 
-	GetSystemTimeAsFileTime(&time);
-
-	ns100 = (((int64_t)time.dwHighDateTime << 32) + time.dwLowDateTime)
-	    - 116444736000000000LL;
-	tsp->tv_sec = ns100 / 10000000;
-	tsp->tv_nsec = (long)((ns100 % 10000000) * 100);
-
-	return (0);
-}
-
-/*
- * localtime_r --
- *	Return the current local time.
- */
-struct tm *
-localtime_r(const time_t *timer, struct tm *result)
-{
-	errno_t err;
-
-	err = localtime_s(result, timer);
-	if (err != 0) {
-		__wt_err(NULL, err, "localtime_s");
-		return (NULL);
-	}
-
-	return (result);
+    WT_RET_MSG(session, err, "localtime_s");
 }

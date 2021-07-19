@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,96 +29,164 @@
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/commands/explain_cmd.h"
-
-#include "mongo/client/dbclientinterface.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/client.h"
+#include "mongo/db/command_can_run_here.h"
 #include "mongo/db/commands.h"
+#include "mongo/db/explain_gen.h"
 #include "mongo/db/query/explain.h"
-#include "mongo/db/repl/replication_coordinator_global.h"
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
+namespace {
 
-    using std::string;
+/**
+ * The explain command is used to generate explain output for any read or write operation which has
+ * a query component (e.g. find, count, update, remove, distinct, etc.).
+ *
+ * The explain command takes as its argument a nested object which specifies the command to
+ * explain, and a verbosity indicator. For example:
+ *
+ *    {explain: {count: "coll", query: {foo: "bar"}}, verbosity: "executionStats"}
+ *
+ * This command like a dispatcher: it just retrieves a pointer to the nested command and invokes
+ * its explain() implementation.
+ */
+class CmdExplain final : public Command {
+public:
+    CmdExplain() : Command("explain") {}
 
-    static CmdExplain cmdExplain;
-
-    Status CmdExplain::checkAuthForCommand(ClientBasic* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) {
-        if (Object != cmdObj.firstElement().type()) {
-            return Status(ErrorCodes::BadValue, "explain command requires a nested object");
-        }
-
-        BSONObj explainObj = cmdObj.firstElement().Obj();
-
-        Command* commToExplain = Command::findCommand(explainObj.firstElementFieldName());
-        if (NULL == commToExplain) {
-            mongoutils::str::stream ss;
-            ss << "unknown command: " << explainObj.firstElementFieldName();
-            return Status(ErrorCodes::CommandNotFound, ss);
-        }
-
-        return commToExplain->checkAuthForCommand(client, dbname, explainObj);
+    const std::set<std::string>& apiVersions() const {
+        return kApiVersions1;
     }
 
-    bool CmdExplain::run(OperationContext* txn,
-                         const string& dbname,
-                         BSONObj& cmdObj, int options,
-                         string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
-        // Should never get explain commands issued from replication.
-        if (fromRepl) {
-            Status commandStat(ErrorCodes::IllegalOperation,
-                               "explain command should not be from repl");
-            appendCommandStatus(result, commandStat);
-            return false;
-        }
+    std::unique_ptr<CommandInvocation> parse(OperationContext* opCtx,
+                                             const OpMsgRequest& request) override;
 
-        ExplainCommon::Verbosity verbosity;
-        Status parseStatus = ExplainCommon::parseCmdBSON(cmdObj, &verbosity);
-        if (!parseStatus.isOK()) {
-            return appendCommandStatus(result, parseStatus);
-        }
+    /**
+     * Running an explain on a secondary requires explicitly setting slaveOk.
+     */
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kOptIn;
+    }
 
-        // This is the nested command which we are explaining.
-        BSONObj explainObj = cmdObj.firstElement().Obj();
+    bool maintenanceOk() const override {
+        return false;
+    }
 
-        Command* commToExplain = Command::findCommand(explainObj.firstElementFieldName());
-        if (NULL == commToExplain) {
-            mongoutils::str::stream ss;
-            ss << "Explain failed due to unknown command: " << explainObj.firstElementFieldName();
-            Status explainStatus(ErrorCodes::CommandNotFound, ss);
-            return appendCommandStatus(result, explainStatus);
-        }
+    bool adminOnly() const override {
+        return false;
+    }
 
-        // Check whether the child command is allowed to run here. TODO: this logic is
-        // copied from Command::execCommand and should be abstracted. Until then, make
-        // sure to keep it up to date.
-        repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
-        const bool canRunHere =
-            replCoord->canAcceptWritesForDatabase(dbname) ||
-            commToExplain->slaveOk() ||
-            (commToExplain->slaveOverrideOk() && (options & QueryOption_SlaveOk));
-
-        if (!canRunHere) {
-            mongoutils::str::stream ss;
-            ss << "Explain's child command cannot run on this node. "
-               << "Are you explaining a write command on a secondary?";
-            appendCommandStatus(result, false, ss);
-            return false;
-        }
-
-        // Actually call the nested command's explain(...) method.
-        Status explainStatus = commToExplain->explain(txn, dbname, explainObj, verbosity, &result);
-        if (!explainStatus.isOK()) {
-            return appendCommandStatus(result, explainStatus);
-        }
-
+    bool collectsResourceConsumptionMetrics() const override {
         return true;
     }
 
-} // namespace mongo
+    std::string help() const override {
+        return "explain database reads and writes";
+    }
+
+private:
+    class Invocation;
+};
+
+class CmdExplain::Invocation final : public CommandInvocation {
+public:
+    Invocation(const CmdExplain* explainCommand,
+               const OpMsgRequest& request,
+               ExplainOptions::Verbosity verbosity,
+               std::unique_ptr<OpMsgRequest> innerRequest,
+               std::unique_ptr<CommandInvocation> innerInvocation)
+        : CommandInvocation(explainCommand),
+          _outerRequest{&request},
+          _dbName{_outerRequest->getDatabase().toString()},
+          _verbosity{std::move(verbosity)},
+          _innerRequest{std::move(innerRequest)},
+          _innerInvocation{std::move(innerInvocation)} {}
+
+    void run(OperationContext* opCtx, rpc::ReplyBuilderInterface* result) override {
+        // Explain is never allowed in multi-document transactions.
+        const bool inMultiDocumentTransaction = false;
+        uassert(50746,
+                "Explain's child command cannot run on this node. "
+                "Are you explaining a write command on a secondary?",
+                commandCanRunHere(
+                    opCtx, _dbName, _innerInvocation->definition(), inMultiDocumentTransaction));
+        _innerInvocation->explain(opCtx, _verbosity, result);
+    }
+
+    void explain(OperationContext* opCtx,
+                 ExplainOptions::Verbosity verbosity,
+                 rpc::ReplyBuilderInterface* result) override {
+        uasserted(ErrorCodes::IllegalOperation, "Explain cannot explain itself.");
+    }
+
+    NamespaceString ns() const override {
+        return _innerInvocation->ns();
+    }
+
+    bool supportsWriteConcern() const override {
+        return false;
+    }
+
+    /**
+     * You are authorized to run an explain if you are authorized to run
+     * the command that you are explaining. The auth check is performed recursively
+     * on the nested command.
+     */
+    void doCheckAuthorization(OperationContext* opCtx) const override {
+        _innerInvocation->checkAuthorization(opCtx, *_innerRequest);
+    }
+
+private:
+    const CmdExplain* command() const {
+        return static_cast<const CmdExplain*>(definition());
+    }
+
+    const OpMsgRequest* _outerRequest;
+    const std::string _dbName;
+    const NamespaceString _ns;
+    ExplainOptions::Verbosity _verbosity;
+    std::unique_ptr<OpMsgRequest> _innerRequest;  // Lifespan must enclose that of _innerInvocation.
+    std::unique_ptr<CommandInvocation> _innerInvocation;
+};
+
+std::unique_ptr<CommandInvocation> CmdExplain::parse(OperationContext* opCtx,
+                                                     const OpMsgRequest& request) {
+    CommandHelpers::uassertNoDocumentSequences(getName(), request);
+
+    // To enforce API versioning
+    auto cmdObj = ExplainCommandRequest::parse(
+        IDLParserErrorContext(ExplainCommandRequest::kCommandName,
+                              APIParameters::get(opCtx).getAPIStrict().value_or(false)),
+        request.body);
+    std::string dbname = cmdObj.getDbName().toString();
+    ExplainOptions::Verbosity verbosity = cmdObj.getVerbosity();
+    auto explainedObj = cmdObj.getCommandParameter();
+
+    // Extract 'comment' field from the 'explainedObj' only if there is no top-level comment.
+    auto commentField = explainedObj["comment"];
+    if (!opCtx->getComment() && commentField) {
+        opCtx->setComment(commentField.wrap());
+    }
+
+    if (auto innerDb = explainedObj["$db"]) {
+        uassert(ErrorCodes::InvalidNamespace,
+                str::stream() << "Mismatched $db in explain command. Expected " << dbname
+                              << " but got " << innerDb.checkAndGetStringData(),
+                innerDb.checkAndGetStringData() == dbname);
+    }
+    auto explainedCommand = CommandHelpers::findCommand(explainedObj.firstElementFieldName());
+    uassert(ErrorCodes::CommandNotFound,
+            str::stream() << "Explain failed due to unknown command: "
+                          << explainedObj.firstElementFieldName(),
+            explainedCommand);
+    auto innerRequest =
+        std::make_unique<OpMsgRequest>(OpMsgRequest::fromDBAndBody(dbname, explainedObj));
+    auto innerInvocation = explainedCommand->parseForExplain(opCtx, *innerRequest, verbosity);
+    return std::make_unique<Invocation>(
+        this, request, std::move(verbosity), std::move(innerRequest), std::move(innerInvocation));
+}
+
+CmdExplain cmdExplain;
+
+}  // namespace
+}  // namespace mongo

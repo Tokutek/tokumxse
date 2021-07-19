@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -8,62 +8,55 @@
 
 #include "util.h"
 
-static int usage(void);
+static int
+usage(void)
+{
+    static const char *options[] = {"-F",
+      "force salvage (by default salvage will refuse to salvage tables that fail basic tests)",
+      NULL, NULL};
+
+    util_usage("salvage [-F] uri", "options:", options);
+    return (1);
+}
 
 int
 util_salvage(WT_SESSION *session, int argc, char *argv[])
 {
-	WT_DECL_RET;
-	int ch;
-	const char *force;
-	char *name;
+    WT_DECL_RET;
+    int ch;
+    char *uri;
+    const char *force;
 
-	force = NULL;
-	name = NULL;
-	while ((ch = __wt_getopt(progname, argc, argv, "F")) != EOF)
-		switch (ch) {
-		case 'F':
-			force = "force";
-			break;
-		case '?':
-		default:
-			return (usage());
-		}
-	argc -= __wt_optind;
-	argv += __wt_optind;
+    force = NULL;
+    uri = NULL;
+    while ((ch = __wt_getopt(progname, argc, argv, "F")) != EOF)
+        switch (ch) {
+        case 'F':
+            force = "force";
+            break;
+        case '?':
+        default:
+            return (usage());
+        }
+    argc -= __wt_optind;
+    argv += __wt_optind;
 
-	/* The remaining argument is the file name. */
-	if (argc != 1)
-		return (usage());
-	if ((name = util_name(session, *argv, "file")) == NULL)
-		return (1);
+    /* The remaining argument is the file name. */
+    if (argc != 1)
+        return (usage());
+    if ((uri = util_uri(session, *argv, "file")) == NULL)
+        return (1);
 
-	if ((ret = session->salvage(session, name, force)) != 0) {
-		fprintf(stderr, "%s: salvage(%s): %s\n",
-		    progname, name, session->strerror(session, ret));
-		goto err;
-	}
+    if ((ret = session->salvage(session, uri, force)) != 0)
+        (void)util_err(session, ret, "session.salvage: %s", uri);
+    else {
+        /*
+         * Verbose configures a progress counter, move to the next line.
+         */
+        if (verbose)
+            printf("\n");
+    }
 
-	/* Verbose configures a progress counter, move to the next line. */
-	if (verbose)
-		printf("\n");
-
-	if (0) {
-err:		ret = 1;
-	}
-
-	if (name != NULL)
-		free(name);
-
-	return (ret);
-}
-
-static int
-usage(void)
-{
-	(void)fprintf(stderr,
-	    "usage: %s %s "
-	    "salvage [-F] uri\n",
-	    progname, usage_prefix);
-	return (1);
+    free(uri);
+    return (ret);
 }

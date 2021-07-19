@@ -1,0 +1,44 @@
+#!/bin/bash
+# postrm script for Percona Server for MongoDB
+#
+
+if [ -n "${PERCONA_DEBUG}" ]; then
+  set -x
+  export DEBCONF_DEBUG=developer
+fi
+
+set -e
+
+if [ -f /usr/share/debconf/confmodule ]; then
+  . /usr/share/debconf/confmodule
+fi
+
+case "$1" in
+    
+  purge|remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+  ;;
+
+  *)
+    echo "postrm called with unknown argument '$1'" 1>&2
+    exit 1
+  ;;
+
+esac
+
+if [ "$1" = "purge" ]; then
+  db_input high percona-server-mongodb-server/postrm_remove_databases || true
+  db_go || true
+  db_get percona-server-mongodb-server/postrm_remove_databases || true
+  if [ "$RET" = "true" ]; then
+    rm -rf /var/lib/mongodb
+    rm -rf /var/log/mongodb
+    rm -f /var/run/mongod.pid
+    userdel mongod || true
+  fi
+fi
+
+#DEBHELPER#
+
+exit 0
+
+

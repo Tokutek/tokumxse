@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,53 +30,52 @@
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/commands.h"
-#include "mongo/s/config.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/client/shard_registry.h"
+#include "mongo/s/grid.h"
 
 namespace mongo {
 namespace {
 
-    class NetStatCmd : public Command {
-    public:
-        NetStatCmd() : Command("netstat", false, "netstat") { }
+class NetStatCmd : public BasicCommand {
+public:
+    NetStatCmd() : BasicCommand("netstat") {}
 
-        virtual bool slaveOk() const {
-            return true;
-        }
+    std::string help() const override {
+        return "Shows status/reachability of servers in the cluster";
+    }
 
-        virtual bool adminOnly() const {
-            return true;
-        }
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
 
-        virtual bool isWriteCommandForConfigServer() const {
-            return false;
-        }
+    bool adminOnly() const override {
+        return true;
+    }
 
-        virtual void help(std::stringstream& help) const {
-            help << " shows status/reachability of servers in the cluster";
-        }
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
 
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::netstat);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
+    void addRequiredPrivileges(const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               std::vector<Privilege>* out) const override {
+        ActionSet actions;
+        actions.addAction(ActionType::netstat);
+        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    }
 
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+    bool run(OperationContext* opCtx,
+             const std::string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        auto const shardRegistry = Grid::get(opCtx)->shardRegistry();
+        result.append("configserver", shardRegistry->getConfigServerConnectionString().toString());
+        result.append("isdbgrid", 1);
+        return true;
+    }
 
-            result.append("configserver", configServer.getPrimary().getConnString());
-            result.append("isdbgrid", 1);
-            return true;
-        }
+} netstat;
 
-    } netstat;
-
-} // namespace
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

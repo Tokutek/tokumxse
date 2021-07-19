@@ -5,11 +5,10 @@
  *
  * like indexed_insert_text.js but the indexed value is an array of strings
  */
-load('jstests/concurrency/fsm_libs/extend_workload.js'); // for extendWorkload
-load('jstests/concurrency/fsm_workloads/indexed_insert_text.js'); // for $config
+load('jstests/concurrency/fsm_libs/extend_workload.js');           // for extendWorkload
+load('jstests/concurrency/fsm_workloads/indexed_insert_text.js');  // for $config
 
 var $config = extendWorkload($config, function($config, $super) {
-
     $config.states.init = function init(db, collName) {
         $super.states.init.apply(this, arguments);
     };
@@ -22,6 +21,13 @@ var $config = extendWorkload($config, function($config, $super) {
         }
         return textArr;
     };
+
+    // SERVER-21291: Reduce the thread count to alleviate PV1 failovers on
+    // Windows DEBUG hosts.
+    $config.threadCount = 5;
+
+    // Remove the shard key, since it cannot be a multikey index
+    delete $config.data.shardKey;
 
     return $config;
 });

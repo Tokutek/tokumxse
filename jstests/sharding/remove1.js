@@ -1,30 +1,53 @@
-s = new ShardingTest( "remove_shard1", 2 );
+(function() {
+'use strict';
 
-assert.eq( 2, s.config.shards.count() , "initial server count wrong" );
+var s = new ShardingTest({shards: 2, other: {enableBalancer: true}});
+var config = s.s0.getDB('config');
 
-assert.writeOK(s.config.databases.insert({ _id: 'local',
-                                           partitioned: false,
-                                           primary: 'shard0000'}));
-assert.writeOK(s.config.databases.insert({ _id: 'needToMove',
-                                           partitioned: false,
-                                           primary: 'shard0000'}));
+assert.commandWorked(s.s0.adminCommand({enableSharding: 'needToMove'}));
+s.ensurePrimaryShard('needToMove', s.shard0.shardName);
 
-// first remove puts in draining mode, the second tells me a db needs to move, the third actually removes
-assert( s.admin.runCommand( { removeshard: "shard0000" } ).ok , "failed to start draining shard" );
-assert( !s.admin.runCommand( { removeshard: "shard0001" } ).ok , "allowed two draining shards" );
-assert.eq( s.admin.runCommand( { removeshard: "shard0000" } ).dbsToMove, ['needToMove'] , "didn't show db to move" );
-s.getDB('needToMove').dropDatabase();
-assert( s.admin.runCommand( { removeshard: "shard0000" } ).ok , "failed to remove shard" );
-assert.eq( 1, s.config.shards.count() , "removed server still appears in count" );
+// Returns an error when trying to remove a shard that doesn't exist.
+assert.commandFailedWithCode(s.s0.adminCommand({removeshard: "shardz"}), ErrorCodes.ShardNotFound);
 
-assert( !s.admin.runCommand( { removeshard: "shard0001" } ).ok , "allowed removing last shard" );
+var topologyTime0 = config.shards.findOne({_id: s.shard0.shardName}).topologyTime;
+var topologyTime1 = config.shards.findOne({_id: s.shard1.shardName}).topologyTime;
+assert.gt(topologyTime1, topologyTime0);
 
-assert.isnull( s.config.databases.findOne({_id: 'local'}), 'should have removed local db');
+// First remove puts in draining mode, the second tells me a db needs to move, the third
+// actually removes
+assert.commandWorked(s.s0.adminCommand({removeshard: s.shard0.shardName}));
 
-// should create a shard0002 shard
-conn = startMongodTest( 29000 );
-assert( s.admin.runCommand( { addshard: "localhost:29000" } ).ok, "failed to add shard" );
-assert.eq( 2, s.config.shards.count(), "new server does not appear in count" );
+// Can't make all shards in the cluster draining
+assert.commandFailedWithCode(s.s0.adminCommand({removeshard: s.shard1.shardName}),
+                             ErrorCodes.IllegalOperation);
 
-stopMongod( 29000 );
+var removeResult = assert.commandWorked(s.s0.adminCommand({removeshard: s.shard0.shardName}));
+assert.eq(removeResult.dbsToMove, ['needToMove'], "didn't show db to move");
+
+s.s0.getDB('needToMove').dropDatabase();
+
+// Ensure the balancer moves the config.system.sessions collection chunks out of the shard being
+// removed
+s.awaitBalancerRound();
+
+removeResult = assert.commandWorked(s.s0.adminCommand({removeshard: s.shard0.shardName}));
+assert.eq('completed', removeResult.state, 'Shard was not removed: ' + tojson(removeResult));
+
+var existingShards = config.shards.find({}).toArray();
+assert.eq(
+    1, existingShards.length, "Removed server still appears in count: " + tojson(existingShards));
+
+var topologyTime2 = existingShards[0].topologyTime;
+assert.gt(topologyTime2, topologyTime1);
+
+assert.commandFailed(s.s0.adminCommand({removeshard: s.shard1.shardName}));
+
+// Should create a shard0002 shard
+var conn = MongoRunner.runMongod({shardsvr: ""});
+assert.commandWorked(s.s0.adminCommand({addshard: conn.host}));
+assert.eq(2, s.config.shards.count(), "new server does not appear in count");
+
+MongoRunner.stopMongod(conn);
 s.stop();
+})();

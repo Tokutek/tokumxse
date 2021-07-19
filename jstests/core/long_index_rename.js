@@ -1,17 +1,22 @@
-// SERVER-7720 Building an index with a too-long name should always fail
-// Formerly, we would allow an index that already existed to be "created" with too long a name,
-// but this caused secondaries to crash when replicating what should be a bad createIndex command.
-// Here we test that the too-long name is rejected in this situation as well
+// SERVER-7720 Building an index with a too-long name is acceptable since 4.2.
+// Previously, we would disallow index creation with with too long a name.
+// @tags: [requires_non_retryable_commands, assumes_unsharded_collection]
 
-t = db.long_index_rename;
-t.drop();
+(function() {
+'use strict';
 
-for (i = 1; i < 10; i++) {
-    t.save({a:i});
+const coll = db.long_index_rename;
+coll.drop();
+
+for (let i = 1; i < 10; i++) {
+    coll.save({a: i});
 }
 
-t.createIndex({a:1}, {name: "aaa"});
-var result = t.createIndex({a:1}, {name: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" +
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"});
-assert( !result.ok );
-assert( result.errmsg.indexOf( "too long" ) >= 0 );
+// Beginning with 4.2, index namespaces longer than 127 characters are acceptable.
+assert.commandWorked(coll.createIndex({b: 1}, {name: 'a'.repeat(8192)}));
+
+// Before 4.2, index namespace lengths were checked while renaming collections.
+const dest = db.long_index_rename2;
+dest.drop();
+assert.commandWorked(coll.renameCollection(dest.getName()));
+})();

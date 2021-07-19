@@ -1,91 +1,58 @@
-/**
- * @tags : [ hashed ] 
- */
-var st = new ShardingTest({ shards: 2, chunkSize: 1, other: { shardOptions: { verbose: 1 }} });
-st.stopBalancer();
+(function() {
+'use strict';
 
-var testDB = st.s.getDB('test');
-testDB.adminCommand({ enableSharding: 'test' });
-testDB.adminCommand({ shardCollection: 'test.user', key: { x: 'hashed' }});
+load("jstests/sharding/libs/find_chunks_util.js");
 
-var configDB = st.s.getDB('config');
-var chunkCountBefore = configDB.chunks.count();
+var st = new ShardingTest({shards: 2, chunkSize: 1});
+
+assert.commandWorked(st.s0.adminCommand({enableSharding: 'test'}));
+st.ensurePrimaryShard('test', st.shard1.shardName);
+assert.commandWorked(st.s0.adminCommand({shardCollection: 'test.user', key: {x: 'hashed'}}));
+
+var configDB = st.s0.getDB('config');
+var chunkCountBefore = findChunksUtil.countChunksForNs(configDB, 'test.user');
 assert.gt(chunkCountBefore, 1);
 
+var testDB = st.s0.getDB('test');
 for (var x = 0; x < 1000; x++) {
-    testDB.user.insert({ x: x });
+    testDB.user.insert({x: x});
 }
 
-// For debugging
-(function() {
-    var chunkList = configDB.chunks.find().sort({ min: -1 }).toArray();
-    chunkList.forEach(function(chunk) { chunk.count = 0; });
-
-    for (var x = 0; x < 1000; x++) {
-        var hashVal = testDB.adminCommand({ _hashBSONElement: x }).out;
-        var countSet = false;
-
-        for (var y = 0; y < chunkList.length - 2; y++) {
-            var chunkDoc = chunkList[y];
-            if (chunkDoc.min.x <= hashVal) {
-                countSet = true;
-                chunkDoc.count++;
-
-                print('doc in chunk: x [' + x + '], h[' + hashVal +
-                      '], min[' + chunkDoc.min.x +
-                      '], max[' + chunkDoc.max.x + ']');
-                break;
-            }
-        }
-
-        if (!countSet) {
-            chunkDoc = chunkList[chunkList.length - 1];
-            print('doc in chunk: x [' + x + '], h[' + hashVal +
-                  '], min[' + chunkDoc.min.x +
-                  '], max[' + chunkDoc.max.x + ']');
-            chunkDoc.count++;
-        }
-    }
-
-    chunkList.forEach(function(chunkDoc) {
-        print('chunk details: ' + tojson(chunkDoc));
-    });
-});
-
-var chunkDoc = configDB.chunks.find().sort({ min: 1 }).next();
+var chunkDoc = findChunksUtil.findChunksByNs(configDB, 'test.user').sort({min: 1}).next();
 var min = chunkDoc.min;
 var max = chunkDoc.max;
 
-// Assumption: There are documents in the MinKey chunk, otherwise, splitVector will
-// fail. Note: This chunk will have 267 documents if collection was presplit to 4.
-var cmdRes = testDB.adminCommand({ split: 'test.user', bounds: [ min, max ]});
-assert(cmdRes.ok, 'split on bounds failed on chunk[' + tojson(chunkDoc) +
-    ']: ' + tojson(cmdRes));
+// Assumption: There are documents in the MinKey chunk, otherwise, splitVector will fail.
+//
+// Note: This chunk will have 267 documents if collection was presplit to 4.
+var cmdRes = assert.commandWorked(st.s0.adminCommand({split: 'test.user', bounds: [min, max]}),
+                                  'Split on bounds failed for chunk [' + tojson(chunkDoc) + ']');
 
-chunkDoc = configDB.chunks.find().sort({ min: 1 }).skip(1).next();
-var middle = chunkDoc.min + 1000000;
+chunkDoc = findChunksUtil.findChunksByNs(configDB, 'test.user').sort({min: 1}).skip(1).next();
 
-cmdRes = testDB.adminCommand({ split: 'test.user', middle: { x: middle }});
-assert(cmdRes.ok, 'split failed with middle [' + middle + ']: ' + tojson(cmdRes));
+var middle = NumberLong(chunkDoc.min.x + 1000000);
+cmdRes = assert.commandWorked(st.s0.adminCommand({split: 'test.user', middle: {x: middle}}),
+                              'Split failed with middle [' + middle + ']');
 
-cmdRes = testDB.adminCommand({ split: 'test.user', find: { x: 7 }});
-assert(cmdRes.ok, 'split failed with find: ' + tojson(cmdRes));
+cmdRes = assert.commandWorked(st.s0.adminCommand({split: 'test.user', find: {x: 7}}),
+                              'Split failed with find.');
 
-var chunkList = configDB.chunks.find().sort({ min: 1 }).toArray();
+var chunkList = findChunksUtil.findChunksByNs(configDB, 'test.user').sort({min: 1}).toArray();
 assert.eq(chunkCountBefore + 3, chunkList.length);
 
 chunkList.forEach(function(chunkToMove) {
-    var toShard = configDB.shards.findOne({ _id: { $ne: chunkToMove.shard }})._id;
+    var toShard = configDB.shards.findOne({_id: {$ne: chunkToMove.shard}})._id;
 
-    print(jsTestName() + " - moving chunk " + chunkToMove._id + " from shard " +
-          chunkToMove.shard + " to " + toShard + "...");
+    print('Moving chunk ' + chunkToMove._id + ' from shard ' + chunkToMove.shard + ' to ' +
+          toShard + ' ...');
 
-    var cmdRes = testDB.adminCommand({ moveChunk: 'test.user',
-        bounds: [ chunkToMove.min, chunkToMove.max ],
-        to: toShard, _waitForDelete: true });
-    print(jsTestName() + " - result from moving chunk " + chunkToMove._id + ": " +
-          tojson(cmdRes));
+    assert.commandWorked(st.s0.adminCommand({
+        moveChunk: 'test.user',
+        bounds: [chunkToMove.min, chunkToMove.max],
+        to: toShard,
+        _waitForDelete: true
+    }));
 });
 
 st.stop();
-
+})();

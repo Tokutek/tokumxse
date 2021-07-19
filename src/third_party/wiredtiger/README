@@ -1,21 +1,29 @@
-WiredTiger 2.5.3: (March 26, 2015)
+WiredTiger 10.0.1: (April 12, 2021)
 
-This is version 2.5.3 of WiredTiger.
+This is version 10.0.1 of WiredTiger.
 
 WiredTiger release packages and documentation can be found at:
 
-	http://source.wiredtiger.com/
+	https://source.wiredtiger.com/
 
-Information on configuring, building and installing WiredTiger can be
-found at:
+The documentation for this specific release can be found at:
 
-	http://source.wiredtiger.com/2.5.3/install.html
+	https://source.wiredtiger.com/develop/index.html
+
+The WiredTiger source code can be found at:
+
+	https://github.com/wiredtiger/wiredtiger
+
+WiredTiger uses JIRA for issue management:
+
+	https://jira.mongodb.org/browse/WT
+
+Please do not report issues through GitHub.
 
 WiredTiger licensing information can be found at:
 
-	http://source.wiredtiger.com/license.html
+	https://source.wiredtiger.com/license.html
 
-For general questions and discussion, please use the WiredTiger mailing
-list:
+For general questions and discussion, there's a WiredTiger group:
 
-	http://groups.google.com/group/wiredtiger-users
+	https://groups.google.com/group/wiredtiger-users

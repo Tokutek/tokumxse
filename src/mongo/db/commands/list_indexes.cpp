@@ -1,207 +1,297 @@
-// list_indexes.cpp
-
 /**
-*    Copyright (C) 2014 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/db/catalog/collection.h"
-#include "mongo/db/catalog/collection_catalog_entry.h"
-#include "mongo/db/catalog/cursor_manager.h"
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/client.h"
+#include <memory>
+#include <utility>
+
+#include "mongo/bson/bsonobjbuilder.h"
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog/list_indexes.h"
 #include "mongo/db/clientcursor.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/curop.h"
+#include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/cursor_manager.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/exec/working_set.h"
-#include "mongo/db/global_environment_experiment.h"
-#include "mongo/db/query/find_constants.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/list_indexes_gen.h"
+#include "mongo/db/query/cursor_request.h"
+#include "mongo/db/query/cursor_response.h"
+#include "mongo/db/query/find_common.h"
+#include "mongo/db/query/plan_executor_factory.h"
+#include "mongo/db/service_context.h"
+#include "mongo/db/storage/durable_catalog.h"
 #include "mongo/db/storage/storage_engine.h"
+#include "mongo/db/timeseries/timeseries_index_schema_conversion_functions.h"
+#include "mongo/db/timeseries/timeseries_lookup.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/uuid.h"
 
 namespace mongo {
+namespace {
 
-    using std::string;
-    using std::stringstream;
-    using std::vector;
+/**
+ * Returns index specs, with resolved namespace, from the catalog for this listIndexes request.
+ */
+using IndexSpecsWithNamespaceString = std::pair<std::list<BSONObj>, NamespaceString>;
+IndexSpecsWithNamespaceString getIndexSpecsWithNamespaceString(OperationContext* opCtx,
+                                                               const ListIndexes& cmd) {
+    const auto& origNssOrUUID = cmd.getNamespaceOrUUID();
 
-    /**
-     * Lists the indexes for a given collection.
-     *
-     * Format:
-     * {
-     *   listIndexes: <collection name>
-     * }
-     *
-     * Return format:
-     * {
-     *   indexes: [
-     *     ...
-     *   ]
-     * }
-     */
-    class CmdListIndexes : public Command {
+    // Since time-series collections don't have UUIDs, we skip the time-series lookup
+    // if the target collection is specified as a UUID.
+    if (const auto& origNss = origNssOrUUID.nss()) {
+        if (auto timeseriesOptions = timeseries::getTimeseriesOptions(opCtx, *origNss)) {
+            auto bucketsNss = origNss->makeTimeseriesBucketsNamespace();
+            AutoGetCollectionForReadCommandMaybeLockFree autoColl(opCtx, bucketsNss);
+
+            const CollectionPtr& coll = autoColl.getCollection();
+            uassert(ErrorCodes::NamespaceNotFound,
+                    str::stream() << "ns does not exist: " << bucketsNss,
+                    coll);
+
+            return std::make_pair(
+                timeseries::createTimeseriesIndexesFromBucketsIndexes(
+                    *timeseriesOptions,
+                    listIndexesInLock(opCtx, coll, bucketsNss, cmd.getIncludeBuildUUIDs())),
+                *origNss);
+        }
+    }
+
+    AutoGetCollectionForReadCommandMaybeLockFree autoColl(opCtx, origNssOrUUID);
+
+    const auto& nss = autoColl.getNss();
+    const CollectionPtr& coll = autoColl.getCollection();
+    uassert(
+        ErrorCodes::NamespaceNotFound, str::stream() << "ns does not exist: " << nss.ns(), coll);
+
+    return std::make_pair(listIndexesInLock(opCtx, coll, nss, cmd.getIncludeBuildUUIDs()), nss);
+}
+
+/**
+ * Lists the indexes for a given collection.
+ * If 'includeBuildUUIDs' is true, then the index build uuid is also returned alongside the index
+ * spec for in-progress index builds only.
+ *
+ * Format:
+ * {
+ *   listIndexes: <collection name>,
+ *   includeBuildUUIDs: <boolean>,
+ * }
+ *
+ * Return format:
+ * {
+ *   indexes: [
+ *     <index>,
+ *     ...
+ *   ]
+ * }
+ *
+ * Where '<index>' is the index spec if either the index is ready or 'includeBuildUUIDs' is false.
+ * If the index is in-progress and 'includeBuildUUIDs' is true then '<index>' has the following
+ * format:
+ * {
+ *   spec: <index spec>,
+ *   buildUUID: <index build uuid>
+ * }
+ */
+
+class CmdListIndexes final : public ListIndexesCmdVersion1Gen<CmdListIndexes> {
+public:
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kOptIn;
+    }
+    bool maintenanceOk() const final {
+        return false;
+    }
+    bool adminOnly() const final {
+        return false;
+    }
+
+    bool collectsResourceConsumptionMetrics() const final {
+        return true;
+    }
+
+    std::string help() const final {
+        return "list indexes for a collection";
+    }
+
+    class Invocation final : public InvocationBaseGen {
     public:
-        virtual bool slaveOk() const { return false; }
-        virtual bool slaveOverrideOk() const { return true; }
-        virtual bool adminOnly() const { return false; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
+        using InvocationBaseGen::InvocationBaseGen;
 
-        virtual void help( stringstream& help ) const { help << "list indexes for a collection"; }
-
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::listIndexes);
-            out->push_back(Privilege(parseResourcePattern( dbname, cmdObj ), actions));
+        bool supportsWriteConcern() const final {
+            return false;
         }
 
-        CmdListIndexes() : Command( "listIndexes" ) {}
+        NamespaceString ns() const final {
+            auto nss = request().getNamespaceOrUUID();
+            if (nss.uuid()) {
+                // UUID requires opCtx to resolve, settle on just the dbname.
+                return NamespaceString(request().getDbName(), "");
+            }
+            invariant(nss.nss());
+            return nss.nss().get();
+        }
 
-        bool run(OperationContext* txn,
-                 const string& dbname,
-                 BSONObj& cmdObj,
-                 int,
-                 string& errmsg,
-                 BSONObjBuilder& result,
-                 bool /*fromRepl*/) {
+        void doCheckAuthorization(OperationContext* opCtx) const final {
+            AuthorizationSession* authzSession = AuthorizationSession::get(opCtx->getClient());
 
-            BSONElement first = cmdObj.firstElement();
+            auto& cmd = request();
             uassert(
-                28528,
-                str::stream() << "Argument to listIndexes must be of type String, not "
-                              << typeName(first.type()),
-                first.type() == String);
-            const NamespaceString ns(parseNs(dbname, cmdObj));
-            uassert(
-                28529,
-                str::stream() << "Argument to listIndexes must be a collection name, "
-                              << "not the empty string",
-                !ns.coll().empty());
+                ErrorCodes::Unauthorized,
+                "Unauthorized",
+                authzSession->isAuthorizedToParseNamespaceElement(request().getNamespaceOrUUID()));
 
-            const long long defaultBatchSize = std::numeric_limits<long long>::max();
-            long long batchSize;
-            Status parseCursorStatus = parseCommandCursorOptions(cmdObj,
-                                                                 defaultBatchSize,
-                                                                 &batchSize);
-            if (!parseCursorStatus.isOK()) {
-                return appendCommandStatus(result, parseCursorStatus);
+            const auto nss = CollectionCatalog::get(opCtx)->resolveNamespaceStringOrUUID(
+                opCtx, cmd.getNamespaceOrUUID());
+
+            uassert(ErrorCodes::Unauthorized,
+                    str::stream() << "Not authorized to list indexes on collection:" << nss.ns(),
+                    authzSession->isAuthorizedForActionsOnResource(
+                        ResourcePattern::forExactNamespace(nss), ActionType::listIndexes));
+        }
+
+        ListIndexesReply typedRun(OperationContext* opCtx) final {
+            CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+            auto indexSpecsWithNss = getIndexSpecsWithNamespaceString(opCtx, request());
+            const auto& indexList = indexSpecsWithNss.first;
+            const auto& nss = indexSpecsWithNss.second;
+            return ListIndexesReply(_makeCursor(opCtx, indexList, nss));
+        }
+
+    private:
+        /**
+         * Constructs a cursor that iterates the index specs found in 'indexSpecsWithNss'.
+         * This function does not hold any locks because it does not access in-memory
+         * or on-disk data.
+         */
+        ListIndexesReplyCursor _makeCursor(OperationContext* opCtx,
+                                           const std::list<BSONObj>& indexList,
+                                           const NamespaceString& nss) {
+            auto& cmd = request();
+
+            long long batchSize = std::numeric_limits<long long>::max();
+            if (cmd.getCursor() && cmd.getCursor()->getBatchSize()) {
+                batchSize = *cmd.getCursor()->getBatchSize();
             }
 
-            AutoGetCollectionForRead autoColl(txn, ns);
-            if (!autoColl.getDb()) {
-                return appendCommandStatus( result, Status( ErrorCodes::NamespaceNotFound,
-                                                            "no database" ) );
+            auto expCtx = make_intrusive<ExpressionContext>(
+                opCtx, std::unique_ptr<CollatorInterface>(nullptr), nss);
+
+            auto ws = std::make_unique<WorkingSet>();
+            auto root = std::make_unique<QueuedDataStage>(expCtx.get(), ws.get());
+
+            for (auto&& indexSpec : indexList) {
+                WorkingSetID id = ws->allocate();
+                WorkingSetMember* member = ws->get(id);
+                member->keyData.clear();
+                member->recordId = RecordId();
+                member->resetDocument(SnapshotId(), indexSpec.getOwned());
+                member->transitionToOwnedObj();
+                root->pushBack(id);
             }
 
-            const Collection* collection = autoColl.getCollection();
-            if (!collection) {
-                return appendCommandStatus( result, Status( ErrorCodes::NamespaceNotFound,
-                                                            "no collection" ) );
-            }
+            auto exec = uassertStatusOK(
+                plan_executor_factory::make(expCtx,
+                                            std::move(ws),
+                                            std::move(root),
+                                            &CollectionPtr::null,
+                                            PlanYieldPolicy::YieldPolicy::NO_YIELD,
+                                            false, /* whether returned BSON must be owned */
+                                            nss));
 
-            const CollectionCatalogEntry* cce = collection->getCatalogEntry();
-            invariant(cce);
-
-            vector<string> indexNames;
-            MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-                indexNames.clear();
-                cce->getAllIndexes( txn, &indexNames );
-            } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "listIndexes", ns.ns());
-
-            std::auto_ptr<WorkingSet> ws(new WorkingSet());
-            std::auto_ptr<QueuedDataStage> root(new QueuedDataStage(ws.get()));
-
-            for ( size_t i = 0; i < indexNames.size(); i++ ) {
-                BSONObj indexSpec;
-                MONGO_WRITE_CONFLICT_RETRY_LOOP_BEGIN {
-                    indexSpec = cce->getIndexSpec( txn, indexNames[i] );
-                } MONGO_WRITE_CONFLICT_RETRY_LOOP_END(txn, "listIndexes", ns.ns());
-
-                WorkingSetMember member;
-                member.state = WorkingSetMember::OWNED_OBJ;
-                member.keyData.clear();
-                member.loc = RecordId();
-                member.obj = Snapshotted<BSONObj>(SnapshotId(), indexSpec.getOwned());
-                root->pushBack(member);
-            }
-
-            std::string cursorNamespace = str::stream() << dbname << ".$cmd." << name << "."
-                                                        << ns.coll();
-            dassert(NamespaceString(cursorNamespace).isValid());
-            dassert(NamespaceString(cursorNamespace).isListIndexesGetMore());
-            dassert(ns == NamespaceString(cursorNamespace).getTargetNSForListIndexesGetMore());
-
-            PlanExecutor* rawExec;
-            Status makeStatus = PlanExecutor::make(txn,
-                                                   ws.release(),
-                                                   root.release(),
-                                                   cursorNamespace,
-                                                   PlanExecutor::YIELD_MANUAL,
-                                                   &rawExec);
-            std::auto_ptr<PlanExecutor> exec(rawExec);
-            if (!makeStatus.isOK()) {
-                return appendCommandStatus( result, makeStatus );
-            }
-
-            BSONArrayBuilder firstBatch;
-
-            const int byteLimit = MaxBytesToReturnToClientAtOnce;
-            for (long long objCount = 0;
-                 objCount < batchSize && firstBatch.len() < byteLimit;
-                 objCount++) {
-                BSONObj next;
-                PlanExecutor::ExecState state = exec->getNext(&next, NULL);
-                if ( state == PlanExecutor::IS_EOF ) {
+            std::vector<mongo::ListIndexesReplyItem> firstBatch;
+            int bytesBuffered = 0;
+            for (long long objCount = 0; objCount < batchSize; objCount++) {
+                BSONObj nextDoc;
+                PlanExecutor::ExecState state = exec->getNext(&nextDoc, nullptr);
+                if (state == PlanExecutor::IS_EOF) {
                     break;
                 }
-                invariant( state == PlanExecutor::ADVANCED );
-                firstBatch.append(next);
+                invariant(state == PlanExecutor::ADVANCED);
+
+                // If we can't fit this result inside the current batch, then we stash it for
+                // later.
+                if (!FindCommon::haveSpaceForNext(nextDoc, objCount, bytesBuffered)) {
+                    exec->enqueue(nextDoc);
+                    break;
+                }
+
+                try {
+                    firstBatch.push_back(ListIndexesReplyItem::parse(
+                        IDLParserErrorContext("ListIndexesReplyItem"), nextDoc));
+                } catch (const DBException& exc) {
+                    LOGV2_ERROR(5254500,
+                                "Could not parse catalog entry while replying to listIndexes",
+                                "entry"_attr = nextDoc,
+                                "error"_attr = exc);
+                    uasserted(5254501,
+                              "Could not parse catalog entry while replying to listIndexes");
+                }
+                bytesBuffered += nextDoc.objsize();
             }
 
-            CursorId cursorId = 0LL;
-            if ( !exec->isEOF() ) {
-                exec->saveState();
-                ClientCursor* cursor = new ClientCursor(CursorManager::getGlobalCursorManager(),
-                                                        exec.release(),
-                                                        cursorNamespace);
-                cursorId = cursor->cursorid();
+            if (exec->isEOF()) {
+                return ListIndexesReplyCursor(0 /* cursorId */, nss, std::move(firstBatch));
             }
 
-            Command::appendCursorResponseObject( cursorId, cursorNamespace, firstBatch.arr(),
-                                                 &result );
+            exec->saveState();
+            exec->detachFromOperationContext();
 
-            return true;
+            // Global cursor registration must be done without holding any locks.
+            auto pinnedCursor = CursorManager::get(opCtx)->registerCursor(
+                opCtx,
+                {std::move(exec),
+                 nss,
+                 AuthorizationSession::get(opCtx->getClient())->getAuthenticatedUserNames(),
+                 APIParameters::get(opCtx),
+                 opCtx->getWriteConcern(),
+                 repl::ReadConcernArgs::get(opCtx),
+                 cmd.toBSON({}),
+                 {Privilege(ResourcePattern::forExactNamespace(nss), ActionType::listIndexes)}});
+
+            pinnedCursor->incNBatches();
+            pinnedCursor->incNReturnedSoFar(firstBatch.size());
+
+            return ListIndexesReplyCursor(
+                pinnedCursor.getCursor()->cursorid(), nss, std::move(firstBatch));
         }
+    };
+} cmdListIndexes;
 
-    } cmdListIndexes;
-
-}
+}  // namespace
+}  // namespace mongo

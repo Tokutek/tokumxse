@@ -1,0 +1,117 @@
+# This file is part of Percona Server for MongoDB.
+#
+# Copyright (C) 2018-present Percona and/or its affiliates. All rights reserved.
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the Server Side Public License, version 1,
+#    as published by MongoDB, Inc.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    Server Side Public License for more details.
+#
+#    You should have received a copy of the Server Side Public License
+#    along with this program. If not, see
+#    <http://www.mongodb.com/licensing/server-side-public-license>.
+#
+#    As a special exception, the copyright holders give permission to link the
+#    code of portions of this program with the OpenSSL library under certain
+#    conditions as described in each individual source file and distribute
+#    linked combinations including the program with the OpenSSL library. You
+#    must comply with the Server Side Public License in all respects for
+#    all of the code used other than as permitted herein. If you modify file(s)
+#    with this exception, you may extend this exception to your version of the
+#    file(s), but you are not obligated to do so. If you do not wish to do so,
+#    delete this exception statement from your version. If you delete this
+#    exception statement from all source files in the program, then also delete
+#    it in the license file.
+#
+
+global:
+  cpp_namespace: "mongo"
+  configs:
+    source: [ cli]
+    initializer:
+      register: addPerconaDecryptOptions
+  cpp_includes:
+    - "mongo/tools/perconadecrypt_options.h"
+
+configs:
+  help:
+    description: "show this usage information"
+    short_name: help
+    arg_vartype: Switch
+
+  version:
+    description: 'show version information'
+    short_name: version
+    arg_vartype: Switch
+
+  inputPath:
+    description: "encrypted file to decrypt"
+    short_name: inputPath
+    arg_vartype: String
+
+  outputPath:
+    description: "where to store decrypted result"
+    short_name: outputPath
+    arg_vartype: String
+
+  encryptionKeyFile:
+    description: "the path to encryption key file"
+    short_name: encryptionKeyFile
+    arg_vartype: String
+
+  encryptionCipherMode:
+    description: "the cipher mode to use for decryption (AES256-CBC/AES256-GCM)"
+    short_name: encryptionCipherMode
+    arg_vartype: String
+    validator:
+      callback: validateEncryptionCipherModeSetting
+
+  vaultServerName:
+    description: "hostname or IP address of the Vault server"
+    short_name: vaultServerName
+    arg_vartype: String
+    requires: [ vaultPort, vaultTokenFile, vaultSecret ]
+    conflicts: encryptionKeyFile
+
+  vaultPort:
+    description: "port name the Vault server is listening on"
+    short_name: vaultPort
+    arg_vartype: Int
+    requires: vaultServerName
+    validator:
+      gte: 0
+      lte: 65535
+
+  vaultTokenFile:
+    description: "the path to file with Vault server's access token"
+    short_name: vaultTokenFile
+    arg_vartype: String
+    requires: vaultServerName
+
+  vaultSecret:
+    description: "the name of the Vault secret where the master key is stored"
+    short_name: vaultSecret
+    arg_vartype: String
+    requires: vaultServerName
+
+  vaultServerCAFile:
+    description: >-
+      CA certificate that was used to sign Vault's certificates
+      - should be used when the Vault's CA certificate is not trusted
+      by the machine that is going to connect to the Vault server
+    short_name: vaultServerCAFile
+    arg_vartype: String
+    requires: vaultServerName
+
+  vaultDisableTLSForTesting:
+    description: >-
+      disable using TLS for Vault server connections
+      - is suitable for connecting Vault server in -dev mode or
+      Vault server with TLS disabled. Should not be used in production
+    short_name: vaultDisableTLSForTesting
+    arg_vartype: Switch
+    requires: vaultServerName

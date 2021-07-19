@@ -1,17 +1,20 @@
 // server 6779: serializing ExpressionCoerceToBool
 // This test only fails in debug mode with the bug since that tests round-tripping
+(function() {
+"use strict";
+
 function test(op, val) {
-    t = db.server6779;
-    t.drop();
+    const coll = db.server6779;
+    coll.drop();
+    assert.commandWorked(coll.insert({a: true}));
+    assert.commandWorked(coll.insert({a: false}));
 
-    t.insert({a:true});
-    t.insert({a:false});
-
-    obj = {};
+    const obj = {};
     obj[op] = ['$a', val];
-    result = t.aggregate({$project: {_id: 0, bool: obj}});
+    const result = coll.aggregate([{$project: {_id: 0, bool: obj}}, {$sort: {bool: -1}}]);
 
-    assert.eq(result.toArray(), [{bool:true}, {bool:false}]);
+    assert.eq(result.toArray(), [{bool: true}, {bool: false}]);
 }
 test('$and', true);
 test('$or', false);
+}());

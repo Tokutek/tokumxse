@@ -3,16 +3,24 @@
 Exhaustive test for authorization of commands with builtin roles.
 
 The test logic implemented here operates on the test cases defined
-in jstests/auth/commands.js.
+in jstests/auth/lib/commands_lib.js
+
+@tags: [requires_sharding]
 
 */
+
+// This test involves killing all sessions, which will not work as expected if the kill command is
+// sent with an implicit session.
+TestData.disableImplicitSessions = true;
 
 load("jstests/auth/lib/commands_lib.js");
 
 var roles = [
     {key: "read", role: "read", dbname: firstDbName},
+    {key: "readLocal", role: {role: "read", db: "local"}, dbname: adminDbName},
     {key: "readAnyDatabase", role: "readAnyDatabase", dbname: adminDbName},
     {key: "readWrite", role: "readWrite", dbname: firstDbName},
+    {key: "readWriteLocal", role: {role: "readWrite", db: "local"}, dbname: adminDbName},
     {key: "readWriteAnyDatabase", role: "readWriteAnyDatabase", dbname: adminDbName},
     {key: "userAdmin", role: "userAdmin", dbname: firstDbName},
     {key: "userAdminAnyDatabase", role: "userAdminAnyDatabase", dbname: adminDbName},
@@ -20,6 +28,7 @@ var roles = [
     {key: "dbAdminAnyDatabase", role: "dbAdminAnyDatabase", dbname: adminDbName},
     {key: "clusterAdmin", role: "clusterAdmin", dbname: adminDbName},
     {key: "dbOwner", role: "dbOwner", dbname: firstDbName},
+    {key: "enableSharding", role: "enableSharding", dbname: firstDbName},
     {key: "clusterMonitor", role: "clusterMonitor", dbname: adminDbName},
     {key: "hostManager", role: "hostManager", dbname: adminDbName},
     {key: "clusterManager", role: "clusterManager", dbname: adminDbName},
@@ -45,41 +54,39 @@ function testProperAuthorization(conn, t, testcase, r) {
     var out = "";
 
     var runOnDb = conn.getDB(testcase.runOnDb);
-    authCommandsLib.setup(conn, t, runOnDb);
-    assert(r.db.auth("user|" + r.role, "password"));
-    var res = runOnDb.runCommand(t.command);
+    var state = authCommandsLib.setup(conn, t, runOnDb);
+    assert(r.db.auth("user|" + r.key, "password"));
+    authCommandsLib.authenticatedSetup(t, runOnDb);
+    var command = t.command;
+    if (typeof (command) === "function") {
+        command = t.command(state, testcase.commandArgs);
+    }
+    var res = runOnDb.runCommand(command);
 
-    if (testcase.roles[r.role]) {
+    if (testcase.roles[r.key]) {
         if (res.ok == 0 && res.code == authErrCode) {
             out = "expected authorization success" +
-                  " but received " + tojson(res) + 
-                  " on db " + testcase.runOnDb +
-                  " with role " + r.key;
-        }
-        else if (res.ok == 0 && !testcase.expectFail && res.code != commandNotSupportedCode) {
+                " but received " + tojson(res) + " on db " + testcase.runOnDb + " with role " +
+                r.key;
+        } else if (res.ok == 0 && !testcase.expectFail && res.code != commandNotSupportedCode) {
             // don't error if the test failed with code commandNotSupported since
-            // some storage engines (e.g wiredTiger) don't support some commands (e.g. touch)
-            out = "command failed with " + tojson(res) +
-                  " on db " + testcase.runOnDb +
-                  " with role " + r.key;
+            // some storage engines don't support some commands.
+            out = "command failed with " + tojson(res) + " on db " + testcase.runOnDb +
+                " with role " + r.key;
         }
-        // test can provide a function that will run if
-        // the command completed successfully
-        else if (testcase.onSuccess) {
-            testcase.onSuccess(res);
-        }
-    }
-    else {
-        if (res.ok == 1 || (res.ok == 0 && res.code != authErrCode)) {
+    } else {
+        // Don't error if the test failed with CommandNotFound rather than an authorization failure
+        // because some commands may be guarded by feature flags.
+        if (res.ok == 1 ||
+            (res.ok == 0 && res.code != authErrCode && res.code !== ErrorCodes.CommandNotFound)) {
             out = "expected authorization failure" +
-                  " but received result " + tojson(res) +
-                  " on db " + testcase.runOnDb +
-                  " with role " + r.key;
+                " but received result " + tojson(res) + " on db " + testcase.runOnDb +
+                " with role " + r.key;
         }
     }
 
     r.db.logout();
-    authCommandsLib.teardown(conn, t, runOnDb);
+    authCommandsLib.teardown(conn, t, runOnDb, res);
     return out;
 }
 
@@ -104,17 +111,13 @@ function runOneTest(conn, t) {
 
 function createUsers(conn) {
     var adminDb = conn.getDB(adminDbName);
-    adminDb.createUser({
-        user: "admin",
-        pwd: "password",
-        roles: ["__system"]
-    });
+    adminDb.createUser({user: "admin", pwd: "password", roles: ["__system"]});
 
     assert(adminDb.auth("admin", "password"));
     for (var i = 0; i < roles.length; i++) {
         r = roles[i];
         r.db = conn.getDB(r.dbname);
-        r.db.createUser({user: "user|" + r.role, pwd: "password", roles: [r.role]});
+        r.db.createUser({user: "user|" + r.key, pwd: "password", roles: [r.role]});
     }
     adminDb.logout();
 }
@@ -132,27 +135,27 @@ function checkForNonExistentRoles() {
             for (role in testcase.roles) {
                 var roleExists = false;
                 for (var k = 0; k < roles.length; k++) {
-                    if (roles[k].role === role) {
+                    if (roles[k].key === role) {
                         roleExists = true;
                         break;
                     }
                 }
-                assert(roleExists, "Role " + role + " found in test: " + test.testname +
-                       ", but doesn't exist in roles array");
+                assert(roleExists,
+                       "Role " + role + " found in test: " + test.testname +
+                           ", but doesn't exist in roles array");
             }
         }
     }
-}    
+}
 
+const dbPath = MongoRunner.toRealDir("$dataDir/commands_built_in_roles/");
+mkdir(dbPath);
 var opts = {
-    auth:"",
-    enableExperimentalIndexStatsCmd: "",
-    enableExperimentalStorageDetailsCmd: ""
-}
-var impls = {
-    createUsers: createUsers,
-    runOneTest: runOneTest
-}
+    auth: "",
+    enableExperimentalStorageDetailsCmd: "",
+    setParameter: "trafficRecordingDirectory=" + dbPath
+};
+var impls = {createUsers: createUsers, runOneTest: runOneTest};
 
 checkForNonExistentRoles();
 
@@ -163,11 +166,12 @@ MongoRunner.stopMongod(conn);
 
 // run all tests sharded
 conn = new ShardingTest({
-    shards: 2,
+    shards: 1,
     mongos: 1,
+    config: 1,
     keyFile: "jstests/libs/key1",
-    other: { shardOptions: opts }
+    other:
+        {shardOptions: opts, mongosOptions: {setParameter: "trafficRecordingDirectory=" + dbPath}}
 });
 authCommandsLib.runTests(conn, impls);
 conn.stop();
-

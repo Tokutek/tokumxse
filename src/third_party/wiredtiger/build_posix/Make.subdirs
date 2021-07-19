@@ -1,30 +1,54 @@
 # List of sub-directories, used by makemake to create Makefile.am
 #
 # The format is:
-#   <dir> [<condition>]
+#   <dir> [<condition> ...]
 #
 # If the directory exists, it is added to AUTO_SUBDIRS.
-# If a condition is included, the subdir is made conditional via AM_CONDITIONAL
+# If condition(s) are included, the subdir is made conditional via
+# AM_CONDITIONAL.  All conditions must be true to include the directory.
 ext/collators/reverse
-ext/compressors/bzip2 BZIP2
+ext/collators/revint
 ext/compressors/lz4 LZ4
 ext/compressors/nop
 ext/compressors/snappy SNAPPY
 ext/compressors/zlib ZLIB
-ext/datasources/helium HAVE_HELIUM
-ext/test/kvs_bdb HAVE_BERKELEY_DB
+ext/compressors/zstd ZSTD
+ext/encryptors/nop
+ext/encryptors/rotn
+ext/extractors/csv
+ext/storage_sources/local_store POSIX_HOST
+ext/test/fail_fs
+ext/test/local_store
 .
-api/leveldb LEVELDB
-bench/wtperf
-examples/c
-lang/java JAVA
-examples/java JAVA
 lang/python PYTHON
+
+# Test/Benchmark/Examples support library.
+test/utility
+
+# Example programs.
+examples/c
+
+# Test programs.
 test/bloom
 test/checkpoint
+test/cppsuite HAVE_CXX
+test/csuite
+test/cursor_order
 test/fops
-test/format HAVE_BERKELEY_DB
+test/format
+test/fuzz POSIX_HOST LIBFUZZER
 test/huge
+test/import
+test/manydbs
 test/packing
+test/readonly
 test/salvage
+test/syscall
 test/thread
+
+# Benchmark programs.
+bench/workgen PYTHON HAVE_CXX
+bench/wtperf
+
+# Utility programs.
+tools/xray_to_optrack LLVM HAVE_CXX

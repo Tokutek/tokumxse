@@ -1,5 +1,5 @@
 /*-
- * Public Domain 2014-2015 MongoDB, Inc.
+ * Public Domain 2014-present MongoDB, Inc.
  * Public Domain 2008-2014 WiredTiger, Inc.
  *
  * This is free and unencumbered software released into the public domain.
@@ -28,87 +28,77 @@
 
 #include "wtperf.h"
 
-int
-enomem(const CONFIG *cfg)
-{
-	const char *msg;
-
-	msg = "Unable to allocate memory";
-	if (cfg->logf == NULL)
-		fprintf(stderr, "%s\n", msg);
-	else
-		lprintf(cfg, ENOMEM, 0, "%s", msg);
-	return (ENOMEM);
-}
-
 /* Setup the logging output mechanism. */
 int
-setup_log_file(CONFIG *cfg)
+setup_log_file(WTPERF *wtperf)
 {
-	int ret;
-	char *fname;
+    CONFIG_OPTS *opts;
+    size_t len;
+    int ret;
+    char *fname;
 
-	ret = 0;
+    opts = wtperf->opts;
+    ret = 0;
 
-	if (cfg->verbose < 1)
-		return (0);
+    if (opts->verbose < 1)
+        return (0);
 
-	if ((fname = calloc(strlen(cfg->monitor_dir) +
-	    strlen(cfg->table_name) + strlen(".stat") + 2, 1)) == NULL)
-		return (enomem(cfg));
+    len = strlen(wtperf->monitor_dir) + strlen(opts->table_name) + strlen(".stat") + 2;
+    fname = dmalloc(len);
+    testutil_check(__wt_snprintf(fname, len, "%s/%s.stat", wtperf->monitor_dir, opts->table_name));
+    if ((wtperf->logf = fopen(fname, "w")) == NULL) {
+        ret = errno;
+        fprintf(stderr, "%s: %s\n", fname, strerror(ret));
+    }
+    free(fname);
+    if (wtperf->logf == NULL)
+        return (ret);
 
-	sprintf(fname, "%s/%s.stat", cfg->monitor_dir, cfg->table_name);
-	cfg->logf = fopen(fname, "w");
-	if (cfg->logf == NULL) {
-		ret = errno;
-		fprintf(stderr, "%s: %s\n", fname, strerror(ret));
-	}
-	free(fname);
-	if (cfg->logf == NULL)
-		return (ret);
-
-	/* Use line buffering for the log file. */
-	(void)setvbuf(cfg->logf, NULL, _IOLBF, 32);
-	return (0);
+    /* Use line buffering for the log file. */
+    __wt_stream_set_line_buffer(wtperf->logf);
+    return (0);
 }
 
 /*
  * Log printf - output a log message.
  */
 void
-lprintf(const CONFIG *cfg, int err, uint32_t level, const char *fmt, ...)
+lprintf(const WTPERF *wtperf, int err, uint32_t level, const char *fmt, ...)
 {
-	va_list ap;
+    CONFIG_OPTS *opts;
+    va_list ap;
 
-	if (err == 0 && level <= cfg->verbose) {
-		va_start(ap, fmt);
-		vfprintf(cfg->logf, fmt, ap);
-		va_end(ap);
-		fprintf(cfg->logf, "\n");
+    opts = wtperf->opts;
 
-		if (level < cfg->verbose) {
-			va_start(ap, fmt);
-			vprintf(fmt, ap);
-			va_end(ap);
-			printf("\n");
-		}
-	}
-	if (err == 0)
-		return;
+    if (err == 0 && level <= opts->verbose) {
+        va_start(ap, fmt);
+        vfprintf(wtperf->logf, fmt, ap);
+        va_end(ap);
+        fprintf(wtperf->logf, "\n");
 
-	/* We are dealing with an error. */
-	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	va_end(ap);
-	fprintf(stderr, " Error: %s\n", wiredtiger_strerror(err));
-	if (cfg->logf != NULL) {
-		va_start(ap, fmt);
-		vfprintf(cfg->logf, fmt, ap);
-		va_end(ap);
-		fprintf(cfg->logf, " Error: %s\n", wiredtiger_strerror(err));
-	}
+        if (level < opts->verbose) {
+            va_start(ap, fmt);
+            vprintf(fmt, ap);
+            va_end(ap);
+            printf("\n");
+        }
+    }
+    if (err == 0)
+        return;
 
-	/* Never attempt to continue if we got a panic from WiredTiger. */
-	if (err == WT_PANIC)
-		abort();
+    /* We are dealing with an error. */
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, " Error: %s\n", wiredtiger_strerror(err));
+    if (wtperf->logf != NULL) {
+        va_start(ap, fmt);
+        vfprintf(wtperf->logf, fmt, ap);
+        va_end(ap);
+        fprintf(wtperf->logf, " Error: %s\n", wiredtiger_strerror(err));
+    }
+
+    /* Never attempt to continue if we got a panic from WiredTiger. */
+    if (err == WT_PANIC)
+        abort();
 }

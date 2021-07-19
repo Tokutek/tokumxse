@@ -1,131 +1,238 @@
-// util/base64.cpp
-
-
-/*    Copyright 2009 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/util/base64.h"
 
-namespace mongo {
+#include "mongo/util/assert_util.h"
 
-    using std::string;
-    using std::stringstream;
+#include <array>
+#include <cstdint>
+#include <iostream>
 
-    namespace base64 {
+namespace mongo::base64 {
+namespace {
 
-        Alphabet alphabet;
+constexpr unsigned char kInvalid = ~0;
 
-        void encode( stringstream& ss , const char * data , int size ) {
-            for ( int i=0; i<size; i+=3 ) {
-                int left = size - i;
-                const unsigned char * start = (const unsigned char*)data + i;
+constexpr std::size_t search(StringData table, int c) {
+    for (std::size_t i = 0; i < table.size(); ++i)
+        if (table[i] == c)
+            return i;
+    return kInvalid;
+}
 
-                // byte 0
-                ss << alphabet.e(start[0]>>2);
+template <std::size_t... Cs>
+constexpr auto invertTable(StringData table, std::index_sequence<Cs...>) {
+    return std::array<unsigned char, sizeof...(Cs)>{
+        {static_cast<unsigned char>(search(table, Cs))...}};
+}
 
-                // byte 1
-                unsigned char temp = ( start[0] << 4 );
-                if ( left == 1 ) {
-                    ss << alphabet.e(temp);
-                    break;
-                }
-                temp |= ( ( start[1] >> 4 ) & 0xF );
-                ss << alphabet.e(temp);
+constexpr StringData kEncodeTable =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"_sd;
 
-                // byte 2
-                temp = ( start[1] & 0xF ) << 2;
-                if ( left == 2 ) {
-                    ss << alphabet.e(temp);
-                    break;
-                }
-                temp |= ( ( start[2] >> 6 ) & 0x3 );
-                ss << alphabet.e(temp);
+constexpr auto kDecodeTable = invertTable(kEncodeTable, std::make_index_sequence<256>{});
 
-                // byte 3
-                ss << alphabet.e(start[2] & 0x3f);
-            }
+bool valid(unsigned char x) {
+    return kDecodeTable[x] != kInvalid;
+}
 
-            int mod = size % 3;
-            if ( mod == 1 ) {
-                ss << "==";
-            }
-            else if ( mod == 2 ) {
-                ss << "=";
-            }
+template <typename Writer>
+void encodeImpl(Writer&& write, StringData in) {
+    const char* data = in.rawData();
+    std::size_t size = in.size();
+    auto readOctet = [&data] { return static_cast<std::uint8_t>(*data++); };
+    auto encodeSextet = [](unsigned x) { return kEncodeTable[x & 0b11'1111]; };
+
+    std::array<char, 512> buf;
+    std::array<char, 512>::iterator p;
+    std::uint32_t accum;
+
+    for (std::size_t fullGroups = size / 3; fullGroups;) {
+        std::size_t chunkGroups = std::min(fullGroups, sizeof(buf) / 4);
+        fullGroups -= chunkGroups;
+        p = buf.begin();
+        while (chunkGroups--) {
+            accum = 0;
+            accum |= readOctet() << (8 * (2 - 0));
+            accum |= readOctet() << (8 * (2 - 1));
+            accum |= readOctet() << (8 * (2 - 2));
+            *p++ = encodeSextet(accum >> (6 * (3 - 0)));
+            *p++ = encodeSextet(accum >> (6 * (3 - 1)));
+            *p++ = encodeSextet(accum >> (6 * (3 - 2)));
+            *p++ = encodeSextet(accum >> (6 * (3 - 3)));
         }
 
+        write(buf.data(), p - buf.begin());
+    }
 
-        string encode( const char * data , int size ) {
-            stringstream ss;
-            encode( ss , data ,size );
-            return ss.str();
-        }
-
-        string encode( const string& s ) {
-            return encode( s.c_str() , s.size() );
-        }
-
-
-        void decode( stringstream& ss , const string& s ) {
-            uassert( 10270 ,  "invalid base64" , s.size() % 4 == 0 );
-            const unsigned char * data = (const unsigned char*)s.c_str();
-            int size = s.size();
-
-            unsigned char buf[3];
-            for ( int i=0; i<size; i+=4) {
-                const unsigned char * start = data + i;
-                buf[0] = ( ( alphabet.decode[start[0]] << 2 ) & 0xFC ) | ( ( alphabet.decode[start[1]] >> 4 ) & 0x3 );
-                buf[1] = ( ( alphabet.decode[start[1]] << 4 ) & 0xF0 ) | ( ( alphabet.decode[start[2]] >> 2 ) & 0xF );
-                buf[2] = ( ( alphabet.decode[start[2]] << 6 ) & 0xC0 ) | ( ( alphabet.decode[start[3]] & 0x3F ) );
-
-                int len = 3;
-                if ( start[3] == '=' ) {
-                    len = 2;
-                    if ( start[2] == '=' ) {
-                        len = 1;
-                    }
-                }
-                ss.write( (const char*)buf , len );
-            }
-        }
-
-        string decode( const string& s ) {
-            stringstream ss;
-            decode( ss , s );
-            return ss.str();
-        }
-
-        const char* chars =
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            "abcdefghijklmnopqrstuvwxyz"
-            "0123456789+/=";
-
+    switch (size % 3) {
+        case 2:
+            p = buf.begin();
+            accum = 0;
+            accum |= readOctet() << (8 * (2 - 0));
+            accum |= readOctet() << (8 * (2 - 1));
+            *p++ = encodeSextet(accum >> (6 * (3 - 0)));
+            *p++ = encodeSextet(accum >> (6 * (3 - 1)));
+            *p++ = encodeSextet(accum >> (6 * (3 - 2)));
+            *p++ = '=';
+            write(buf.data(), p - buf.begin());
+            break;
+        case 1:
+            p = buf.begin();
+            accum = 0;
+            accum |= readOctet() << (8 * (2 - 0));
+            *p++ = encodeSextet(accum >> (6 * (3 - 0)));
+            *p++ = encodeSextet(accum >> (6 * (3 - 1)));
+            *p++ = '=';
+            *p++ = '=';
+            write(buf.data(), p - buf.begin());
+            break;
+        case 0:
+            break;
     }
 }
 
+template <typename Writer>
+void decodeImpl(const Writer& write, StringData in) {
+    const char* data = in.rawData();
+    std::size_t size = in.size();
+    if (size == 0)
+        return;
+    uassert(10270, "invalid base64", size % 4 == 0);
+
+    auto decodeSextet = [](char x) {
+        auto c = kDecodeTable[static_cast<unsigned char>(x)];
+        uassert(40537, "Invalid base64 character", c != kInvalid);
+        return c;
+    };
+
+    std::array<char, 512> buf;
+    std::array<char, 512>::iterator p;
+    std::uint32_t accum;
+
+    // All but the final group to avoid '='-related conditionals in the bulk path.
+    for (std::size_t groups = size / 4 - 1; groups;) {
+        std::size_t chunkGroups = std::min(groups, buf.size() / 3);
+        groups -= chunkGroups;
+        p = buf.begin();
+        while (chunkGroups--) {
+            accum = 0;
+            accum |= decodeSextet(*data++) << (6 * (3 - 0));
+            accum |= decodeSextet(*data++) << (6 * (3 - 1));
+            accum |= decodeSextet(*data++) << (6 * (3 - 2));
+            accum |= decodeSextet(*data++) << (6 * (3 - 3));
+            *p++ = (accum >> (8 * (2 - 0))) & 0xff;
+            *p++ = (accum >> (8 * (2 - 1))) & 0xff;
+            *p++ = (accum >> (8 * (2 - 2))) & 0xff;
+        }
+        write(buf.data(), p - buf.begin());
+    }
+
+    {
+        // Final group might have some equal signs
+        std::size_t nbits = 24;
+        if (data[3] == '=') {
+            nbits -= 8;
+            if (data[2] == '=')
+                nbits -= 8;
+        }
+        accum = 0;
+        accum |= decodeSextet(*data++) << (6 * (3 - 0));
+        accum |= decodeSextet(*data++) << (6 * (3 - 1));
+        if (nbits > (6 * 2))
+            accum |= decodeSextet(*data++) << (6 * (3 - 2));
+        if (nbits > (6 * 3))
+            accum |= decodeSextet(*data++) << (6 * (3 - 3));
+
+        p = buf.begin();
+        if (nbits > (8 * 0))
+            *p++ = accum >> (8 * (2 - 0));
+        if (nbits > (8 * 1))
+            *p++ = accum >> (8 * (2 - 1));
+        if (nbits > (8 * 2))
+            *p++ = accum >> (8 * (2 - 2));
+        write(buf.data(), p - buf.begin());
+    }
+}
+
+}  // namespace
+
+std::string encode(StringData in) {
+    std::string r;
+    r.reserve(encodedLength(in.size()));
+    encodeImpl([&](const char* s, std::size_t n) { r.append(s, s + n); }, in);
+    return r;
+}
+
+std::string decode(StringData in) {
+    std::string r;
+    r.reserve(in.size() / 4 * 3);
+    decodeImpl([&](const char* s, std::size_t n) { r.append(s, s + n); }, in);
+    return r;
+}
+
+void encode(std::stringstream& ss, StringData in) {
+    encodeImpl([&](const char* s, std::size_t n) { ss.write(s, n); }, in);
+}
+
+void decode(std::stringstream& ss, StringData in) {
+    decodeImpl([&](const char* s, std::size_t n) { ss.write(s, n); }, in);
+}
+
+void encode(fmt::memory_buffer& buffer, StringData in) {
+    buffer.reserve(buffer.size() + encodedLength(in.size()));
+    encodeImpl([&](const char* s, std::size_t n) { buffer.append(s, s + n); }, in);
+}
+
+void decode(fmt::memory_buffer& buffer, StringData in) {
+    buffer.reserve(buffer.size() + in.size() / 4 * 3);
+    decodeImpl([&](const char* s, std::size_t n) { buffer.append(s, s + n); }, in);
+}
+
+
+bool validate(StringData s) {
+    if (s.size() % 4) {
+        return false;
+    }
+    if (s.empty()) {
+        return true;
+    }
+
+    using std::begin;
+    using std::end;
+
+    auto const unwindTerminator = [](auto it) { return (*(it - 1) == '=') ? (it - 1) : it; };
+    auto const e = unwindTerminator(unwindTerminator(end(s)));
+
+    return e == std::find_if(begin(s), e, [](const char ch) { return !valid(ch); });
+}
+
+}  // namespace mongo::base64

@@ -4,12 +4,16 @@
  * drop_database.js
  *
  * Repeatedly creates and drops a database.
+ *
+ * @tags: [
+ *   # SERVER-54587 create collection does not support stepdowns
+ *   does_not_support_stepdowns,
+ * ]
  */
 var $config = (function() {
-
     var states = {
         init: function init(db, collName) {
-            this.uniqueDBName = 'drop_database' + this.tid;
+            this.uniqueDBName = db.getName() + 'drop_database' + this.tid;
         },
 
         createAndDrop: function createAndDrop(db, collName) {
@@ -18,22 +22,11 @@ var $config = (function() {
             var myDB = db.getSiblingDB(this.uniqueDBName);
             assertAlways.commandWorked(myDB.createCollection(collName));
 
-            var res = myDB.dropDatabase();
-            assertAlways.commandWorked(res);
-            assertAlways.eq(this.uniqueDBName, res.dropped);
+            assertAlways.commandWorked(myDB.dropDatabase());
         }
     };
 
-    var transitions = {
-        init: { createAndDrop: 1 },
-        createAndDrop: { createAndDrop: 1 }
-    };
+    var transitions = {init: {createAndDrop: 1}, createAndDrop: {createAndDrop: 1}};
 
-    return {
-        threadCount: 10,
-        iterations: 10,
-        states: states,
-        transitions: transitions
-    };
-
+    return {threadCount: 10, iterations: 20, states: states, transitions: transitions};
 })();

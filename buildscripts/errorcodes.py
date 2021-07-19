@@ -1,318 +1,335 @@
-#!/usr/bin/env python
-
-"""Produces a report of all assertions in the MongoDB server codebase.
+#!/usr/bin/env python3
+"""Produce a report of all assertions in the MongoDB server codebase.
 
 Parses .cpp files for assertions and verifies assertion codes are distinct.
 Optionally replaces zero codes in source code with new distinct values.
 """
 
-import os
-import re
-import utils
+import bisect
+import os.path
 import sys
 from collections import defaultdict, namedtuple
 from optparse import OptionParser
+from functools import reduce
+from pathlib import Path
 
-ASSERT_NAMES = [ "uassert" , "massert", "fassert", "fassertFailed" ]
-MINIMUM_CODE = 10000
+# Get relative imports to work when the package is not installed on the PYTHONPATH.
+if __name__ == "__main__" and __package__ is None:
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-codes = []
+try:
+    import regex as re
+except ImportError:
+    print("*** Run 'pip3 install --user regex' to speed up error code checking")
+    import re  # type: ignore
+
+ASSERT_NAMES = ["uassert", "massert", "fassert", "fassertFailed"]
+MAXIMUM_CODE = 9999999  # JIRA Ticket + XX
+
+# pylint: disable=invalid-name
+codes = []  # type: ignore
+# pylint: enable=invalid-name
 
 # Each AssertLocation identifies the C++ source location of an assertion
-AssertLocation = namedtuple( "AssertLocation", ['sourceFile', 'lineNum', 'lines', 'code'] )
+AssertLocation = namedtuple("AssertLocation", ['sourceFile', 'byteOffset', 'lines', 'code'])
 
+list_files = False  # pylint: disable=invalid-name
 
-# Of historical interest only
-def assignErrorCodes():
-    cur = MINIMUM_CODE
-    for root in ASSERT_NAMES:
-        for x in utils.getAllSourceFiles():
-            print( x )
-            didAnything = False
-            fixed = ""
-            for line in open( x ):
-                s = line.partition( root + "(" )
-                if s[1] == "" or line.startswith( "#define " + root):
-                    fixed += line
-                    continue
-                fixed += s[0] + root + "( " + str( cur ) + " , " + s[2]
-                cur = cur + 1
-                didAnything = True
-            if didAnything:
-                out = open( x , 'w' )
-                out.write( fixed )
-                out.close()
-
-
-def parseSourceFiles( callback ):
-    """Walks MongoDB sourcefiles and invokes callback for each AssertLocation found."""
-
-    quick = [ "assert" , "Exception"]
-
-    patterns = [
-        re.compile( r"[umsg]asser(?:t|ted)(?:NoTrace)? *\( *(\d+)" ) ,
-        re.compile( r"(?:User|Msg|MsgAssertion)Exception *\( *(\d+)" ),
-        re.compile( r"fassert(?:Failed)?(?:WithStatus)?(?:NoTrace)? *\( *(\d+)" ),
+_CODE_PATTERNS = [
+    re.compile(p + r'\s*(?P<code>\d+)', re.MULTILINE) for p in [
+        # All the asserts and their optional variant suffixes
+        r"(?:f|i|m|msg|t|u)(?:assert)"
+        r"(?:ed)?"
+        r"(?:Failed)?"
+        r"(?:WithStatus)?"
+        r"(?:NoTrace)?"
+        r"(?:StatusOK)?"
+        r"(?:WithContext)?"
+        r"\s*\(",
+        # DBException and AssertionException constructors
+        r"(?:DB|Assertion)Exception\s*[({]",
+        # Calls to all LOGV2* variants
+        r"LOGV2(?:\w*)?\s*\(",
+        # Forwards a dynamic code to LOGV2
+        r"logAndBackoff\(",
+        # Error coersions
+        r"ErrorCodes::Error\s*[({]",
     ]
+]
 
-    bad = [ re.compile( r"^\s*assert *\(" ) ]
+_DIR_EXCLUDE_RE = re.compile(r'(\..*'
+                             r'|pcre-.*'
+                             r'|32bit.*'
+                             r'|mongodb-.*'
+                             r'|debian.*'
+                             r'|mongo-cxx-driver.*'
+                             r'|.*gotools.*'
+                             r'|.*mozjs.*'
+                             r')')
 
-    for sourceFile in utils.getAllSourceFiles():
-        if not sourceFile.find( "src/mongo/" ) >= 0:
-            # Skip generated sources
-            continue
+_FILE_INCLUDE_RE = re.compile(r'.*\.(cpp|c|h|py|idl)')
 
-        with open(sourceFile) as f:
-            line_iterator = enumerate(f, 1)
-            for (lineNum, line) in line_iterator:
 
-                # See if we can skip regexes
-                if not any([zz in line for zz in quick]):
+def get_all_source_files(prefix='.'):
+    """Return source files."""
+
+    def walk(path):
+        for fx in path.iterdir():
+            if fx.is_dir():
+                if fx.is_symlink() and fx.parent.name != "modules":
                     continue
+                if _DIR_EXCLUDE_RE.fullmatch(fx.name):
+                    continue
+                for child in walk(fx):
+                    yield child
+            elif fx.is_file() and _FILE_INCLUDE_RE.fullmatch(fx.name):
+                yield fx
 
-                for b in bad:
-                    if b.search(line):
-                        msg = "Bare assert prohibited. Replace with [umwdf]assert"
-                        print( "%s:%s: %s\n%s" % (sourceFile, lineNum, msg, line) )
-                        raise Exception(msg)
-
-                # no more than one pattern should ever match
-                matches = [x for x in [p.search(line) for p in patterns]
-                           if x]
-                assert len(matches) <= 1, matches
-                if matches:
-                    match = matches[0]
-                    code = match.group(1)
-                    span = match.span()
-
-                    # Advance to statement terminator iff not on this line
-                    lines = [line.strip()]
-
-                    if not isTerminated(lines):
-                        for (_lineNum, line) in line_iterator:
-                            lines.append(line.strip())
-                            if isTerminated(lines):
-                                break
-
-                    thisLoc = AssertLocation(sourceFile, lineNum, lines, code)
-                    callback( thisLoc )
-
-        # end for sourceFile loop
+    for child in walk(Path(prefix)):
+        yield str(child)
 
 
-def isTerminated( lines ):
-    """Given .cpp/.h source lines as text, determine if assert is terminated."""
-    x = " ".join(lines)
-    return ';' in x \
-        or x.count('(') - x.count(')') <= 0
+def foreach_source_file(callback, src_root):
+    """Invoke a callback on the text of each source file."""
+    for source_file in get_all_source_files(prefix=src_root):
+        if list_files:
+            print('scanning file: ' + source_file)
+        with open(source_file, 'r', encoding='utf-8') as fh:
+            callback(source_file, fh.read())
 
 
-def getNextCode():
-    """Finds next unused assertion code.
+def parse_source_files(callback, src_root):
+    """Walk MongoDB sourcefiles and invoke a callback for each AssertLocation found."""
+
+    def scan_for_codes(source_file, text):
+        for pat in _CODE_PATTERNS:
+            for match in pat.finditer(text):
+                # Note that this will include the text of the full match but will report the
+                # position of the beginning of the code portion rather than the beginning of the
+                # match. This is to position editors on the spot that needs to change.
+                loc = AssertLocation(source_file, match.start('code'), match.group(0),
+                                     match.group('code'))
+                callback(loc)
+
+    foreach_source_file(scan_for_codes, src_root)
+
+
+def get_line_and_column_for_position(loc, _file_cache=None):
+    """Convert an absolute position in a file into a line number."""
+    if _file_cache is None:
+        _file_cache = {}
+    if loc.sourceFile not in _file_cache:
+        with open(loc.sourceFile) as fh:
+            text = fh.read()
+            line_offsets = [0]
+            for line in text.splitlines(True):
+                line_offsets.append(line_offsets[-1] + len(line))
+            _file_cache[loc.sourceFile] = line_offsets
+
+    # These are both 1-based, but line is handled by starting the list with 0.
+    line = bisect.bisect(_file_cache[loc.sourceFile], loc.byteOffset)
+    column = loc.byteOffset - _file_cache[loc.sourceFile][line - 1] + 1
+    return (line, column)
+
+
+def is_terminated(lines):
+    """Determine if assert is terminated, from .cpp/.h source lines as text."""
+    code_block = " ".join(lines)
+    return ';' in code_block or code_block.count('(') - code_block.count(')') <= 0
+
+
+def get_next_code(seen, server_ticket=0):
+    """Find next unused assertion code.
 
     Called by: SConstruct and main()
     Since SConstruct calls us, codes[] must be global OR WE REPARSE EVERYTHING
     """
-    if not len(codes) > 0:
-        readErrorCodes()
+    if not codes:
+        (_, _, seen) = read_error_codes()
 
-    highest = reduce( lambda x, y: max(int(x), int(y)),
-                      (loc.code for loc in codes) )
-    return highest + 1
+    if server_ticket:
+        # Each SERVER ticket is allocated 100 error codes ranging from TICKET_00 -> TICKET_99.
+        def generator(seen, ticket):
+            avail_codes = list(range(ticket * 100, (ticket + 1) * 100))
+            avail_codes.reverse()
+            while avail_codes:
+                code = avail_codes.pop()
+                if str(code) in seen:
+                    continue
+                yield code
+            return "No more available codes for ticket. Ticket: {}".format(ticket)
+
+        return generator(seen, server_ticket)
+
+    # No server ticket. Return a generator that counts starting at highest + 1.
+    highest = reduce(lambda x, y: max(int(x), int(y)), (loc.code for loc in codes))
+    return iter(range(highest + 1, MAXIMUM_CODE))
 
 
-def checkErrorCodes():
-    """SConstruct expects a boolean response from this function.
-    """
-    (codes, errors) = readErrorCodes()
-    return len( errors ) == 0
+def check_error_codes():
+    """Check error codes as SConstruct expects a boolean response from this function."""
+    (_, errors, _) = read_error_codes()
+    return len(errors) == 0
 
 
-def readErrorCodes():
-    """Defines callback, calls parseSourceFiles() with callback,
-    and saves matches to global codes list.
-    """
+def read_error_codes(src_root='src/mongo'):
+    """Define callback, call parse_source_files() with callback, save matches to global codes list."""
     seen = {}
     errors = []
     dups = defaultdict(list)
+    skips = []
+    malformed = []  # type: ignore
 
-    # define callback
-    def checkDups( assertLoc ):
-        codes.append( assertLoc )
-        code = assertLoc.code
+    # define validation callbacks
+    def check_dups(assert_loc):
+        """Check for duplicates."""
+        codes.append(assert_loc)
+        code = assert_loc.code
 
         if not code in seen:
-            seen[code] = assertLoc
+            seen[code] = assert_loc
         else:
             if not code in dups:
                 # on first duplicate, add original to dups, errors
-                dups[code].append( seen[code] )
-                errors.append( seen[code] )
+                dups[code].append(seen[code])
+                errors.append(seen[code])
 
-            dups[code].append( assertLoc )
-            errors.append( assertLoc )
+            dups[code].append(assert_loc)
+            errors.append(assert_loc)
 
-    parseSourceFiles( checkDups )
+    def validate_code(assert_loc):
+        """Check for malformed codes."""
+        code = int(assert_loc.code)
+        if code > MAXIMUM_CODE:
+            malformed.append(assert_loc)
+            errors.append(assert_loc)
 
-    if seen.has_key("0"):
+    def callback(assert_loc):
+        validate_code(assert_loc)
+        check_dups(assert_loc)
+
+    parse_source_files(callback, src_root)
+
+    if "0" in seen:
         code = "0"
         bad = seen[code]
-        errors.append( bad )
-        print( "ZERO_CODE:" )
-        print( "  %s:%d:%s" % (bad.sourceFile, bad.lineNum, bad.lines[0]) )
+        errors.append(bad)
+        line, col = get_line_and_column_for_position(bad)
+        print("ZERO_CODE:")
+        print("  %s:%d:%d:%s" % (bad.sourceFile, line, col, bad.lines))
 
-    for code, locations in dups.items():
-        print( "DUPLICATE IDS: %s" % code )
+    for loc in skips:
+        line, col = get_line_and_column_for_position(loc)
+        print("EXCESSIVE SKIPPING OF ERROR CODES:")
+        print("  %s:%d:%d:%s" % (loc.sourceFile, line, col, loc.lines))
+
+    for code, locations in list(dups.items()):
+        print("DUPLICATE IDS: %s" % code)
         for loc in locations:
-            print( "  %s:%d:%s" % (loc.sourceFile, loc.lineNum, loc.lines[0]) )
+            line, col = get_line_and_column_for_position(loc)
+            print("  %s:%d:%d:%s" % (loc.sourceFile, line, col, loc.lines))
 
-    return (codes, errors)
+    for loc in malformed:
+        line, col = get_line_and_column_for_position(loc)
+        print("MALFORMED ID: %s" % loc.code)
+        print("  %s:%d:%d:%s" % (loc.sourceFile, line, col, loc.lines))
+
+    return (codes, errors, seen)
 
 
-def replaceBadCodes( errors, nextCode ):
-    """Modifies C++ source files to replace invalid assertion codes.
+def replace_bad_codes(errors, next_code_generator):  # pylint: disable=too-many-locals
+    """Modify C++ source files to replace invalid assertion codes.
+
     For now, we only modify zero codes.
 
     Args:
         errors: list of AssertLocation
-        nextCode: int, next non-conflicting assertion code
+        next_code_generator: generator -> int, next non-conflicting assertion code
     """
     zero_errors = [e for e in errors if int(e.code) == 0]
     skip_errors = [e for e in errors if int(e.code) != 0]
 
     for loc in skip_errors:
-        print "SKIPPING NONZERO code=%s: %s:%s" % (loc.code, loc.sourceFile, loc.lineNum)
+        line, col = get_line_and_column_for_position(loc)
+        print("SKIPPING NONZERO code=%s: %s:%d:%d" % (loc.code, loc.sourceFile, line, col))
 
-    for assertLoc in zero_errors:
-        (sourceFile, lineNum, lines, code) = assertLoc
-        print "UPDATING_FILE: %s:%s" % (sourceFile, lineNum)
+    # Dedupe, sort, and reverse so we don't have to update offsets as we go.
+    for assert_loc in reversed(sorted(set(zero_errors))):
+        (source_file, byte_offset, _, _) = assert_loc
+        line_num, _ = get_line_and_column_for_position(assert_loc)
+        print("UPDATING_FILE: %s:%s" % (source_file, line_num))
 
-        ln = lineNum - 1
+        ln = line_num - 1
 
-        with open(sourceFile, 'r+') as f:
-            fileLines = f.readlines()
-            line = fileLines[ln]
-            print "LINE_%d_BEFORE:%s" % (lineNum, line.rstrip())
-            line = re.sub(r'(\( *)(\d+)',
-                          r'\g<1>' + str(nextCode),
-                          line)
-            print "LINE_%d_AFTER :%s" % (lineNum, line.rstrip())
-            fileLines[ln] = line
-            f.seek(0)
-            f.writelines(fileLines)
-        nextCode += 1
+        with open(source_file, 'r+') as fh:
+            print("LINE_%d_BEFORE:%s" % (line_num, fh.readlines()[ln].rstrip()))
+
+            fh.seek(0)
+            text = fh.read()
+            assert text[byte_offset] == '0'
+            fh.seek(0)
+            fh.write(text[:byte_offset])
+            fh.write(str(next(next_code_generator)))
+            fh.write(text[byte_offset + 1:])
+            fh.seek(0)
+
+            print("LINE_%d_AFTER :%s" % (line_num, fh.readlines()[ln].rstrip()))
 
 
-def getBestMessage( lines , codeStr ):
-    """Extracts message from one AssertionLocation.lines entry
+def coerce_to_number(ticket_value):
+    """Coerce the input into a number.
 
-    Args:
-        lines: list of contiguous C++ source lines
-        codeStr: assertion code found in first line
+    If the input is a number, return itself. Otherwise parses input strings of two forms.
+    'SERVER-12345' and '12345' will both return 12345'.
     """
-    line = lines if isinstance(lines, str) else " ".join(lines)
+    if isinstance(ticket_value, int):
+        return ticket_value
 
-    err = line.partition( codeStr )[2]
-    if not err:
-        return ""
+    ticket_re = re.compile(r'(?:SERVER-)?(\d+)', re.IGNORECASE)
+    matches = ticket_re.fullmatch(ticket_value)
+    if not matches:
+        print("Unknown ticket number. Input: " + ticket_value)
+        return -1
 
-    # Trim to outer quotes
-    m = re.search(r'"(.*)"', err)
-    if not m:
-        return ""
-    err = m.group(1)
-
-    # Trim inner quote pairs
-    err = re.sub(r'" +"', '', err)
-    err = re.sub(r'" *<< *"', '', err)
-    err = re.sub(r'" *<<[^<]+<< *"', '<X>', err)
-    err = re.sub(r'" *\+[^+]+\+ *"', '<X>', err)
-
-    # Trim escaped quotes
-    err = re.sub(r'\\"', '', err)
-
-    # Iff doublequote still present, trim that and any trailing text
-    err = re.sub(r'".*$', '', err)
-
-    return err.strip()
-
-
-def writeMarkdownReport( codes, outfile ):
-    """Write errors.md report to filesystem in Markdown format
-
-    Args:
-        codes: list of AssertLocation
-        outfile: string path to a file to overwrite
-    """
-
-    baseurl = "http://github.com/mongodb/mongo/blob/master"
-
-    if os.path.exists(outfile):
-        i = open(outfile, "r" )
-        i.close()
-
-    out = open(outfile, 'wb')
-    out.write("MongoDB Error Codes\n")
-    out.write("===================\n\n")
-    out.write("This file is generated by errorcodes.py. Do not edit.\n\n")
-
-    prev = ""
-    seen = {}
-
-    # Sort by sourceFile, then code
-    codes.sort( key=lambda loc: loc.sourceFile+"-"+loc.code )
-
-    for assertLoc in codes:
-        if assertLoc.code in seen:
-            continue
-        seen[assertLoc.code] = True
-
-        (sourceFile, lineNum, lines, code) = assertLoc
-
-        if sourceFile.startswith("./"):
-            sourceFile = sourceFile[2:]
-
-        if sourceFile != prev:
-            out.write("\n\n%s\n----\n" % sourceFile)
-            prev = sourceFile
-
-        url = "%s/%s#L%s" % (baseurl, sourceFile, lineNum)
-        message = getBestMessage(lines, str(code))
-        out.write("* %s [code](%s) %s\n" % (code, url, message))
-
-    out.write( "\n" )
-    out.close()
+    return int(matches.group(1))
 
 
 def main():
+    """Main."""
     parser = OptionParser(description=__doc__.strip())
-    parser.add_option("--fix", dest="replace",
-                      action="store_true", default=False,
+    parser.add_option("--fix", dest="replace", action="store_true", default=False,
                       help="Fix zero codes in source files [default: %default]")
-    parser.add_option("-o", dest="outfile",
-                      default="docs/errors.md",
-                      help="Report file [default: %default]")
-    parser.add_option("--report", type="choice",
-                      choices=["none", "markdown"], default="none",
-                      help="What format report should be generated. " \
-                           "Possible options: [none, markdown]")
-    (options, args) = parser.parse_args()
+    parser.add_option("-q", "--quiet", dest="quiet", action="store_true", default=False,
+                      help="Suppress output on success [default: %default]")
+    parser.add_option("--list-files", dest="list_files", action="store_true", default=False,
+                      help="Print the name of each file as it is scanned [default: %default]")
+    parser.add_option(
+        "--ticket", dest="ticket", type="str", action="store", default=0,
+        help="Generate error codes for a given SERVER ticket number. Inputs can be of"
+        " the form: `--ticket=12345` or `--ticket=SERVER-12345`.")
+    (options, _) = parser.parse_args()
 
-    (codes, errors) = readErrorCodes()
+    global list_files  # pylint: disable=global-statement,invalid-name
+    list_files = options.list_files
+
+    (_, errors, seen) = read_error_codes()
     ok = len(errors) == 0
-    next = getNextCode()
+
+    if ok and options.quiet:
+        return
+
+    next_code_gen = get_next_code(seen, coerce_to_number(options.ticket))
 
     print("ok: %s" % ok)
-    print("next: %s" % next)
+    if not options.replace:
+        print("next: %s" % next(next_code_gen))
 
     if ok:
-        reportStyle = options.report
-        if reportStyle == "markdown":
-            writeMarkdownReport(codes, options.outfile)
+        sys.exit(0)
     elif options.replace:
-        replaceBadCodes(errors, next)
+        replace_bad_codes(errors, next_code_gen)
     else:
-        print ERROR_HELP
+        print(ERROR_HELP)
         sys.exit(1)
 
 

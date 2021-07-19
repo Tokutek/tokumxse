@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -33,541 +34,320 @@
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
 #include "mongo/db/matcher/expression.h"
-#include "mongo/db/matcher/expression_tree.h"
 #include "mongo/db/matcher/expression_leaf.h"
+#include "mongo/db/matcher/expression_tree.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
 
 namespace mongo {
 
-    using std::auto_ptr;
-
-    TEST( NotMatchExpression, MatchesScalar ) {
-        BSONObj baseOperand = BSON( "$lt" << 5 );
-        auto_ptr<ComparisonMatchExpression> lt( new LTMatchExpression() );
-        ASSERT( lt->init( "a", baseOperand[ "$lt" ] ).isOK() );
-        NotMatchExpression notOp;
-        ASSERT( notOp.init( lt.release() ).isOK() );
-        ASSERT( notOp.matchesBSON( BSON( "a" << 6 ), NULL ) );
-        ASSERT( !notOp.matchesBSON( BSON( "a" << 4 ), NULL ) );
-    }
-
-    TEST( NotMatchExpression, MatchesArray ) {
-        BSONObj baseOperand = BSON( "$lt" << 5 );
-        auto_ptr<ComparisonMatchExpression> lt( new LTMatchExpression() );
-        ASSERT( lt->init( "a", baseOperand[ "$lt" ] ).isOK() );
-        NotMatchExpression notOp;
-        ASSERT( notOp.init( lt.release() ).isOK() );
-        ASSERT( notOp.matchesBSON( BSON( "a" << BSON_ARRAY( 6 ) ), NULL ) );
-        ASSERT( !notOp.matchesBSON( BSON( "a" << BSON_ARRAY( 4 ) ), NULL ) );
-        // All array elements must match.
-        ASSERT( !notOp.matchesBSON( BSON( "a" << BSON_ARRAY( 4 << 5 << 6 ) ), NULL ) );
-    }
-
-    TEST( NotMatchExpression, ElemMatchKey ) {
-        BSONObj baseOperand = BSON( "$lt" << 5 );
-        auto_ptr<ComparisonMatchExpression> lt( new LTMatchExpression() );
-        ASSERT( lt->init( "a", baseOperand[ "$lt" ] ).isOK() );
-        NotMatchExpression notOp;
-        ASSERT( notOp.init( lt.release() ).isOK() );
-        MatchDetails details;
-        details.requestElemMatchKey();
-        ASSERT( !notOp.matchesBSON( BSON( "a" << BSON_ARRAY( 1 ) ), &details ) );
-        ASSERT( !details.hasElemMatchKey() );
-        ASSERT( notOp.matchesBSON( BSON( "a" << 6 ), &details ) );
-        ASSERT( !details.hasElemMatchKey() );
-        ASSERT( notOp.matchesBSON( BSON( "a" << BSON_ARRAY( 6 ) ), &details ) );
-        // elemMatchKey is not implemented for negative match operators.
-        ASSERT( !details.hasElemMatchKey() );
-    }
-    /*
-      TEST( NotMatchExpression, MatchesIndexKey ) {
-      BSONObj baseOperand = BSON( "$lt" << 5 );
-      auto_ptr<ComparisonMatchExpression> lt( new ComparisonMatchExpression() );
-      ASSERT( lt->init( "a", baseOperand[ "$lt" ] ).isOK() );
-      NotMatchExpression notOp;
-      ASSERT( notOp.init( lt.release() ).isOK() );
-      IndexSpec indexSpec( BSON( "a" << 1 ) );
-      BSONObj indexKey = BSON( "" << "7" );
-      ASSERT( MatchMatchExpression::PartialMatchResult_Unknown ==
-      notOp.matchesIndexKey( indexKey, indexSpec ) );
-      }
-    */
-
-    /**
-    TEST( AndOp, MatchesElementSingleClause ) {
-        BSONObj baseOperand = BSON( "$lt" << 5 );
-        BSONObj match = BSON( "a" << 4 );
-        BSONObj notMatch = BSON( "a" << 5 );
-        auto_ptr<ComparisonMatchExpression> lt( new ComparisonMatchExpression() );
-        ASSERT( lt->init( "", baseOperand[ "$lt" ] ).isOK() );
-        OwnedPointerVector<MatchMatchExpression> subMatchExpressions;
-        subMatchExpressions.mutableVector().push_back( lt.release() );
-        AndOp andOp;
-        ASSERT( andOp.init( &subMatchExpressions ).isOK() );
-        ASSERT( andOp.matchesSingleElement( match[ "a" ] ) );
-        ASSERT( !andOp.matchesSingleElement( notMatch[ "a" ] ) );
-    }
-    */
-
-    TEST( AndOp, NoClauses ) {
-        AndMatchExpression andMatchExpression;
-        ASSERT( andMatchExpression.matchesBSON( BSONObj(), NULL ) );
-    }
-
-    TEST( AndOp, MatchesElementThreeClauses ) {
-        BSONObj baseOperand1 = BSON( "$lt" << "z1" );
-        BSONObj baseOperand2 = BSON( "$gt" << "a1" );
-        BSONObj match = BSON( "a" << "r1" );
-        BSONObj notMatch1 = BSON( "a" << "z1" );
-        BSONObj notMatch2 = BSON( "a" << "a1" );
-        BSONObj notMatch3 = BSON( "a" << "r" );
-
-        auto_ptr<ComparisonMatchExpression> sub1( new LTMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "$lt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub2( new GTMatchExpression() );
-        ASSERT( sub2->init( "a", baseOperand2[ "$gt" ] ).isOK() );
-        auto_ptr<RegexMatchExpression> sub3( new RegexMatchExpression() );
-        ASSERT( sub3->init( "a", "1", "" ).isOK() );
-
-        AndMatchExpression andOp;
-        andOp.add( sub1.release() );
-        andOp.add( sub2.release() );
-        andOp.add( sub3.release() );
-
-        ASSERT( andOp.matchesBSON( match ) );
-        ASSERT( !andOp.matchesBSON( notMatch1 ) );
-        ASSERT( !andOp.matchesBSON( notMatch2 ) );
-        ASSERT( !andOp.matchesBSON( notMatch3 ) );
-    }
-
-    TEST( AndOp, MatchesSingleClause ) {
-        BSONObj baseOperand = BSON( "$ne" << 5 );
-        auto_ptr<ComparisonMatchExpression> eq( new EqualityMatchExpression() );
-        ASSERT( eq->init( "a", baseOperand[ "$ne" ] ).isOK() );
-        auto_ptr<NotMatchExpression> ne( new NotMatchExpression() );
-        ASSERT( ne->init( eq.release() ).isOK() );
-
-        AndMatchExpression andOp;
-        andOp.add( ne.release() );
-
-        ASSERT( andOp.matchesBSON( BSON( "a" << 4 ), NULL ) );
-        ASSERT( andOp.matchesBSON( BSON( "a" << BSON_ARRAY( 4 << 6 ) ), NULL ) );
-        ASSERT( !andOp.matchesBSON( BSON( "a" << 5 ), NULL ) );
-        ASSERT( !andOp.matchesBSON( BSON( "a" << BSON_ARRAY( 4 << 5 ) ), NULL ) );
-    }
-
-    TEST( AndOp, MatchesThreeClauses ) {
-        BSONObj baseOperand1 = BSON( "$gt" << 1 );
-        BSONObj baseOperand2 = BSON( "$lt" << 10 );
-        BSONObj baseOperand3 = BSON( "$lt" << 100 );
-
-        auto_ptr<ComparisonMatchExpression> sub1( new GTMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "$gt" ] ).isOK() );
-
-        auto_ptr<ComparisonMatchExpression> sub2( new LTMatchExpression() );
-        ASSERT( sub2->init( "a", baseOperand2[ "$lt" ] ).isOK() );
-
-        auto_ptr<ComparisonMatchExpression> sub3( new LTMatchExpression() );
-        ASSERT( sub3->init( "b", baseOperand3[ "$lt" ] ).isOK() );
-
-        AndMatchExpression andOp;
-        andOp.add( sub1.release() );
-        andOp.add( sub2.release() );
-        andOp.add( sub3.release() );
-
-        ASSERT( andOp.matchesBSON( BSON( "a" << 5 << "b" << 6 ), NULL ) );
-        ASSERT( !andOp.matchesBSON( BSON( "a" << 5 ), NULL ) );
-        ASSERT( !andOp.matchesBSON( BSON( "b" << 6 ), NULL ) );
-        ASSERT( !andOp.matchesBSON( BSON( "a" << 1 << "b" << 6 ), NULL ) );
-        ASSERT( !andOp.matchesBSON( BSON( "a" << 10 << "b" << 6 ), NULL ) );
-    }
-
-    TEST( AndOp, ElemMatchKey ) {
-        BSONObj baseOperand1 = BSON( "a" << 1 );
-        BSONObj baseOperand2 = BSON( "b" << 2 );
-
-        auto_ptr<ComparisonMatchExpression> sub1( new EqualityMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "a" ] ).isOK() );
-
-        auto_ptr<ComparisonMatchExpression> sub2( new EqualityMatchExpression() );
-        ASSERT( sub2->init( "b", baseOperand2[ "b" ] ).isOK() );
-
-        AndMatchExpression andOp;
-        andOp.add( sub1.release() );
-        andOp.add( sub2.release() );
-
-        MatchDetails details;
-        details.requestElemMatchKey();
-        ASSERT( !andOp.matchesBSON( BSON( "a" << BSON_ARRAY( 1 ) ), &details ) );
-        ASSERT( !details.hasElemMatchKey() );
-        ASSERT( !andOp.matchesBSON( BSON( "b" << BSON_ARRAY( 2 ) ), &details ) );
-        ASSERT( !details.hasElemMatchKey() );
-        ASSERT( andOp.matchesBSON( BSON( "a" << BSON_ARRAY( 1 ) << "b" << BSON_ARRAY( 1 << 2 ) ),
-                               &details ) );
-        ASSERT( details.hasElemMatchKey() );
-        // The elem match key for the second $and clause is recorded.
-        ASSERT_EQUALS( "1", details.elemMatchKey() );
-    }
-
-    /**
-    TEST( AndOp, MatchesIndexKeyWithoutUnknown ) {
-        BSONObj baseOperand1 = BSON( "$gt" << 1 );
-        BSONObj baseOperand2 = BSON( "$lt" << 5 );
-        auto_ptr<ComparisonMatchExpression> sub1( new ComparisonMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "$gt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub2( new ComparisonMatchExpression() );
-        ASSERT( sub2->init( "a", baseOperand2[ "$lt" ] ).isOK() );
-        OwnedPointerVector<MatchMatchExpression> subMatchExpressions;
-        subMatchExpressions.mutableVector().push_back( sub1.release() );
-        subMatchExpressions.mutableVector().push_back( sub2.release() );
-        AndOp andOp;
-        ASSERT( andOp.init( &subMatchExpressions ).isOK() );
-        IndexSpec indexSpec( BSON( "a" << 1 ) );
-        ASSERT( MatchMatchExpression::PartialMatchResult_True ==
-                andOp.matchesIndexKey( BSON( "" << 3 ), indexSpec ) );
-        ASSERT( MatchMatchExpression::PartialMatchResult_False ==
-                andOp.matchesIndexKey( BSON( "" << 0 ), indexSpec ) );
-        ASSERT( MatchMatchExpression::PartialMatchResult_False ==
-                andOp.matchesIndexKey( BSON( "" << 6 ), indexSpec ) );
-    }
-
-    TEST( AndOp, MatchesIndexKeyWithUnknown ) {
-        BSONObj baseOperand1 = BSON( "$gt" << 1 );
-        BSONObj baseOperand2 = BSON( "$lt" << 5 );
-        // This part will return PartialMatchResult_Unknown.
-        BSONObj baseOperand3 = BSON( "$ne" << 5 );
-        auto_ptr<ComparisonMatchExpression> sub1( new ComparisonMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "$gt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub2( new ComparisonMatchExpression() );
-        ASSERT( sub2->init( "a", baseOperand2[ "$lt" ] ).isOK() );
-        auto_ptr<NeOp> sub3( new NeOp() );
-        ASSERT( sub3->init( "a", baseOperand3[ "$ne" ] ).isOK() );
-        OwnedPointerVector<MatchMatchExpression> subMatchExpressions;
-        subMatchExpressions.mutableVector().push_back( sub1.release() );
-        subMatchExpressions.mutableVector().push_back( sub2.release() );
-        subMatchExpressions.mutableVector().push_back( sub3.release() );
-        AndOp andOp;
-        ASSERT( andOp.init( &subMatchExpressions ).isOK() );
-        IndexSpec indexSpec( BSON( "a" << 1 ) );
-        ASSERT( MatchMatchExpression::PartialMatchResult_Unknown ==
-                andOp.matchesIndexKey( BSON( "" << 3 ), indexSpec ) );
-        ASSERT( MatchMatchExpression::PartialMatchResult_False ==
-                andOp.matchesIndexKey( BSON( "" << 0 ), indexSpec ) );
-        ASSERT( MatchMatchExpression::PartialMatchResult_False ==
-                andOp.matchesIndexKey( BSON( "" << 6 ), indexSpec ) );
-    }
-    */
-
-    /**
-    TEST( OrOp, MatchesElementSingleClause ) {
-        BSONObj baseOperand = BSON( "$lt" << 5 );
-        BSONObj match = BSON( "a" << 4 );
-        BSONObj notMatch = BSON( "a" << 5 );
-        auto_ptr<ComparisonMatchExpression> lt( new ComparisonMatchExpression() );
-        ASSERT( lt->init( "a", baseOperand[ "$lt" ] ).isOK() );
-        OwnedPointerVector<MatchMatchExpression> subMatchExpressions;
-        subMatchExpressions.mutableVector().push_back( lt.release() );
-        OrOp orOp;
-        ASSERT( orOp.init( &subMatchExpressions ).isOK() );
-        ASSERT( orOp.matchesSingleElement( match[ "a" ] ) );
-        ASSERT( !orOp.matchesSingleElement( notMatch[ "a" ] ) );
-    }
-    */
-
-    TEST( OrOp, NoClauses ) {
-        OrMatchExpression orOp;
-        ASSERT( !orOp.matchesBSON( BSONObj(), NULL ) );
-    }
-    /*
-    TEST( OrOp, MatchesElementThreeClauses ) {
-        BSONObj baseOperand1 = BSON( "$lt" << 0 );
-        BSONObj baseOperand2 = BSON( "$gt" << 10 );
-        BSONObj baseOperand3 = BSON( "a" << 5 );
-        BSONObj match1 = BSON( "a" << -1 );
-        BSONObj match2 = BSON( "a" << 11 );
-        BSONObj match3 = BSON( "a" << 5 );
-        BSONObj notMatch = BSON( "a" << "6" );
-        auto_ptr<ComparisonMatchExpression> sub1( new ComparisonMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "$lt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub2( new ComparisonMatchExpression() );
-        ASSERT( sub2->init( "a", baseOperand2[ "$gt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub3( new ComparisonMatchExpression() );
-        ASSERT( sub3->init( "a", baseOperand3[ "a" ] ).isOK() );
-        OwnedPointerVector<MatchMatchExpression> subMatchExpressions;
-        subMatchExpressions.mutableVector().push_back( sub1.release() );
-        subMatchExpressions.mutableVector().push_back( sub2.release() );
-        subMatchExpressions.mutableVector().push_back( sub3.release() );
-        OrOp orOp;
-        ASSERT( orOp.init( &subMatchExpressions ).isOK() );
-        ASSERT( orOp.matchesSingleElement( match1[ "a" ] ) );
-        ASSERT( orOp.matchesSingleElement( match2[ "a" ] ) );
-        ASSERT( orOp.matchesSingleElement( match3[ "a" ] ) );
-        ASSERT( !orOp.matchesSingleElement( notMatch[ "a" ] ) );
-    }
-    */
-    TEST( OrOp, MatchesSingleClause ) {
-        BSONObj baseOperand = BSON( "$ne" << 5 );
-        auto_ptr<ComparisonMatchExpression> eq( new EqualityMatchExpression() );
-        ASSERT( eq->init( "a", baseOperand[ "$ne" ] ).isOK() );
-        auto_ptr<NotMatchExpression> ne( new NotMatchExpression() );
-        ASSERT( ne->init( eq.release() ).isOK() );
-
-        OrMatchExpression orOp;
-        orOp.add( ne.release() );
-
-        ASSERT( orOp.matchesBSON( BSON( "a" << 4 ), NULL ) );
-        ASSERT( orOp.matchesBSON( BSON( "a" << BSON_ARRAY( 4 << 6 ) ), NULL ) );
-        ASSERT( !orOp.matchesBSON( BSON( "a" << 5 ), NULL ) );
-        ASSERT( !orOp.matchesBSON( BSON( "a" << BSON_ARRAY( 4 << 5 ) ), NULL ) );
-    }
-
-    TEST( OrOp, MatchesThreeClauses ) {
-        BSONObj baseOperand1 = BSON( "$gt" << 10 );
-        BSONObj baseOperand2 = BSON( "$lt" << 0 );
-        BSONObj baseOperand3 = BSON( "b" << 100 );
-        auto_ptr<ComparisonMatchExpression> sub1( new GTMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "$gt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub2( new LTMatchExpression() );
-        ASSERT( sub2->init( "a", baseOperand2[ "$lt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub3( new EqualityMatchExpression() );
-        ASSERT( sub3->init( "b", baseOperand3[ "b" ] ).isOK() );
-
-        OrMatchExpression orOp;
-        orOp.add( sub1.release() );
-        orOp.add( sub2.release() );
-        orOp.add( sub3.release() );
-
-        ASSERT( orOp.matchesBSON( BSON( "a" << -1 ), NULL ) );
-        ASSERT( orOp.matchesBSON( BSON( "a" << 11 ), NULL ) );
-        ASSERT( !orOp.matchesBSON( BSON( "a" << 5 ), NULL ) );
-        ASSERT( orOp.matchesBSON( BSON( "b" << 100 ), NULL ) );
-        ASSERT( !orOp.matchesBSON( BSON( "b" << 101 ), NULL ) );
-        ASSERT( !orOp.matchesBSON( BSONObj(), NULL ) );
-        ASSERT( orOp.matchesBSON( BSON( "a" << 11 << "b" << 100 ), NULL ) );
-    }
-
-    TEST( OrOp, ElemMatchKey ) {
-        BSONObj baseOperand1 = BSON( "a" << 1 );
-        BSONObj baseOperand2 = BSON( "b" << 2 );
-        auto_ptr<ComparisonMatchExpression> sub1( new EqualityMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "a" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub2( new EqualityMatchExpression() );
-        ASSERT( sub2->init( "b", baseOperand2[ "b" ] ).isOK() );
-
-        OrMatchExpression orOp;
-        orOp.add( sub1.release() );
-        orOp.add( sub2.release() );
-
-        MatchDetails details;
-        details.requestElemMatchKey();
-        ASSERT( !orOp.matchesBSON( BSONObj(), &details ) );
-        ASSERT( !details.hasElemMatchKey() );
-        ASSERT( !orOp.matchesBSON( BSON( "a" << BSON_ARRAY( 10 ) << "b" << BSON_ARRAY( 10 ) ),
-                               &details ) );
-        ASSERT( !details.hasElemMatchKey() );
-        ASSERT( orOp.matchesBSON( BSON( "a" << BSON_ARRAY( 1 ) << "b" << BSON_ARRAY( 1 << 2 ) ),
-                              &details ) );
-        // The elem match key feature is not implemented for $or.
-        ASSERT( !details.hasElemMatchKey() );
-    }
-
-    /**
-    TEST( OrOp, MatchesIndexKeyWithoutUnknown ) {
-        BSONObj baseOperand1 = BSON( "$gt" << 5 );
-        BSONObj baseOperand2 = BSON( "$lt" << 1 );
-        auto_ptr<ComparisonMatchExpression> sub1( new ComparisonMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "$gt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub2( new ComparisonMatchExpression() );
-        ASSERT( sub2->init( "a", baseOperand2[ "$lt" ] ).isOK() );
-        OwnedPointerVector<MatchMatchExpression> subMatchExpressions;
-        subMatchExpressions.mutableVector().push_back( sub1.release() );
-        subMatchExpressions.mutableVector().push_back( sub2.release() );
-        OrOp orOp;
-        ASSERT( orOp.init( &subMatchExpressions ).isOK() );
-        IndexSpec indexSpec( BSON( "a" << 1 ) );
-        ASSERT( MatchMatchExpression::PartialMatchResult_False ==
-                orOp.matchesIndexKey( BSON( "" << 3 ), indexSpec ) );
-        ASSERT( MatchMatchExpression::PartialMatchResult_True ==
-                orOp.matchesIndexKey( BSON( "" << 0 ), indexSpec ) );
-        ASSERT( MatchMatchExpression::PartialMatchResult_True ==
-                orOp.matchesIndexKey( BSON( "" << 6 ), indexSpec ) );
-    }
-    
-    TEST( OrOp, MatchesIndexKeyWithUnknown ) {
-        BSONObj baseOperand1 = BSON( "$gt" << 5 );
-        BSONObj baseOperand2 = BSON( "$lt" << 1 );
-        // This part will return PartialMatchResult_Unknown.
-        BSONObj baseOperand3 = BSON( "$ne" << 5 );
-        auto_ptr<ComparisonMatchExpression> sub1( new ComparisonMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "$gt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub2( new ComparisonMatchExpression() );
-        ASSERT( sub2->init( "a", baseOperand2[ "$lt" ] ).isOK() );
-        auto_ptr<NeOp> sub3( new NeOp() );
-        ASSERT( sub3->init( "a", baseOperand3[ "$ne" ] ).isOK() );
-        OwnedPointerVector<MatchMatchExpression> subMatchExpressions;
-        subMatchExpressions.mutableVector().push_back( sub1.release() );
-        subMatchExpressions.mutableVector().push_back( sub2.release() );
-        subMatchExpressions.mutableVector().push_back( sub3.release() );
-        OrOp orOp;
-        ASSERT( orOp.init( &subMatchExpressions ).isOK() );
-        IndexSpec indexSpec( BSON( "a" << 1 ) );
-        ASSERT( MatchMatchExpression::PartialMatchResult_Unknown ==
-                orOp.matchesIndexKey( BSON( "" << 3 ), indexSpec ) );
-        ASSERT( MatchMatchExpression::PartialMatchResult_True ==
-                orOp.matchesIndexKey( BSON( "" << 0 ), indexSpec ) );
-        ASSERT( MatchMatchExpression::PartialMatchResult_True ==
-                orOp.matchesIndexKey( BSON( "" << 6 ), indexSpec ) );
-    }
-    */
-
-    /**
-    TEST( NorOp, MatchesElementSingleClause ) {
-        BSONObj baseOperand = BSON( "$lt" << 5 );
-        BSONObj match = BSON( "a" << 5 );
-        BSONObj notMatch = BSON( "a" << 4 );
-        auto_ptr<ComparisonMatchExpression> lt( new ComparisonMatchExpression() );
-        ASSERT( lt->init( "a", baseOperand[ "$lt" ] ).isOK() );
-        OwnedPointerVector<MatchMatchExpression> subMatchExpressions;
-        subMatchExpressions.mutableVector().push_back( lt.release() );
-        NorOp norOp;
-        ASSERT( norOp.init( &subMatchExpressions ).isOK() );
-        ASSERT( norOp.matchesSingleElement( match[ "a" ] ) );
-        ASSERT( !norOp.matchesSingleElement( notMatch[ "a" ] ) );
-    }
-    */
-
-    TEST( NorOp, NoClauses ) {
-        NorMatchExpression norOp;
-        ASSERT( norOp.matchesBSON( BSONObj(), NULL ) );
-    }
-    /*
-    TEST( NorOp, MatchesElementThreeClauses ) {
-        BSONObj baseOperand1 = BSON( "$lt" << 0 );
-        BSONObj baseOperand2 = BSON( "$gt" << 10 );
-        BSONObj baseOperand3 = BSON( "a" << 5 );
-        BSONObj notMatch1 = BSON( "a" << -1 );
-        BSONObj notMatch2 = BSON( "a" << 11 );
-        BSONObj notMatch3 = BSON( "a" << 5 );
-        BSONObj match = BSON( "a" << "6" );
-        auto_ptr<ComparisonMatchExpression> sub1( new ComparisonMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "$lt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub2( new ComparisonMatchExpression() );
-        ASSERT( sub2->init( "a", baseOperand2[ "$gt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub3( new ComparisonMatchExpression() );
-        ASSERT( sub3->init( "a", baseOperand3[ "a" ] ).isOK() );
-        OwnedPointerVector<MatchMatchExpression> subMatchExpressions;
-        subMatchExpressions.mutableVector().push_back( sub1.release() );
-        subMatchExpressions.mutableVector().push_back( sub2.release() );
-        subMatchExpressions.mutableVector().push_back( sub3.release() );
-        NorOp norOp;
-        ASSERT( norOp.init( &subMatchExpressions ).isOK() );
-        ASSERT( !norOp.matchesSingleElement( notMatch1[ "a" ] ) );
-        ASSERT( !norOp.matchesSingleElement( notMatch2[ "a" ] ) );
-        ASSERT( !norOp.matchesSingleElement( notMatch3[ "a" ] ) );
-        ASSERT( norOp.matchesSingleElement( match[ "a" ] ) );
-    }
-    */
-
-    TEST( NorOp, MatchesSingleClause ) {
-        BSONObj baseOperand = BSON( "$ne" << 5 );
-        auto_ptr<ComparisonMatchExpression> eq( new EqualityMatchExpression() );
-        ASSERT( eq->init( "a", baseOperand[ "$ne" ] ).isOK() );
-        auto_ptr<NotMatchExpression> ne( new NotMatchExpression() );
-        ASSERT( ne->init( eq.release() ).isOK() );
-
-        NorMatchExpression norOp;
-        norOp.add( ne.release() );
-
-        ASSERT( !norOp.matchesBSON( BSON( "a" << 4 ), NULL ) );
-        ASSERT( !norOp.matchesBSON( BSON( "a" << BSON_ARRAY( 4 << 6 ) ), NULL ) );
-        ASSERT( norOp.matchesBSON( BSON( "a" << 5 ), NULL ) );
-        ASSERT( norOp.matchesBSON( BSON( "a" << BSON_ARRAY( 4 << 5 ) ), NULL ) );
-    }
-
-    TEST( NorOp, MatchesThreeClauses ) {
-        BSONObj baseOperand1 = BSON( "$gt" << 10 );
-        BSONObj baseOperand2 = BSON( "$lt" << 0 );
-        BSONObj baseOperand3 = BSON( "b" << 100 );
-
-        auto_ptr<ComparisonMatchExpression> sub1( new GTMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "$gt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub2( new LTMatchExpression() );
-        ASSERT( sub2->init( "a", baseOperand2[ "$lt" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub3( new EqualityMatchExpression() );
-        ASSERT( sub3->init( "b", baseOperand3[ "b" ] ).isOK() );
-
-        NorMatchExpression norOp;
-        norOp.add( sub1.release() );
-        norOp.add( sub2.release() );
-        norOp.add( sub3.release() );
-
-        ASSERT( !norOp.matchesBSON( BSON( "a" << -1 ), NULL ) );
-        ASSERT( !norOp.matchesBSON( BSON( "a" << 11 ), NULL ) );
-        ASSERT( norOp.matchesBSON( BSON( "a" << 5 ), NULL ) );
-        ASSERT( !norOp.matchesBSON( BSON( "b" << 100 ), NULL ) );
-        ASSERT( norOp.matchesBSON( BSON( "b" << 101 ), NULL ) );
-        ASSERT( norOp.matchesBSON( BSONObj(), NULL ) );
-        ASSERT( !norOp.matchesBSON( BSON( "a" << 11 << "b" << 100 ), NULL ) );
-    }
-
-    TEST( NorOp, ElemMatchKey ) {
-        BSONObj baseOperand1 = BSON( "a" << 1 );
-        BSONObj baseOperand2 = BSON( "b" << 2 );
-        auto_ptr<ComparisonMatchExpression> sub1( new EqualityMatchExpression() );
-        ASSERT( sub1->init( "a", baseOperand1[ "a" ] ).isOK() );
-        auto_ptr<ComparisonMatchExpression> sub2( new EqualityMatchExpression() );
-        ASSERT( sub2->init( "b", baseOperand2[ "b" ] ).isOK() );
-
-        NorMatchExpression norOp;
-        norOp.add( sub1.release() );
-        norOp.add( sub2.release() );
-
-        MatchDetails details;
-        details.requestElemMatchKey();
-        ASSERT( !norOp.matchesBSON( BSON( "a" << 1 ), &details ) );
-        ASSERT( !details.hasElemMatchKey() );
-        ASSERT( !norOp.matchesBSON( BSON( "a" << BSON_ARRAY( 1 ) << "b" << BSON_ARRAY( 10 ) ),
-                                &details ) );
-        ASSERT( !details.hasElemMatchKey() );
-        ASSERT( norOp.matchesBSON( BSON( "a" << BSON_ARRAY( 3 ) << "b" << BSON_ARRAY( 4 ) ),
-                               &details ) );
-        // The elem match key feature is not implemented for $nor.
-        ASSERT( !details.hasElemMatchKey() );
-    }
-
-
-    TEST( NorOp, Equivalent ) {
-        BSONObj baseOperand1 = BSON( "a" << 1 );
-        BSONObj baseOperand2 = BSON( "b" << 2 );
-        EqualityMatchExpression sub1;
-        ASSERT( sub1.init( "a", baseOperand1[ "a" ] ).isOK() );
-        EqualityMatchExpression sub2;
-        ASSERT( sub2.init( "b", baseOperand2[ "b" ] ).isOK() );
-
-        NorMatchExpression e1;
-        e1.add( sub1.shallowClone() );
-        e1.add( sub2.shallowClone() );
-
-        NorMatchExpression e2;
-        e2.add( sub1.shallowClone() );
-
-        ASSERT( e1.equivalent( &e1 ) );
-        ASSERT( !e1.equivalent( &e2 ) );
-    }
-
-    /**
-    TEST( NorOp, MatchesIndexKey ) {
-        BSONObj baseOperand = BSON( "a" << 5 );
-        auto_ptr<ComparisonMatchExpression> eq( new ComparisonMatchExpression() );
-        ASSERT( eq->init( "a", baseOperand[ "a" ] ).isOK() );
-        OwnedPointerVector<MatchMatchExpression> subMatchExpressions;
-        subMatchExpressions.mutableVector().push_back( eq.release() );
-        NorOp norOp;
-        ASSERT( norOp.init( &subMatchExpressions ).isOK() );
-        IndexSpec indexSpec( BSON( "a" << 1 ) );
-        BSONObj indexKey = BSON( "" << "7" );
-        ASSERT( MatchMatchExpression::PartialMatchResult_Unknown ==
-                norOp.matchesIndexKey( indexKey, indexSpec ) );
-    }
-    */
-
+TEST(NotMatchExpression, MatchesScalar) {
+    auto baseOperand = BSON("$lt" << 5);
+    auto lt = std::make_unique<LTMatchExpression>("a", baseOperand["$lt"]);
+    auto notOp = NotMatchExpression{lt.release()};
+    ASSERT(notOp.matchesBSON(BSON("a" << 6), nullptr));
+    ASSERT(!notOp.matchesBSON(BSON("a" << 4), nullptr));
 }
+
+TEST(NotMatchExpression, MatchesArray) {
+    auto baseOperand = BSON("$lt" << 5);
+    auto lt = std::make_unique<LTMatchExpression>("a", baseOperand["$lt"]);
+    auto notOp = NotMatchExpression{lt.release()};
+    ASSERT(notOp.matchesBSON(BSON("a" << BSON_ARRAY(6)), nullptr));
+    ASSERT(!notOp.matchesBSON(BSON("a" << BSON_ARRAY(4)), nullptr));
+    // All array elements must match.
+    ASSERT(!notOp.matchesBSON(BSON("a" << BSON_ARRAY(4 << 5 << 6)), nullptr));
+}
+
+TEST(NotMatchExpression, ElemMatchKey) {
+    auto baseOperand = BSON("$lt" << 5);
+    auto lt = std::make_unique<LTMatchExpression>("a", baseOperand["$lt"]);
+    auto notOp = NotMatchExpression{lt.release()};
+    auto details = MatchDetails{};
+    details.requestElemMatchKey();
+    ASSERT(!notOp.matchesBSON(BSON("a" << BSON_ARRAY(1)), &details));
+    ASSERT(!details.hasElemMatchKey());
+    ASSERT(notOp.matchesBSON(BSON("a" << 6), &details));
+    ASSERT(!details.hasElemMatchKey());
+    ASSERT(notOp.matchesBSON(BSON("a" << BSON_ARRAY(6)), &details));
+    // elemMatchKey is not implemented for negative match operators.
+    ASSERT(!details.hasElemMatchKey());
+}
+
+TEST(NotMatchExpression, SetCollatorPropagatesToChild) {
+    auto baseOperand = BSON("a"
+                            << "string");
+    auto eq = std::make_unique<EqualityMatchExpression>("a", baseOperand["a"]);
+    auto notOp = NotMatchExpression{eq.release()};
+    auto collator = CollatorInterfaceMock{CollatorInterfaceMock::MockType::kAlwaysEqual};
+    notOp.setCollator(&collator);
+    ASSERT(!notOp.matchesBSON(BSON("a"
+                                   << "string2"),
+                              nullptr));
+}
+
+TEST(AndOp, NoClauses) {
+    auto andMatchExpression = AndMatchExpression{};
+    ASSERT(andMatchExpression.matchesBSON(BSONObj{}, nullptr));
+}
+
+TEST(AndOp, MatchesElementThreeClauses) {
+    auto baseOperand1 = BSON("$lt"
+                             << "z1");
+    auto baseOperand2 = BSON("$gt"
+                             << "a1");
+    auto match = BSON("a"
+                      << "r1");
+    auto notMatch1 = BSON("a"
+                          << "z1");
+    auto notMatch2 = BSON("a"
+                          << "a1");
+    auto notMatch3 = BSON("a"
+                          << "r");
+
+    auto sub1 = std::make_unique<LTMatchExpression>("a", baseOperand1["$lt"]);
+    auto sub2 = std::make_unique<GTMatchExpression>("a", baseOperand2["$gt"]);
+    auto sub3 = std::make_unique<RegexMatchExpression>("a", "1", "");
+
+    auto andOp = AndMatchExpression{};
+    andOp.add(std::move(sub1));
+    andOp.add(std::move(sub2));
+    andOp.add(std::move(sub3));
+
+    ASSERT(andOp.matchesBSON(match));
+    ASSERT(!andOp.matchesBSON(notMatch1));
+    ASSERT(!andOp.matchesBSON(notMatch2));
+    ASSERT(!andOp.matchesBSON(notMatch3));
+}
+
+TEST(AndOp, MatchesSingleClause) {
+    auto baseOperand = BSON("$ne" << 5);
+    auto eq = std::make_unique<EqualityMatchExpression>("a", baseOperand["$ne"]);
+    auto ne = std::make_unique<NotMatchExpression>(eq.release());
+
+    auto andOp = AndMatchExpression{};
+    andOp.add(std::move(ne));
+
+    ASSERT(andOp.matchesBSON(BSON("a" << 4), nullptr));
+    ASSERT(andOp.matchesBSON(BSON("a" << BSON_ARRAY(4 << 6)), nullptr));
+    ASSERT(!andOp.matchesBSON(BSON("a" << 5), nullptr));
+    ASSERT(!andOp.matchesBSON(BSON("a" << BSON_ARRAY(4 << 5)), nullptr));
+}
+
+TEST(AndOp, MatchesThreeClauses) {
+    auto baseOperand1 = BSON("$gt" << 1);
+    auto baseOperand2 = BSON("$lt" << 10);
+    auto baseOperand3 = BSON("$lt" << 100);
+
+    auto sub1 = std::make_unique<GTMatchExpression>("a", baseOperand1["$gt"]);
+    auto sub2 = std::make_unique<LTMatchExpression>("a", baseOperand2["$lt"]);
+    auto sub3 = std::make_unique<LTMatchExpression>("b", baseOperand3["$lt"]);
+
+    auto andOp = AndMatchExpression{};
+    andOp.add(std::move(sub1));
+    andOp.add(std::move(sub2));
+    andOp.add(std::move(sub3));
+
+    ASSERT(andOp.matchesBSON(BSON("a" << 5 << "b" << 6), nullptr));
+    ASSERT(!andOp.matchesBSON(BSON("a" << 5), nullptr));
+    ASSERT(!andOp.matchesBSON(BSON("b" << 6), nullptr));
+    ASSERT(!andOp.matchesBSON(BSON("a" << 1 << "b" << 6), nullptr));
+    ASSERT(!andOp.matchesBSON(BSON("a" << 10 << "b" << 6), nullptr));
+}
+
+TEST(AndOp, ElemMatchKey) {
+    auto baseOperand1 = BSON("a" << 1);
+    auto baseOperand2 = BSON("b" << 2);
+
+    auto sub1 = std::make_unique<EqualityMatchExpression>("a", baseOperand1["a"]);
+    auto sub2 = std::make_unique<EqualityMatchExpression>("b", baseOperand2["b"]);
+
+    auto andOp = AndMatchExpression{};
+    andOp.add(std::move(sub1));
+    andOp.add(std::move(sub2));
+
+    auto details = MatchDetails{};
+    details.requestElemMatchKey();
+    ASSERT(!andOp.matchesBSON(BSON("a" << BSON_ARRAY(1)), &details));
+    ASSERT(!details.hasElemMatchKey());
+    ASSERT(!andOp.matchesBSON(BSON("b" << BSON_ARRAY(2)), &details));
+    ASSERT(!details.hasElemMatchKey());
+    ASSERT(andOp.matchesBSON(BSON("a" << BSON_ARRAY(1) << "b" << BSON_ARRAY(1 << 2)), &details));
+    ASSERT(details.hasElemMatchKey());
+    // The elem match key for the second $and clause is recorded.
+    ASSERT_EQUALS("1", details.elemMatchKey());
+}
+
+TEST(OrOp, NoClauses) {
+    auto orOp = OrMatchExpression{};
+    ASSERT(!orOp.matchesBSON(BSONObj{}, nullptr));
+}
+
+TEST(OrOp, MatchesSingleClause) {
+    auto baseOperand = BSON("$ne" << 5);
+    auto eq = std::make_unique<EqualityMatchExpression>("a", baseOperand["$ne"]);
+    auto ne = std::make_unique<NotMatchExpression>(eq.release());
+
+    auto orOp = OrMatchExpression{};
+    orOp.add(std::move(ne));
+
+    ASSERT(orOp.matchesBSON(BSON("a" << 4), nullptr));
+    ASSERT(orOp.matchesBSON(BSON("a" << BSON_ARRAY(4 << 6)), nullptr));
+    ASSERT(!orOp.matchesBSON(BSON("a" << 5), nullptr));
+    ASSERT(!orOp.matchesBSON(BSON("a" << BSON_ARRAY(4 << 5)), nullptr));
+}
+
+TEST(OrOp, MatchesTwoClauses) {
+    auto clauseObj1 = fromjson("{i: 5}");
+    auto clauseObj2 = fromjson("{'i.a': 6}");
+    auto clause1 = std::make_unique<EqualityMatchExpression>("i", clauseObj1["i"]);
+    auto clause2 = std::make_unique<EqualityMatchExpression>("i.a", clauseObj2["i.a"]);
+
+    auto filter = OrMatchExpression{};
+    filter.add(std::move(clause1));
+    filter.add(std::move(clause2));
+
+    auto aClause1 = fromjson("{a: 5}");
+    auto iClause1 = fromjson("{i: 5}");
+    ASSERT_TRUE(filter.matchesBSONElement(aClause1["a"]));
+    ASSERT_TRUE(filter.matchesBSON(iClause1));
+
+    auto aClause2 = fromjson("{a: {a: 6}}");
+    auto iClause2 = fromjson("{i: {a: 6}}");
+    ASSERT_TRUE(filter.matchesBSONElement(aClause2["a"]));
+    ASSERT_TRUE(filter.matchesBSON(iClause2));
+
+    auto aNoMatch1 = fromjson("{a: 6}");
+    auto iNoMatch1 = fromjson("{i: 6}");
+    ASSERT_FALSE(filter.matchesBSONElement(aNoMatch1["a"]));
+    ASSERT_FALSE(filter.matchesBSON(iNoMatch1));
+
+    auto aNoMatch2 = fromjson("{a: {a: 5}}");
+    auto iNoMatch2 = fromjson("{i: {a: 5}}");
+    ASSERT_FALSE(filter.matchesBSONElement(aNoMatch2["a"]));
+    ASSERT_FALSE(filter.matchesBSON(iNoMatch2));
+}
+
+TEST(OrOp, MatchesThreeClauses) {
+    auto baseOperand1 = BSON("$gt" << 10);
+    auto baseOperand2 = BSON("$lt" << 0);
+    auto baseOperand3 = BSON("b" << 100);
+    auto sub1 = std::make_unique<GTMatchExpression>("a", baseOperand1["$gt"]);
+    auto sub2 = std::make_unique<LTMatchExpression>("a", baseOperand2["$lt"]);
+    auto sub3 = std::make_unique<EqualityMatchExpression>("b", baseOperand3["b"]);
+
+    auto orOp = OrMatchExpression{};
+    orOp.add(std::move(sub1));
+    orOp.add(std::move(sub2));
+    orOp.add(std::move(sub3));
+
+    ASSERT(orOp.matchesBSON(BSON("a" << -1), nullptr));
+    ASSERT(orOp.matchesBSON(BSON("a" << 11), nullptr));
+    ASSERT(!orOp.matchesBSON(BSON("a" << 5), nullptr));
+    ASSERT(orOp.matchesBSON(BSON("b" << 100), nullptr));
+    ASSERT(!orOp.matchesBSON(BSON("b" << 101), nullptr));
+    ASSERT(!orOp.matchesBSON(BSONObj(), nullptr));
+    ASSERT(orOp.matchesBSON(BSON("a" << 11 << "b" << 100), nullptr));
+}
+
+TEST(OrOp, ElemMatchKey) {
+    auto baseOperand1 = BSON("a" << 1);
+    auto baseOperand2 = BSON("b" << 2);
+    auto sub1 = std::make_unique<EqualityMatchExpression>("a", baseOperand1["a"]);
+    auto sub2 = std::make_unique<EqualityMatchExpression>("b", baseOperand2["b"]);
+
+    auto orOp = OrMatchExpression{};
+    orOp.add(std::move(sub1));
+    orOp.add(std::move(sub2));
+
+    auto details = MatchDetails{};
+    details.requestElemMatchKey();
+    ASSERT(!orOp.matchesBSON(BSONObj{}, &details));
+    ASSERT(!details.hasElemMatchKey());
+    ASSERT(!orOp.matchesBSON(BSON("a" << BSON_ARRAY(10) << "b" << BSON_ARRAY(10)), &details));
+    ASSERT(!details.hasElemMatchKey());
+    ASSERT(orOp.matchesBSON(BSON("a" << BSON_ARRAY(1) << "b" << BSON_ARRAY(1 << 2)), &details));
+    // The elem match key feature is not implemented for $or.
+    ASSERT(!details.hasElemMatchKey());
+}
+
+TEST(NorOp, NoClauses) {
+    auto norOp = NorMatchExpression{};
+    ASSERT(norOp.matchesBSON(BSONObj{}, nullptr));
+}
+
+TEST(NorOp, MatchesSingleClause) {
+    auto baseOperand = BSON("$ne" << 5);
+    auto eq = std::make_unique<EqualityMatchExpression>("a", baseOperand["$ne"]);
+    auto ne = std::make_unique<NotMatchExpression>(eq.release());
+
+    auto norOp = NorMatchExpression{};
+    norOp.add(std::move(ne));
+
+    ASSERT(!norOp.matchesBSON(BSON("a" << 4), nullptr));
+    ASSERT(!norOp.matchesBSON(BSON("a" << BSON_ARRAY(4 << 6)), nullptr));
+    ASSERT(norOp.matchesBSON(BSON("a" << 5), nullptr));
+    ASSERT(norOp.matchesBSON(BSON("a" << BSON_ARRAY(4 << 5)), nullptr));
+}
+
+TEST(NorOp, MatchesThreeClauses) {
+    auto baseOperand1 = BSON("$gt" << 10);
+    auto baseOperand2 = BSON("$lt" << 0);
+    auto baseOperand3 = BSON("b" << 100);
+
+    auto sub1 = std::make_unique<GTMatchExpression>("a", baseOperand1["$gt"]);
+    auto sub2 = std::make_unique<LTMatchExpression>("a", baseOperand2["$lt"]);
+    auto sub3 = std::make_unique<EqualityMatchExpression>("b", baseOperand3["b"]);
+
+    auto norOp = NorMatchExpression{};
+    norOp.add(std::move(sub1));
+    norOp.add(std::move(sub2));
+    norOp.add(std::move(sub3));
+
+    ASSERT(!norOp.matchesBSON(BSON("a" << -1), nullptr));
+    ASSERT(!norOp.matchesBSON(BSON("a" << 11), nullptr));
+    ASSERT(norOp.matchesBSON(BSON("a" << 5), nullptr));
+    ASSERT(!norOp.matchesBSON(BSON("b" << 100), nullptr));
+    ASSERT(norOp.matchesBSON(BSON("b" << 101), nullptr));
+    ASSERT(norOp.matchesBSON(BSONObj{}, nullptr));
+    ASSERT(!norOp.matchesBSON(BSON("a" << 11 << "b" << 100), nullptr));
+}
+
+TEST(NorOp, ElemMatchKey) {
+    auto baseOperand1 = BSON("a" << 1);
+    auto baseOperand2 = BSON("b" << 2);
+    auto sub1 = std::make_unique<EqualityMatchExpression>("a", baseOperand1["a"]);
+    auto sub2 = std::make_unique<EqualityMatchExpression>("b", baseOperand2["b"]);
+
+    auto norOp = NorMatchExpression{};
+    norOp.add(std::move(sub1));
+    norOp.add(std::move(sub2));
+
+    MatchDetails details;
+    details.requestElemMatchKey();
+    ASSERT(!norOp.matchesBSON(BSON("a" << 1), &details));
+    ASSERT(!details.hasElemMatchKey());
+    ASSERT(!norOp.matchesBSON(BSON("a" << BSON_ARRAY(1) << "b" << BSON_ARRAY(10)), &details));
+    ASSERT(!details.hasElemMatchKey());
+    ASSERT(norOp.matchesBSON(BSON("a" << BSON_ARRAY(3) << "b" << BSON_ARRAY(4)), &details));
+    // The elem match key feature is not implemented for $nor.
+    ASSERT(!details.hasElemMatchKey());
+}
+
+
+TEST(NorOp, Equivalent) {
+    auto baseOperand1 = BSON("a" << 1);
+    auto baseOperand2 = BSON("b" << 2);
+    auto sub1 = EqualityMatchExpression{"a", baseOperand1["a"]};
+    auto sub2 = EqualityMatchExpression{"b", baseOperand2["b"]};
+
+    auto e1 = NorMatchExpression{};
+    e1.add(sub1.shallowClone());
+    e1.add(sub2.shallowClone());
+
+    auto e2 = NorMatchExpression{};
+    e2.add(sub1.shallowClone());
+
+    ASSERT(e1.equivalent(&e1));
+    ASSERT(!e1.equivalent(&e2));
+}
+}  // namespace mongo

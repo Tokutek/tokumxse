@@ -6,21 +6,17 @@ ACLOCAL_AMFLAGS = -I build_posix/aclocal
 lib_LTLIBRARIES = libwiredtiger.la
 LDADD = $(lib_LTLIBRARIES)
 
-# The LevelDB libraries prefer to include all of the objects in a single
-# library.  Create a convenience library for them.
-if LEVELDB
-noinst_LTLIBRARIES = libwiredtiger_static.la
-endif
-
 # BEGIN SOURCES, maintained by makemake and dist/filelist
 # END SOURCES
 
 bin_PROGRAMS = wt
 wt_SOURCES =\
+	src/utilities/util_alter.c \
 	src/utilities/util_backup.c \
-	src/utilities/util_cpyright.c \
 	src/utilities/util_compact.c \
+	src/utilities/util_cpyright.c \
 	src/utilities/util_create.c \
+	src/utilities/util_downgrade.c \
 	src/utilities/util_drop.c \
 	src/utilities/util_dump.c \
 	src/utilities/util_list.c \
@@ -34,6 +30,7 @@ wt_SOURCES =\
 	src/utilities/util_rename.c \
 	src/utilities/util_salvage.c \
 	src/utilities/util_stat.c \
+	src/utilities/util_truncate.c \
 	src/utilities/util_upgrade.c \
 	src/utilities/util_verbose.c \
 	src/utilities/util_verify.c \
@@ -54,12 +51,6 @@ $(srcdir)/Makefile.am: $(srcdir)/build_posix/Make.base $(srcdir)/build_posix/mak
 libtool: $(LIBTOOL_DEPS)
 	$(SHELL) ./config.status libtool
 
-$(srcdir)/src/include/extern.h: auto-includes.chk
-$(srcdir)/src/include/wt_internal.h: auto-includes.chk
-
-auto-includes.chk: $(libwiredtiger_la_SOURCES)
-	@(cd $(srcdir)/dist && sh s_prototypes && sh s_typedef -b) && touch $@
-
 $(srcdir)/docs/index.html:
 	@cd $(srcdir)/dist && sh s_docs
 
@@ -76,9 +67,9 @@ endif
 if HAVE_BUILTIN_EXTENSION_ZLIB
 libwiredtiger_la_LIBADD += ext/compressors/zlib/libwiredtiger_zlib.la
 endif
-
-libwiredtiger_static_la_LIBADD=$(libwiredtiger_la_LIBADD)
-libwiredtiger_static_la_SOURCES=$(libwiredtiger_la_SOURCES)
+if HAVE_BUILTIN_EXTENSION_ZSTD
+libwiredtiger_la_LIBADD += ext/compressors/zstd/libwiredtiger_zstd.la
+endif
 
 clean-local:
 	rm -rf WT_TEST

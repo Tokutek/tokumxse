@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2012-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -29,69 +30,99 @@
 #pragma once
 
 #include <set>
+#include <string>
 
 #include "mongo/base/string_data.h"
-#include "mongo/db/namespace_string.h"
-#include "mongo/util/concurrency/mutex.h"
-#include "mongo/util/string_map.h"
+#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_options.h"
 
 namespace mongo {
 
-    class Database;
+class CollectionCatalogEntry;
+class Database;
+class OperationContext;
+class RecordStore;
+class ViewCatalog;
+
+/**
+ * Registry of opened databases.
+ */
+class DatabaseHolder {
+public:
+    // Operation Context binding.
+    static DatabaseHolder* get(ServiceContext* service);
+    static DatabaseHolder* get(ServiceContext& service);
+    static DatabaseHolder* get(OperationContext* opCtx);
+    static void set(ServiceContext* service, std::unique_ptr<DatabaseHolder> databaseHolder);
+
+    virtual ~DatabaseHolder() = default;
+
+    DatabaseHolder() = default;
 
     /**
-     * Registry of opened databases.
+     * Retrieves an already opened database or returns nullptr. Must be called with the database
+     * locked in at least IS-mode.
      */
-    class DatabaseHolder {
-    public:
-        DatabaseHolder() : _m("dbholder") { }
+    virtual Database* getDb(OperationContext* const opCtx, const StringData ns) const = 0;
 
-        /**
-         * Retrieves an already opened database or returns NULL. Must be called with the database
-         * locked in at least IS-mode.
-         */
-        Database* get(OperationContext* txn, StringData ns) const;
+    /**
+     * Fetches the ViewCatalog decorating the Database matching 'dbName', or returns nullptr if the
+     * database does not exist. The returned ViewCatalog is safe to access without a lock because it
+     * is held as a shared_ptr.
+     *
+     * The ViewCatalog must be fetched through this interface if the caller holds no database lock
+     * to ensure the Database object is safe to access. This class' internal mutex provides
+     * concurrency protection around looking up and accessing the Database object matching 'dbName.
+     */
+    virtual std::shared_ptr<const ViewCatalog> getViewCatalog(OperationContext* const opCtx,
+                                                              StringData dbName) const = 0;
 
-        /**
-         * Retrieves a database reference if it is already opened, or opens it if it hasn't been
-         * opened/created yet. Must be called with the database locked in X-mode.
-         *
-         * @param justCreated Returns whether the database was newly created (true) or it already
-         *          existed (false). Can be NULL if this information is not necessary.
-         */
-        Database* openDb(OperationContext* txn, StringData ns, bool* justCreated = NULL);
+    /**
+     * Retrieves a database reference if it is already opened, or opens it if it hasn't been
+     * opened/created yet. Must be called with the database locked in X-mode.
+     *
+     * @param justCreated Returns whether the database was newly created (true) or it already
+     *          existed (false). Can be NULL if this information is not necessary.
+     */
+    virtual Database* openDb(OperationContext* const opCtx,
+                             const StringData ns,
+                             bool* const justCreated = nullptr) = 0;
 
-        /**
-         * Closes the specified database. Must be called with the database locked in X-mode.
-         */
-        void close(OperationContext* txn, StringData ns);
+    /**
+     * Physically drops the specified opened database and removes it from the server's metadata. It
+     * doesn't notify the replication subsystem or do any other consistency checks, so it should
+     * not be used directly from user commands.
+     *
+     * Must be called with the specified database locked in X mode. The caller must ensure no index
+     * builds are in progress on the database.
+     */
+    virtual void dropDb(OperationContext* opCtx, Database* db) = 0;
 
-        /**
-         * Closes all opened databases. Must be called with the global lock acquired in X-mode.
-         *
-         * @param result Populated with the names of the databases, which were closed.
-         * @param force Force close even if something underway - use at shutdown
-         */
-        bool closeAll(OperationContext* txn, BSONObjBuilder& result, bool force);
+    /**
+     * Closes the specified database. Must be called with the database locked in X-mode.
+     * No background jobs must be in progress on the database when this function is called.
+     */
+    virtual void close(OperationContext* opCtx, const StringData ns) = 0;
 
-        /**
-         * Retrieves the names of all currently opened databases. Does not require locking, but it
-         * is not guaranteed that the returned set of names will be still valid unless a global
-         * lock is held, which would prevent database from disappearing or being created.
-         */
-        void getAllShortNames( std::set<std::string>& all ) const {
-            SimpleMutex::scoped_lock lk(_m);
-            for( DBs::const_iterator j=_dbs.begin(); j!=_dbs.end(); ++j ) {
-                all.insert( j->first );
-            }
-        }
+    /**
+     * Closes all opened databases. Must be called with the global lock acquired in X-mode.
+     * Will uassert if any background jobs are running when this function is called.
+     *
+     * The caller must hold the global X lock and ensure there are no index builds in progress.
+     */
+    virtual void closeAll(OperationContext* opCtx) = 0;
 
-    private:
-        typedef StringMap<Database*> DBs;
+    /**
+     * Returns the set of existing database names that differ only in casing.
+     */
+    virtual std::set<std::string> getNamesWithConflictingCasing(const StringData name) = 0;
 
-        mutable SimpleMutex _m;
-        DBs _dbs;
-    };
+    /**
+     * Returns all the database names (including those which are empty).
+     *
+     * Unlike CollectionCatalog::getAllDbNames(), this returns databases that are empty.
+     */
+    virtual std::vector<std::string> getNames() = 0;
+};
 
-    DatabaseHolder& dbHolder();
-}
+}  // namespace mongo

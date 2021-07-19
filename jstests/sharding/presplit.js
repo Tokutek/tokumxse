@@ -1,38 +1,41 @@
-// presplit.js
+(function() {
 
-// Starts a new sharding environment limiting the chunksize to 1MB. 
-s = new ShardingTest( "presplit" , 2 , 2 , 1 , { chunksize : 1 } );
+load("jstests/sharding/libs/find_chunks_util.js");
+
+var s = new ShardingTest({name: "presplit", shards: 2, mongos: 1, other: {chunkSize: 1}});
+
+s.adminCommand({enablesharding: "test"});
+s.ensurePrimaryShard('test', s.shard1.shardName);
 
 // Insert enough data in 'test.foo' to fill several chunks, if it was sharded.
 bigString = "";
-while ( bigString.length < 10000 ){
+while (bigString.length < 10000) {
     bigString += "asdasdasdasdadasdasdasdasdasdasdasdasda";
 }
 
-db = s.getDB( "test" );
+db = s.getDB("test");
 inserted = 0;
 num = 0;
 var bulk = db.foo.initializeUnorderedBulkOp();
-while ( inserted < ( 20 * 1024 * 1024 ) ){
-    bulk.insert({ _id: num++, s: bigString });
+while (inserted < (20 * 1024 * 1024)) {
+    bulk.insert({_id: num++, s: bigString});
     inserted += bigString.length;
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
 // Make sure that there's only one chunk holding all the data.
 s.printChunks();
-primary = s.getServer( "test" ).getDB( "test" );
-assert.eq( 0 , s.config.chunks.count()  , "single chunk assertion" );
-assert.eq( num , primary.foo.count() );
+primary = s.getPrimaryShard("test").getDB("test");
+assert.eq(0, s.config.chunks.count({"ns": "test.foo"}), "single chunk assertion");
+assert.eq(num, primary.foo.count());
 
-// Turn on sharding on the 'test.foo' collection
-s.adminCommand( { enablesharding : "test" } );
-s.adminCommand( { shardcollection : "test.foo" , key : { _id : 1 } } );
+s.adminCommand({shardcollection: "test.foo", key: {_id: 1}});
 
-// Make sure the collection's original chunk got split 
+// Make sure the collection's original chunk got split
 s.printChunks();
-assert.lt( 20 , s.config.chunks.count() , "many chunks assertion" );
-assert.eq( num , primary.foo.count() );
+assert.lt(20, findChunksUtil.countChunksForNs(s.config, "test.foo"), "many chunks assertion");
+assert.eq(num, primary.foo.count());
 
 s.printChangeLog();
 s.stop();
+})();

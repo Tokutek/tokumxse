@@ -1,32 +1,31 @@
 // test that "show log dbname" and "show logs" have good err messages when unauthorized
+// @tags: [live_record_incompatible]
 
-var port = allocatePorts( 1 )[ 0 ];
 var baseName = "jstests_show_log_auth";
 
-var m = startMongod( "--auth", "--port", port, "--dbpath", MongoRunner.dataPath + baseName, "--nohttpinterface", "--bind_ip", "127.0.0.1" , "--nojournal" , "--smallfiles" );
-var db = m.getDB( "admin" );
+var m = MongoRunner.runMongod({auth: "", bind_ip: "127.0.0.1"});
+var db = m.getDB("admin");
 
-db.createUser({user: "admin" , pwd: "pass", roles: jsTest.adminUserRoles});
-
-// Temporarily capture this shell's print() output
-var oldprint = print, printed = [];
-print = function(s) { printed.push(s); }
-
-try {
-    shellHelper.show('logs');
-    shellHelper.show('log ' + baseName);
-}
-finally {
-    // Stop capturing print() output
-    print = oldprint;
-}
+db.createUser({user: "admin", pwd: "pass", roles: jsTest.adminUserRoles});
 
 function assertStartsWith(s, prefix) {
     assert.eq(s.substr(0, prefix.length), prefix);
 }
 
-assertStartsWith(printed[0], 'Error while trying to show logs');
-assertStartsWith(printed[1], 'Error while trying to show ' + baseName + ' log');
+assertStartsWith(print
+                     .captureAllOutput(function() {
+                         shellHelper.show('logs');
+                     })
+                     .output[0],
+                 'Error while trying to show logs');
 
-db.auth( "admin" , "pass" );
+assertStartsWith(print
+                     .captureAllOutput(function() {
+                         shellHelper.show('log ' + baseName);
+                     })
+                     .output[0],
+                 'Error while trying to show ' + baseName + ' log');
+
+db.auth("admin", "pass");
 db.shutdownServer();
+waitProgram(m.pid);

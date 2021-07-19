@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,94 +29,107 @@
 
 #pragma once
 
-#include "mongo/db/jsobj.h"
-#include "mongo/db/exec/plan_stage.h"
+#include <memory>
+#include <queue>
+
+#include "mongo/db/exec/requires_all_indices_stage.h"
 #include "mongo/db/exec/working_set.h"
+#include "mongo/db/jsobj.h"
 #include "mongo/db/query/canonical_query.h"
+#include "mongo/db/query/query_planner_params.h"
 #include "mongo/db/query/query_solution.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
 
+class PlanYieldPolicy;
+
+/**
+ * Runs a trial period in order to evaluate the cost of a cached plan. If the cost is unexpectedly
+ * high, the plan cache entry is deactivated and we use multi-planning to select an entirely new
+ * winning plan. This process is called "replanning".
+ *
+ * This stage requires all indices to stay intact during the trial period so that replanning can
+ * occur with the set of indices in 'params'. As a future improvement, we could instead refresh the
+ * list of indices in 'params' prior to replanning, and thus avoid inheriting from
+ * RequiresAllIndicesStage.
+ */
+class CachedPlanStage final : public RequiresAllIndicesStage {
+public:
+    CachedPlanStage(ExpressionContext* expCtx,
+                    const CollectionPtr& collection,
+                    WorkingSet* ws,
+                    CanonicalQuery* cq,
+                    const QueryPlannerParams& params,
+                    size_t decisionWorks,
+                    std::unique_ptr<PlanStage> root);
+
+    bool isEOF() final;
+
+    StageState doWork(WorkingSetID* out) final;
+
+    StageType stageType() const final {
+        return STAGE_CACHED_PLAN;
+    }
+
+    std::unique_ptr<PlanStageStats> getStats() final;
+
+    const SpecificStats* getSpecificStats() const final;
+
+    static const char* kStageType;
+
     /**
-     * This stage outputs its mainChild, and possibly its backup child
-     * and also updates the cache.
+     * Runs the cached plan for a trial period, yielding during the trial period according to
+     * 'yieldPolicy'.
      *
-     * Preconditions: Valid RecordId.
-     *
+     * Feedback from the trial period is passed to the plan cache. If the performance is lower
+     * than expected, the old plan is evicted and a new plan is selected from scratch (again
+     * yielding according to 'yieldPolicy'). Otherwise, the cached plan is run.
      */
-    class CachedPlanStage : public PlanStage {
-    public:
-        /**
-         * Takes ownership of 'mainChild', 'mainQs', 'backupChild', and 'backupQs'.
-         */
-        CachedPlanStage(const Collection* collection,
-                        CanonicalQuery* cq,
-                        PlanStage* mainChild,
-                        QuerySolution* mainQs,
-                        PlanStage* backupChild = NULL,
-                        QuerySolution* backupQs = NULL);
+    Status pickBestPlan(PlanYieldPolicy* yieldPolicy);
 
-        virtual ~CachedPlanStage();
+private:
+    /**
+     * Uses the QueryPlanner and the MultiPlanStage to re-generate candidate plans for this
+     * query and select a new winner.
+     *
+     * We fallback to a new plan if updatePlanCache() tells us that the performance was worse
+     * than anticipated during the trial period.
+     *
+     * We only modify the plan cache if 'shouldCache' is true.
+     */
+    Status replan(PlanYieldPolicy* yieldPolicy, bool shouldCache, std::string reason);
 
-        virtual bool isEOF();
+    /**
+     * May yield during the cached plan stage's trial period or replanning phases.
+     *
+     * Returns a non-OK status if query planning fails. In particular, this function returns
+     * ErrorCodes::QueryPlanKilled if the query plan was killed during a yield, or
+     * ErrorCodes::MaxTimeMSExpired if the operation exceeded its time limit.
+     */
+    Status tryYield(PlanYieldPolicy* yieldPolicy);
 
-        virtual StageState work(WorkingSetID* out);
+    // Not owned.
+    WorkingSet* _ws;
 
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    // Not owned.
+    CanonicalQuery* _canonicalQuery;
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    QueryPlannerParams _plannerParams;
 
-        virtual StageType stageType() const { return STAGE_CACHED_PLAN; }
+    // The number of work cycles taken to decide on a winning plan when the plan was first
+    // cached.
+    size_t _decisionWorks;
 
-        virtual PlanStageStats* getStats();
+    // If we fall back to re-planning the query, and there is just one resulting query solution,
+    // that solution is owned here.
+    std::unique_ptr<QuerySolution> _replannedQs;
 
-        virtual const CommonStats* getCommonStats();
+    // Any results produced during trial period execution are kept here.
+    std::queue<WorkingSetID> _results;
 
-        virtual const SpecificStats* getSpecificStats();
-
-        static const char* kStageType;
-
-        void kill();
-
-    private:
-        PlanStage* getActiveChild() const;
-        void updateCache();
-
-        // not owned
-        const Collection* _collection;
-
-        // not owned
-        CanonicalQuery* _canonicalQuery;
-
-        // Owned by us. Must be deleted after the corresponding PlanStage trees, as
-        // those trees point into the query solutions.
-        boost::scoped_ptr<QuerySolution> _mainQs;
-        boost::scoped_ptr<QuerySolution> _backupQs;
-
-        // Owned by us. Must be deleted before the QuerySolutions above, as these
-        // can point into the QuerySolutions.
-        boost::scoped_ptr<PlanStage> _mainChildPlan;
-        boost::scoped_ptr<PlanStage> _backupChildPlan;
-
-        // True if the main plan errors before producing results
-        // and if a backup plan is available (can happen with blocking sorts)
-        bool _usingBackupChild;
-
-        // True if the childPlan has produced results yet.
-        bool _alreadyProduced;
-
-        // Have we updated the cache with our plan stats yet?
-        bool _updatedCache;
-
-        // Has this query been killed?
-        bool _killed;
-
-        // Stats
-        CommonStats _commonStats;
-        CachedPlanStats _specificStats;
-    };
+    // Stats
+    CachedPlanStats _specificStats;
+};
 
 }  // namespace mongo

@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,358 +27,391 @@
  *    it in the license file.
  */
 
-#include "mongo/bson/ordering.h"
-#include "mongo/db/catalog/head_manager.h"
+#include <boost/optional/optional.hpp>
+#include <boost/optional/optional_io.hpp>
+#include <memory>
+
 #include "mongo/db/jsobj.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
-#include "mongo/db/storage/record_store.h"
+#include "mongo/db/storage/ident.h"
+#include "mongo/db/storage/index_entry_comparison.h"
+#include "mongo/db/storage/key_format.h"
+#include "mongo/db/storage/key_string.h"
 
 #pragma once
 
 namespace mongo {
 
-    class BSONObjBuilder;
-    class BucketDeletionNotification;
-    class SortedDataBuilderInterface;
+class BSONObjBuilder;
+class BucketDeletionNotification;
+class SortedDataBuilderInterface;
+struct IndexValidateResults;
+
+/**
+ * This is the uniform interface for storing indexes and supporting point queries as well as range
+ * queries. The actual implementation is up to the storage engine. All the storage engines must
+ * support an index key size up to the maximum document size.
+ */
+class SortedDataInterface : public Ident {
+public:
+    /**
+     * Constructs a SortedDataInterface. The rsKeyFormat is the RecordId key format of the related
+     * RecordStore.
+     */
+    SortedDataInterface(StringData ident,
+                        KeyString::Version keyStringVersion,
+                        Ordering ordering,
+                        KeyFormat rsKeyFormat)
+        : Ident(ident.toString()),
+          _keyStringVersion(keyStringVersion),
+          _ordering(ordering),
+          _rsKeyFormat(rsKeyFormat) {}
+
+    virtual ~SortedDataInterface() {}
+
+    //
+    // Data changes
+    //
 
     /**
-     * This interface is a work in progress.  Notes below:
+     * Return a bulk builder for 'this' index.
      *
-     * This interface began as the SortedDataInterface, a way to hide the fact that there were two
-     * on-disk formats for the btree.  With the introduction of other storage engines, this
-     * interface was generalized to provide access to sorted data.  Specifically:
+     * Implementations can assume that 'this' index outlives its bulk
+     * builder.
      *
-     * 1. Many other storage engines provide different Btree(-ish) implementations.  This interface
-     * could allow those interfaces to avoid storing btree buckets in an already sorted structure.
-     *
-     * TODO: See if there is actually a performance gain.
-     *
-     * 2. The existing btree implementation is written to assume that if it modifies a record it is
-     * modifying the underlying record.  This interface is an attempt to work around that.
-     *
-     * TODO: See if this actually works.
+     * @param opCtx the transaction under which keys are added to 'this' index
+     * @param dupsAllowed true if duplicate keys are allowed, and false
+     *        otherwise
      */
-    class SortedDataInterface {
+    virtual std::unique_ptr<SortedDataBuilderInterface> makeBulkBuilder(OperationContext* opCtx,
+                                                                        bool dupsAllowed) = 0;
+
+    /**
+     * Insert an entry into the index with the specified KeyString, which must have a RecordId
+     * appended to the end.
+     *
+     * @param opCtx the transaction under which the insert takes place
+     * @param dupsAllowed true if duplicate keys are allowed, and false
+     *        otherwise
+     *
+     * @return Status::OK() if the insert succeeded,
+     *
+     *         ErrorCodes::DuplicateKey if 'keyString' already exists in 'this' index
+     *         at a RecordId other than 'loc' and duplicates were not allowed
+     */
+    virtual Status insert(OperationContext* opCtx,
+                          const KeyString::Value& keyString,
+                          bool dupsAllowed) = 0;
+
+    /**
+     * Remove the entry from the index with the specified KeyString, which must have a RecordId
+     * appended to the end.
+     *
+     * @param opCtx the transaction under which the remove takes place
+     * @param dupsAllowed true to enforce strict checks to ensure we only delete a key with an exact
+     *        match, false otherwise
+     */
+    virtual void unindex(OperationContext* opCtx,
+                         const KeyString::Value& keyString,
+                         bool dupsAllowed) = 0;
+
+    /**
+     * Return ErrorCodes::DuplicateKey if there is more than one occurence of 'KeyString' in this
+     * index, and Status::OK() otherwise. This call is only allowed on a unique index, and will
+     * invariant otherwise.
+     *
+     * @param opCtx the transaction under which this operation takes place
+     */
+    virtual Status dupKeyCheck(OperationContext* opCtx, const KeyString::Value& keyString) = 0;
+
+    /**
+     * Attempt to reduce the storage space used by this index via compaction. Only called if the
+     * indexed record store supports compaction-in-place.
+     */
+    virtual Status compact(OperationContext* opCtx) {
+        return Status::OK();
+    }
+
+    //
+    // Information about the tree
+    //
+
+    /**
+     * TODO: expose full set of args for testing?
+     */
+    virtual void fullValidate(OperationContext* opCtx,
+                              long long* numKeysOut,
+                              IndexValidateResults* fullResults) const = 0;
+
+    virtual bool appendCustomStats(OperationContext* opCtx,
+                                   BSONObjBuilder* output,
+                                   double scale) const = 0;
+
+
+    /**
+     * Return the number of bytes consumed by 'this' index.
+     *
+     * @param opCtx the transaction under which this operation takes place
+     *
+     * @see IndexAccessMethod::getSpaceUsedBytes
+     */
+    virtual long long getSpaceUsedBytes(OperationContext* opCtx) const = 0;
+
+    /**
+     * The number of unused free bytes consumed by this index on disk.
+     */
+    virtual long long getFreeStorageBytes(OperationContext* opCtx) const = 0;
+
+    /**
+     * Return true if 'this' index is empty, and false otherwise.
+     */
+    virtual bool isEmpty(OperationContext* opCtx) = 0;
+
+    /**
+     * Return the number of entries in 'this' index.
+     *
+     * The default implementation should be overridden with a more
+     * efficient one if at all possible.
+     */
+    virtual long long numEntries(OperationContext* opCtx) const {
+        long long x = -1;
+        fullValidate(opCtx, &x, nullptr);
+        return x;
+    }
+
+    /*
+     * Return the KeyString version for 'this' index.
+     */
+    KeyString::Version getKeyStringVersion() const {
+        return _keyStringVersion;
+    }
+
+    /*
+     * Return the ordering for 'this' index.
+     */
+    Ordering getOrdering() const {
+        return _ordering;
+    }
+
+    /**
+     * Returns the format of the associated RecordStore's RecordId keys.
+     */
+    KeyFormat rsKeyFormat() const {
+        return _rsKeyFormat;
+    }
+
+    /**
+     * Navigates over the sorted data.
+     *
+     * A cursor is constructed with a direction flag with the following effects:
+     *      - The direction that next() moves.
+     *      - If a seek method hits an exact match on key, forward cursors will be positioned on
+     *        the first value for that key, reverse cursors on the last.
+     *      - If a seek method or restore does not hit an exact match, cursors will be
+     *        positioned on the closest position *after* the query in the direction of the
+     *        search.
+     *      - The end position is on the "far" side of the query. In a forward cursor that means
+     *        that it is the lowest value for the key if the end is exclusive or the first entry
+     *        past the key if the end is inclusive or there are no exact matches.
+     *
+     * A cursor is tied to a transaction, such as the OperationContext or a WriteUnitOfWork
+     * inside that context. Any cursor acquired inside a transaction is invalid outside
+     * of that transaction, instead use the save and restore methods to reestablish the cursor.
+     *
+     * Any method other than the save methods may throw WriteConflict exception. If that
+     * happens, the cursor may not be used again until it has been saved and successfully
+     * restored. If next() or restore() throw a WCE the cursor's position will be the same as
+     * before the call (strong exception guarantee). All other methods leave the cursor in a
+     * valid state but with an unspecified position (basic exception guarantee). All methods
+     * only provide the basic guarantee for exceptions other than WCE.
+     *
+     * Any returned unowned BSON is only valid until the next call to any method on this
+     * interface. The implementations must assume that passed-in unowned BSON is only valid for
+     * the duration of the call.
+     *
+     * Implementations may override any default implementation if they can provide a more
+     * efficient implementation.
+     */
+    class Cursor {
     public:
-        virtual ~SortedDataInterface() { }
-
-        //
-        // Data changes
-        //
-
         /**
-         * Return a bulk builder for 'this' index.
+         * Tells methods that return an IndexKeyEntry what part of the data the caller is
+         * interested in.
          *
-         * Implementations can assume that 'this' index outlives its bulk
-         * builder.
+         * Methods returning an engaged optional<T> will only return null RecordIds or empty
+         * BSONObjs if they have been explicitly left out of the request.
          *
-         * @param txn the transaction under which keys are added to 'this' index
-         * @param dupsAllowed true if duplicate keys are allowed, and false
-         *        otherwise
-         *
-         * @return caller takes ownership
+         * Implementations are allowed to return more data than requested, but not less.
          */
-        virtual SortedDataBuilderInterface* getBulkBuilder(OperationContext* txn,
-                                                           bool dupsAllowed) = 0;
-
-        /**
-         * Insert an entry into the index with the specified key and RecordId.
-         *
-         * @param txn the transaction under which the insert takes place
-         * @param dupsAllowed true if duplicate keys are allowed, and false
-         *        otherwise
-         *
-         * @return Status::OK() if the insert succeeded,
-         *
-         *         ErrorCodes::DuplicateKey if 'key' already exists in 'this' index
-         *         at a RecordId other than 'loc' and duplicates were not allowed
-         */
-        virtual Status insert(OperationContext* txn,
-                              const BSONObj& key,
-                              const RecordId& loc,
-                              bool dupsAllowed) = 0;
-
-        /**
-         * Remove the entry from the index with the specified key and RecordId.
-         *
-         * @param txn the transaction under which the remove takes place
-         * @param dupsAllowed true if duplicate keys are allowed, and false
-         *        otherwise
-         */
-        virtual void unindex(OperationContext* txn,
-                             const BSONObj& key,
-                             const RecordId& loc,
-                             bool dupsAllowed) = 0;
-
-        /**
-         * Return ErrorCodes::DuplicateKey if 'key' already exists in 'this'
-         * index at a RecordId other than 'loc', and Status::OK() otherwise.
-         *
-         * @param txn the transaction under which this operation takes place
-         *
-         * TODO: Hide this by exposing an update method?
-         */
-        virtual Status dupKeyCheck(OperationContext* txn,
-                                   const BSONObj& key,
-                                   const RecordId& loc) = 0;
-
-        //
-        // Information about the tree
-        //
-
-        /**
-         * 'output' is used to store results of validate when 'full' is true.
-         * If 'full' is false, 'output' may be NULL.
-         *
-         * TODO: expose full set of args for testing?
-         */
-        virtual void fullValidate(OperationContext* txn, bool full, long long* numKeysOut,
-                                  BSONObjBuilder* output) const = 0;
-
-        virtual bool appendCustomStats(OperationContext* txn, BSONObjBuilder* output, double scale)
-            const = 0;
-
-
-        /**
-         * Return the number of bytes consumed by 'this' index.
-         *
-         * @param txn the transaction under which this operation takes place
-         *
-         * @see IndexAccessMethod::getSpaceUsedBytes
-         */
-        virtual long long getSpaceUsedBytes( OperationContext* txn ) const = 0;
-
-        /**
-         * Return true if 'this' index is empty, and false otherwise.
-         */
-        virtual bool isEmpty(OperationContext* txn) = 0;
-
-        /**
-         * Attempt to bring the entirety of 'this' index into memory.
-         *
-         * If the underlying storage engine does not support the operation,
-         * returns ErrorCodes::CommandNotSupported
-         *
-         * @return Status::OK()
-         */
-        virtual Status touch(OperationContext* txn) const {
-            return Status(ErrorCodes::CommandNotSupported,
-                          "this storage engine does not support touch");
-        }
-
-        /**
-         * Return the number of entries in 'this' index.
-         *
-         * The default implementation should be overridden with a more
-         * efficient one if at all possible.
-         */
-        virtual long long numEntries( OperationContext* txn ) const {
-            long long x = -1;
-            fullValidate(txn, false, &x, NULL);
-            return x;
-        }
-
-        /**
-         * Navigation
-         *
-         * A cursor is tied to a transaction, such as the OperationContext or a WriteUnitOfWork
-         * inside that context. Any cursor acquired inside a transaction is invalid outside
-         * of that transaction, instead use the savePosition() and restorePosition() methods
-         * reestablish the cursor.
-         */
-        class Cursor {
-        public:
-            virtual ~Cursor() {}
-
-            /**
-             * Return the direction of 'this' cursor.
-             *
-             * @return +1 for a forward cursor or -1 for a reverse cursor
-             */
-            virtual int getDirection() const = 0;
-
-            /**
-             * Return true if 'this' forward (reverse) cursor is positioned
-             * past the end (before the beginning) of the index, and false otherwise.
-             */
-            virtual bool isEOF() const = 0;
-
-            /**
-             * Return true if 'this' cursor and the 'other' cursor are positioned at
-             * the same key and RecordId, or if both cursors are at EOF. Otherwise,
-             * this function returns false.
-             *
-             * Implementations should prohibit the comparison of cursors associated
-             * with different indices.
-             */
-             virtual bool pointsToSamePlaceAs(const Cursor& other) const = 0;
-
-            /**
-             * Position 'this' forward (reverse) cursor either at the entry or
-             * immediately after (or immediately before) the specified key and RecordId.
-             * The cursor should be positioned at EOF if no such entry exists.
-             *
-             * @return true if the entry (key, RecordId) exists within the index,
-             *         and false otherwise
-             */
-            virtual bool locate(const BSONObj& key, const RecordId& loc) = 0;
-
-            /**
-             * Position 'this' forward (reverse) cursor either at the next
-             * (previous) occurrence of a particular key or immediately after
-             * (or immediately before).
-             *
-             * @see SortedDataInterface::customLocate
-             */
-            virtual void advanceTo(const BSONObj &keyPrefix,
-                                   int prefixLen,
-                                   bool prefixExclusive,
-                                   const std::vector<const BSONElement*>& keySuffix,
-                                   const std::vector<bool>& suffixInclusive) = 0;
-
-            /**
-             * Position 'this' forward (reverse) cursor either at the first
-             * (last) occurrence of a particular key or immediately after
-             * (or immediately before). The key is a typical BSONObj,
-             * represented by the specified parameters in the following way:
-             *
-             * The first 'prefixLen' elements of 'keyPrefix' followed by
-             * the last 'keySuffix.size() - prefixLen' elements of 'keySuffix'.
-             *
-             * e.g.
-             *
-             *  Suppose that
-             *
-             *      keyPrefix = { "" : 1, "" : 2 }
-             *      prefixLen = 1
-             *      prefixExclusive = false
-             *      keySuffix = [ IGNORED; { "" : 5 } ]
-             *      suffixInclusive = [ IGNORED; false ]
-             *
-             *      ==> represented key is { "" : 1, "" : 5 }
-             *          with the exclusive byte set on the second field
-             *
-             *  Suppose that
-             *
-             *      keyPrefix = { "" : 1, "" : 2 }
-             *      prefixLen = 1
-             *      prefixExclusive = true
-             *      keySuffix = IGNORED
-             *      suffixInclusive = IGNORED
-             *
-             *      ==> represented key is { "" : 1 }
-             *          with the exclusive byte set on the first field
-             *
-             * @param prefixExclusive true if 'this' forward (reverse) cursor
-             *        should be positioned immediately after (immediately
-             *        before) the represented key, and false otherwise
-             *
-             * @param suffixInclusive an element of the vector is false if
-             *        'this' forward (reverse) cursor should be positioned
-             *        immediately after (immediately before) the represented
-             *        key, and true otherwise
-             *
-             * Implementations should prohibit callers from specifying
-             * 'prefixLen = 0' when 'prefixExclusive = true'.
-             *
-             * @see IndexEntryComparison::makeQueryObject
-             */
-            virtual void customLocate(const BSONObj& keyPrefix,
-                                      int prefixLen,
-                                      bool prefixExclusive,
-                                      const std::vector<const BSONElement*>& keySuffix,
-                                      const std::vector<bool>& suffixInclusive) = 0;
-
-            /**
-             * Return the key associated with the current position of 'this' cursor.
-             */
-            virtual BSONObj getKey() const = 0;
-
-            /**
-             * Return the RecordId associated with the current position of 'this' cursor.
-             */
-            virtual RecordId getRecordId() const = 0;
-
-            /**
-             * Position 'this' forward (reverse) cursor at the next (preceding) entry
-             * in the index. A cursor positioned at EOF should remain at EOF when advanced.
-             */
-            virtual void advance() = 0;
-
-            //
-            // Saving and restoring state
-            //
-
-            /**
-             * Save the entry in the index (i.e. its key and RecordId) of where
-             * 'this' cursor is currently positioned.
-             *
-             * Implementations can assume that no operations other than delete
-             * or restorePosition() will be called on 'this' cursor after its
-             * position has been saved.
-             */
-            virtual void savePosition() = 0;
-
-            /**
-             * Restore 'this' cursor to the previously saved entry in the index.
-             *
-             * Implementations should have the same behavior as calling locate()
-             * with the saved key and RecordId.
-             */
-            virtual void restorePosition(OperationContext* txn) = 0;
+        enum RequestedInfo {
+            // Only usable part of the return is whether it is engaged or not.
+            kJustExistance = 0,
+            // Key must be filled in.
+            kWantKey = 1,
+            // Loc must be fulled in.
+            kWantLoc = 2,
+            // Both must be returned.
+            kKeyAndLoc = kWantKey | kWantLoc,
         };
 
+        virtual ~Cursor() = default;
+
+
         /**
-         * Return a cursor over 'this' index. The cursor need not be positioned
-         * at any particular entry.
+         * Sets the position to stop scanning. An empty key unsets the end position.
          *
-         * Implementations can assume that locate() is called on the cursor
-         * before it gets used.
+         * If next() hits this position, or a seek method attempts to seek past it they
+         * unposition the cursor and return boost::none.
          *
-         * Implementations can assume that 'this' index outlives all cursors
-         * it produces.
-         *
-         * @param txn the transaction to which the cursor is tied
-         * @param direction the direction of the cursor.
-         *        +1 for a forward cursor or -1 for a reverse cursor.
-         *
-         * @return caller takes ownership
+         * Setting the end position should be done before seeking since the current position, if
+         * any, isn't checked.
          */
-        virtual Cursor* newCursor(OperationContext* txn, int direction) const = 0;
+        virtual void setEndPosition(const BSONObj& key, bool inclusive) = 0;
+
+        /**
+         * Moves forward and returns the new data or boost::none if there is no more data.
+         * If not positioned, returns boost::none.
+         */
+        virtual boost::optional<IndexKeyEntry> next(RequestedInfo parts = kKeyAndLoc) = 0;
+        virtual boost::optional<KeyStringEntry> nextKeyString() = 0;
 
         //
-        // Index creation
+        // Seeking
         //
 
-        virtual Status initAsEmpty(OperationContext* txn) = 0;
+        /**
+         * Seeks to the provided keyString and returns the KeyStringEntry.
+         * The provided keyString has discriminator information encoded.
+         */
+        virtual boost::optional<KeyStringEntry> seekForKeyString(
+            const KeyString::Value& keyString) = 0;
+
+        /**
+         * Seeks to the provided keyString and returns the IndexKeyEntry.
+         * The provided keyString has discriminator information encoded.
+         */
+        virtual boost::optional<IndexKeyEntry> seek(const KeyString::Value& keyString,
+                                                    RequestedInfo parts = kKeyAndLoc) = 0;
+
+        /**
+         * Seeks to a key with a hint to the implementation that you only want exact matches. If
+         * an exact match can't be found, boost::none will be returned and the resulting
+         * position of the cursor is unspecified.
+         *
+         * This will not accept a KeyString with a Discriminator other than kInclusive. Since
+         * keys are not stored with Discriminators, an exact match would never be found.
+         */
+        virtual boost::optional<KeyStringEntry> seekExactForKeyString(
+            const KeyString::Value& keyString) = 0;
+
+        /**
+         * Seeks to a key with a hint to the implementation that you only want exact matches. If
+         * an exact match can't be found, boost::none will be returned and the resulting
+         * position of the cursor is unspecified.
+         *
+         * This will not accept a KeyString with a Discriminator other than kInclusive. Since
+         * keys are not stored with Discriminators, an exact match would never be found.
+         *
+         * Unlike the previous method, this one will return IndexKeyEntry if an exact match is
+         * found.
+         */
+        virtual boost::optional<IndexKeyEntry> seekExact(const KeyString::Value& keyString,
+                                                         RequestedInfo parts = kKeyAndLoc) = 0;
+
+        //
+        // Saving and restoring state
+        //
+
+        /**
+         * Prepares for state changes in underlying data in a way that allows the cursor's
+         * current position to be restored.
+         *
+         * It is safe to call save multiple times in a row.
+         * No other method (excluding destructor) may be called until successfully restored.
+         */
+        virtual void save() = 0;
+
+        /**
+         * Prepares for state changes in underlying data without necessarily saving the current
+         * state.
+         *
+         * The cursor's position when restored is unspecified. Caller is expected to seek
+         * following the restore.
+         *
+         * It is safe to call saveUnpositioned multiple times in a row.
+         * No other method (excluding destructor) may be called until successfully restored.
+         */
+        virtual void saveUnpositioned() {
+            save();
+        }
+
+        /**
+         * Recovers from potential state changes in underlying data.
+         *
+         * If the former position no longer exists, a following call to next() will return the
+         * next closest position in the direction of the scan, if any.
+         *
+         * This handles restoring after either save() or saveUnpositioned().
+         */
+        virtual void restore() = 0;
+
+        /**
+         * Detaches from the OperationContext and releases any storage-engine state.
+         *
+         * It is only legal to call this when in a "saved" state. While in the "detached" state, it
+         * is only legal to call reattachToOperationContext or the destructor. It is not legal to
+         * call detachFromOperationContext() while already in the detached state.
+         */
+        virtual void detachFromOperationContext() = 0;
+
+        /**
+         * Reattaches to the OperationContext and reacquires any storage-engine state.
+         *
+         * It is only legal to call this in the "detached" state. On return, the cursor is left in a
+         * "saved" state, so callers must still call restoreState to use this object.
+         */
+        virtual void reattachToOperationContext(OperationContext* opCtx) = 0;
     };
 
     /**
-     * A version-hiding wrapper around the bulk builder for the Btree.
+     * Returns an unpositioned cursor over 'this' index.
+     *
+     * Implementations can assume that 'this' index outlives all cursors it produces.
      */
-    class SortedDataBuilderInterface {
-    public:
-        virtual ~SortedDataBuilderInterface() { }
+    virtual std::unique_ptr<Cursor> newCursor(OperationContext* opCtx,
+                                              bool isForward = true) const = 0;
 
-        /**
-         * Adds 'key' to intermediate storage.
-         *
-         * 'key' must be > or >= the last key passed to this function (depends on _dupsAllowed).  If
-         * this is violated an error Status (ErrorCodes::InternalError) will be returned.
-         */
-        virtual Status addKey(const BSONObj& key, const RecordId& loc) = 0;
+    //
+    // Index creation
+    //
 
-        /**
-         * Do any necessary work to finish building the tree.
-         *
-         * The default implementation may be used if no commit phase is necessary because addKey
-         * always leaves the tree in a valid state.
-         *
-         * This is called outside of any WriteUnitOfWork to allow implementations to split this up
-         * into multiple units.
-         */
-        virtual void commit(bool mayInterrupt) {}
-    };
+    virtual Status initAsEmpty(OperationContext* opCtx) = 0;
+
+protected:
+    const KeyString::Version _keyStringVersion;
+    const Ordering _ordering;
+    const KeyFormat _rsKeyFormat;
+};
+
+/**
+ * A version-hiding wrapper around the bulk builder for the Btree.
+ */
+class SortedDataBuilderInterface {
+public:
+    virtual ~SortedDataBuilderInterface() {}
+
+    /**
+     * Adds 'keyString' to intermediate storage.
+     *
+     * 'keyString' must be > or >= the last key passed to this function (depends on _dupsAllowed).
+     * If this is violated an error Status (ErrorCodes::InternalError) will be returned.
+     *
+     * Some storage engines require callers to manage a WriteUnitOfWork to perform these inserts
+     * transactionally. Other storage engines do not perform inserts transactionally and will ignore
+     * any parent WriteUnitOfWork.
+     */
+    virtual Status addKey(const KeyString::Value& keyString) = 0;
+};
 
 }  // namespace mongo

@@ -2,14 +2,20 @@
 // localhost exception does not apply.  That is, if mongos cannot verify that there
 // are user documents stored in the configuration information, it must assume that
 // there are.
+// @tags: [requires_sharding]
 
-var dopts = { smallfiles: "", nopreallocj: ""}
-var st = new ShardingTest(
-    { shards: 1,
-      mongos: 1,
-      config: 1,
-      keyFile: 'jstests/libs/key1',
-      other: { shardOptions: dopts, configOptions: dopts, mongosOptions: { verbose: 1 } } } );
+// The config servers are not reachable at shutdown.
+TestData.skipCheckingIndexesConsistentAcrossCluster = true;
+TestData.skipCheckOrphans = true;
+
+var st = new ShardingTest({
+    shards: 1,
+    mongos: 1,
+    config: 1,
+    keyFile: 'jstests/libs/key1',
+    useHostname: false,  // Needed when relying on the localhost exception
+    other: {mongosOptions: {verbose: 1}}
+});
 var mongos = st.s;
 var config = st.config0;
 var authzErrorCode = 13;
@@ -31,10 +37,10 @@ assert.commandFailedWithCode(db.adminCommand('serverStatus'), authzErrorCode);
 db.auth('user', 'pwd');
 assert.commandWorked(db.adminCommand('serverStatus'));
 
-jsTest.log('repeat without config server')
+jsTest.log('repeat without config server');
 
 // shut down only config server
-stopMongod(config.port, /*signal*/15);
+MongoRunner.stopMongod(config);
 
 // open a new connection to mongos (unauthorized)
 var conn2 = new Mongo(mongos.host);
@@ -42,3 +48,4 @@ var db2 = conn2.getDB('admin');
 
 // should fail since user is not authorized.
 assert.commandFailedWithCode(db2.adminCommand('serverStatus'), authzErrorCode);
+st.stop();

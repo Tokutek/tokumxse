@@ -6,31 +6,26 @@
 # description: Mongo is a scalable, document-oriented database.
 # processname: mongod
 # config: /etc/mongod.conf
-# pidfile: /var/run/mongodb/mongod.pid
 
 . /etc/rc.d/init.d/functions
-
-# things from mongod.conf get there by mongod reading it
-
 
 # NOTE: if you change any OPTIONS here, you get what you pay for:
 # this script assumes all options are in the config file.
 CONFIGFILE="/etc/mongod.conf"
 OPTIONS=" -f $CONFIGFILE"
-SYSCONFIG="/etc/sysconfig/mongod"
-
-PIDFILEPATH=`awk -F'[:=]' -v IGNORECASE=1 '/^[[:blank:]]*(processManagement\.)?pidfilepath[[:blank:]]*[:=][[:blank:]]*/{print $2}' "$CONFIGFILE" | tr -d "[:blank:]\"'"`
 
 mongod=${MONGOD-/usr/bin/mongod}
 
 MONGO_USER=mongod
 MONGO_GROUP=mongod
 
+# All variables set before this point can be overridden by users, by
+# setting them directly in the SYSCONFIG file. Use this to explicitly
+# override these values, at your own risk.
+SYSCONFIG="/etc/sysconfig/mongod"
 if [ -f "$SYSCONFIG" ]; then
     . "$SYSCONFIG"
 fi
-
-PIDDIR=`dirname $PIDFILEPATH`
 
 # Handle NUMA access to CPUs (SERVER-3574)
 # This verifies the existence of numactl as well as testing that the command works
@@ -42,6 +37,10 @@ else
     NUMACTL=""
 fi
 
+# things from mongod.conf get there by mongod reading it
+PIDFILEPATH="`awk -F'[:=]' -v IGNORECASE=1 '/^[[:blank:]]*(processManagement\.)?pidfilepath[[:blank:]]*[:=][[:blank:]]*/{print $2}' \"$CONFIGFILE\" | tr -d \"[:blank:]\\"'\" | awk -F'#' '{print $1}'`"
+PIDDIR=`dirname $PIDFILEPATH`
+
 start()
 {
   # Make sure the default pidfile directory exists
@@ -49,8 +48,15 @@ start()
     install -d -m 0755 -o $MONGO_USER -g $MONGO_GROUP $PIDDIR
   fi
 
+  # Make sure the pidfile does not exist
+  if [ -f "$PIDFILEPATH" ]; then
+      echo "Error starting mongod. $PIDFILEPATH exists."
+      RETVAL=1
+      return
+  fi
+
   # Recommended ulimit values for mongod or mongos
-  # See http://docs.mongodb.org/manual/reference/ulimit/#recommended-settings
+  # See https://docs.mongodb.com/manual/reference/ulimit/#recommended-ulimit-settings
   #
   ulimit -f unlimited
   ulimit -t unlimited
@@ -58,6 +64,7 @@ start()
   ulimit -n 64000
   ulimit -m unlimited
   ulimit -u 64000
+  ulimit -l unlimited
 
   echo -n $"Starting mongod: "
   daemon --user "$MONGO_USER" --check $mongod "$NUMACTL $mongod $OPTIONS >/dev/null 2>&1"
@@ -76,8 +83,8 @@ stop()
 }
 
 restart () {
-	stop
-	start
+        stop
+        start
 }
 
 # Send TERM signal to process and wait up to 300 seconds for process to go away.
@@ -93,7 +100,32 @@ mongo_killproc()
   local -i duration=10
   local pid=`pidofproc -p "${pid_file}" ${procname}`
 
-  kill -TERM $pid >/dev/null 2>&1
+  if [ ! -f "${pid_file}" ]; then
+     echo "No PID file detected, nothing to stop"
+     return 0
+  fi
+
+  # Per the man page the process name should always be the second
+  # field. In our case mongod is wrapped in parens hence the parens in
+  # the if condition below.
+  local stat_procname=`cat /proc/$pid/stat | cut -d" " -f2`
+  # $procname is the full path to the mongod binary but the process
+  # name will only match the binary's file name.
+  local binary_name=`basename $procname`
+  if [ "($binary_name)" != "$stat_procname" ]; then
+     echo "PID file may have been tampered with, refusing to kill process"
+     echo "Expected (${binary_name}) but found ${stat_procname}"
+     return 1
+  fi
+
+  # This doesn't actually "daemonize" this process. All this function
+  # does (defined in /etc/init.d/function) is run a process as another
+  # user in a way that doesn't require sudo or other packages which
+  # are not guaranteed to exist on any given system.
+  #
+  # The check flag here can be ignored it doesn't do anything except
+  # prevent the daemon function's PID checking from throwing an error.
+  daemon --check "$mongod" --user "$MONGO_USER" "kill -TERM $pid >/dev/null 2>&1"
   usleep 100000
   local -i x=0
   while [ $x -le $delay ] && checkpid $pid; do
@@ -101,15 +133,13 @@ mongo_killproc()
     x=$(( $x + $duration))
   done
 
-  kill -KILL $pid >/dev/null 2>&1
+  daemon --check "$mongod" --user "$MONGO_USER" "kill -KILL $pid >/dev/null 2>&1"
   usleep 100000
 
-  rm -f "${pid_file}"
-
-  checkpid $pid
+  checkpid $pid # returns 0 only if the process exists
   local RC=$?
-  [ "$RC" -eq 0 ] && failure "${procname} shutdown" || success "${procname} shutdown"
-  RC=$((! $RC))
+  [ "$RC" -eq 0 ] && failure "${procname} shutdown" || rm -f "${pid_file}"; success "${procname} shutdown"
+  RC=$((! $RC)) # invert return code so we return 0 when process is dead.
   return $RC
 }
 

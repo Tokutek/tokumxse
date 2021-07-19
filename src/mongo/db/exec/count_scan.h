@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,104 +29,110 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
-
-#include "mongo/db/exec/plan_stage.h"
-#include "mongo/db/index/index_access_method.h"
-#include "mongo/db/jsobj.h"
+#include "mongo/db/exec/requires_index_stage.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/operation_context.h"
 #include "mongo/db/record_id.h"
-#include "mongo/platform/unordered_set.h"
+#include "mongo/db/storage/sorted_data_interface.h"
+#include "mongo/stdx/unordered_set.h"
 
 namespace mongo {
 
-    class IndexAccessMethod;
-    class IndexDescriptor;
-    class WorkingSet;
+class WorkingSet;
 
-    struct CountScanParams {
-        CountScanParams() : descriptor(NULL) { }
+struct CountScanParams {
+    CountScanParams(const IndexDescriptor* descriptor,
+                    std::string indexName,
+                    BSONObj keyPattern,
+                    MultikeyPaths multikeyPaths,
+                    bool multikey)
+        : indexDescriptor(descriptor),
+          name(std::move(indexName)),
+          keyPattern(std::move(keyPattern)),
+          multikeyPaths(std::move(multikeyPaths)),
+          isMultiKey(multikey) {
+        invariant(descriptor);
+    }
 
-        // What index are we traversing?
-        const IndexDescriptor* descriptor;
+    CountScanParams(OperationContext* opCtx, const IndexDescriptor* descriptor)
+        : CountScanParams(descriptor,
+                          descriptor->indexName(),
+                          descriptor->keyPattern(),
+                          descriptor->getEntry()->getMultikeyPaths(opCtx),
+                          descriptor->getEntry()->isMultikey()) {}
 
-        BSONObj startKey;
-        bool startKeyInclusive;
+    const IndexDescriptor* indexDescriptor;
+    std::string name;
 
-        BSONObj endKey;
-        bool endKeyInclusive;
-    };
+    BSONObj keyPattern;
 
-    /**
-     * Used by the count command.  Scans an index from a start key to an end key.  Does not create
-     * any WorkingSetMember(s) for any of the data, instead returning ADVANCED to indicate to the
-     * caller that another result should be counted.
-     *
-     * Only created through the getExecutorCount path, as count is the only operation that doesn't
-     * care about its data.
-     */
-    class CountScan : public PlanStage {
-    public:
-        CountScan(OperationContext* txn, const CountScanParams& params, WorkingSet* workingSet);
-        virtual ~CountScan() { }
+    MultikeyPaths multikeyPaths;
+    bool isMultiKey;
 
-        virtual StageState work(WorkingSetID* out);
-        virtual bool isEOF();
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    BSONObj startKey;
+    bool startKeyInclusive{true};
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    BSONObj endKey;
+    bool endKeyInclusive{true};
+};
 
-        virtual StageType stageType() const { return STAGE_COUNT_SCAN; }
+/**
+ * Used by the count command. Scans an index from a start key to an end key. Creates a
+ * WorkingSetMember for each matching index key in RID_AND_OBJ state. It has a null record id and an
+ * empty object with a null snapshot id rather than real data. Returning real data is unnecessary
+ * since all we need is the count.
+ *
+ * Only created through the getExecutorCount() path, as count is the only operation that doesn't
+ * care about its data.
+ */
+class CountScan final : public RequiresIndexStage {
+public:
+    CountScan(ExpressionContext* expCtx,
+              const CollectionPtr& collection,
+              CountScanParams params,
+              WorkingSet* workingSet);
 
-        virtual PlanStageStats* getStats();
+    StageState doWork(WorkingSetID* out) final;
+    bool isEOF() final;
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
 
-        virtual const CommonStats* getCommonStats();
+    StageType stageType() const final {
+        return STAGE_COUNT_SCAN;
+    }
 
-        virtual const SpecificStats* getSpecificStats();
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-        static const char* kStageType;
+    const SpecificStats* getSpecificStats() const final;
 
-    private:
-        /**
-         * Initialize the underlying IndexCursor
-         */
-        void initIndexCursor();
+    static const char* kStageType;
 
-        /**
-         * See if we've hit the end yet.
-         */
-        void checkEnd();
+protected:
+    void doSaveStateRequiresIndex() final;
 
-        // transactional context for read locks. Not owned by us
-        OperationContext* _txn;
+    void doRestoreStateRequiresIndex() final;
 
-        // The WorkingSet we annotate with results.  Not owned by us.
-        WorkingSet* _workingSet;
+private:
+    // The WorkingSet we annotate with results.  Not owned by us.
+    WorkingSet* _workingSet;
 
-        // Index access.  Both pointers below are owned by Collection -> IndexCatalog.
-        const IndexDescriptor* _descriptor;
-        const IndexAccessMethod* _iam;
+    const BSONObj _keyPattern;
 
-        // Our start cursor.
-        boost::scoped_ptr<IndexCursor> _cursor;
+    const bool _shouldDedup;
 
-        // Our end marker.
-        boost::scoped_ptr<IndexCursor> _endCursor;
+    const BSONObj _startKey;
+    const bool _startKeyInclusive = true;
 
-        // Could our index have duplicates?  If so, we use _returned to dedup.
-        unordered_set<RecordId, RecordId::Hasher> _returned;
+    const BSONObj _endKey;
+    const bool _endKeyInclusive = true;
 
-        CountScanParams _params;
+    std::unique_ptr<SortedDataInterface::Cursor> _cursor;
 
-        bool _hitEnd;
+    // The set of record ids we've returned so far. Used to avoid returning duplicates, if
+    // '_shouldDedup' is set to true.
+    stdx::unordered_set<RecordId, RecordId::Hasher> _returned;
 
-        bool _shouldDedup;
-
-        CommonStats _commonStats;
-        CountScanStats _specificStats;
-    };
+    CountScanStats _specificStats;
+};
 
 }  // namespace mongo

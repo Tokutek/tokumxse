@@ -1,6 +1,7 @@
 /*
  * Test that replSetInitiate prohibits w:0 in getLastErrorDefaults,
  * SERVER-13055.
+ * @tags: [multiversion_incompatible]
  */
 
 var InvalidReplicaSetConfig = 93;
@@ -23,13 +24,11 @@ function testInitiate(gleDefaults) {
 /*
  * Try to initiate with w: 0 in getLastErrorDefaults.
  */
-testInitiate({
-    getLastErrorDefaults: {w: 0}});
+testInitiate({getLastErrorDefaults: {w: 0}});
 
 /*
  * Try to initiate with w: 0 and other options in getLastErrorDefaults.
  */
-testInitiate({
-    getLastErrorDefaults: {w: 0, j: false, wtimeout: 100, fsync: true}});
+testInitiate({getLastErrorDefaults: {w: 0, j: false, wtimeout: 100, fsync: true}});
 
 replTest.stopSet();

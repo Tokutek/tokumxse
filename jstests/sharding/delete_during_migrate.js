@@ -1,42 +1,45 @@
-// Test migrating a big chunk while deletions are happening within that chunk.
-// Test is slightly non-deterministic, since removes could happen before migrate
-// starts. Protect against that by making chunk very large.
+/**
+ * Test migrating a big chunk while deletions are happening within that chunk. Test is slightly
+ * non-deterministic, since removes could happen before migrate starts. Protect against that by
+ * making chunk very large.
+ *
+ * This test is labeled resource intensive because its total io_write is 88MB compared to a median
+ * of 5MB across all sharding tests in wiredTiger.
+ * @tags: [resource_intensive]
+ */
+(function() {
+'use strict';
 
-// start up a new sharded cluster
-var st = new ShardingTest({ shards : 2, mongos : 1 });
+var st = new ShardingTest({shards: 2, mongos: 1});
 
-// stop balancer since we want manual control for this
-st.stopBalancer();
-
-var dbname = "testDB";
+var dbname = "test";
 var coll = "foo";
 var ns = dbname + "." + coll;
-var s = st.s0;
-var t = s.getDB( dbname ).getCollection( coll );
 
-// Create fresh collection with lots of docs
-t.drop();
-for ( i=0; i<200000; i++ ){
-    t.insert( { a : i  } );
+assert.commandWorked(st.s0.adminCommand({enablesharding: dbname}));
+st.ensurePrimaryShard(dbname, st.shard1.shardName);
+
+var t = st.s0.getDB(dbname).getCollection(coll);
+
+var bulk = t.initializeUnorderedBulkOp();
+for (var i = 0; i < 200000; i++) {
+    bulk.insert({a: i});
 }
+assert.commandWorked(bulk.execute());
 
 // enable sharding of the collection. Only 1 chunk.
-t.ensureIndex( { a : 1 } );
-s.adminCommand( { enablesharding : dbname } );
-s.adminCommand( { shardcollection : ns , key: { a : 1 } } );
+t.createIndex({a: 1});
+
+assert.commandWorked(st.s0.adminCommand({shardcollection: ns, key: {a: 1}}));
 
 // start a parallel shell that deletes things
-startMongoProgramNoConnect( "mongo" ,
-                            "--host" , getHostName() ,
-                            "--port" , st.s0.port ,
-                            "--eval" , "db." + coll + ".remove({});" ,
-                            dbname );
+var join = startParallelShell("db." + coll + ".remove({});", st.s0.port);
 
 // migrate while deletions are happening
-var moveResult =  s.adminCommand( { moveChunk : ns ,
-                                    find : { a : 1 } ,
-                                    to : st.getOther( st.getServer( dbname ) ).name } );
-// check if migration worked
-assert( moveResult.ok , "migration didn't work while doing deletes" );
+assert.commandWorked(st.s0.adminCommand(
+    {moveChunk: ns, find: {a: 1}, to: st.getOther(st.getPrimaryShard(dbname)).name}));
+
+join();
 
 st.stop();
+})();

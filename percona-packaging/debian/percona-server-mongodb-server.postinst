@@ -1,0 +1,117 @@
+#!/bin/bash
+# postinst script for Percona Server for MongoDB
+#
+# see: dh_installdeb(1)
+
+if [ -f /usr/share/debconf/confmodule ]; then
+    . /usr/share/debconf/confmodule
+fi
+
+set -e
+
+# summary of how this script can be called:
+#        * <postinst> `configure' <most-recently-configured-version>
+#        * <old-postinst> `abort-upgrade' <new version>
+#        * <conflictor's-postinst> `abort-remove' `in-favour' <package>
+#          <new-version>
+#        * <postinst> `abort-remove'
+#        * <deconfigured's-postinst> `abort-deconfigure' `in-favour'
+#          <failed-install-package> <version> `removing'
+#          <conflicting-package> <version>
+# for details, see http://www.debian.org/doc/debian-policy/ or
+# the debian-policy package
+
+parse_yaml() {
+   local s='[[:space:]]*' w='[a-zA-Z0-9_]*' fs=$(echo @|tr @ '\034')
+   sed -ne "s|^\($s\)\($w\)$s:$s\"\(.*\)\"$s\$|\1$fs\2$fs\3|p" \
+        -e "s|^\($s\)\($w\)$s:$s\(.*\)$s\$|\1$fs\2$fs\3|p"  $1 |
+   awk -F$fs '{
+      indent = length($1)/2;
+      vname[indent] = $2;
+      for (i in vname) {if (i > indent) {delete vname[i]}}
+      if (length($3) > 0) {
+         vn=""; for (i=0; i<indent; i++) {vn=(vn)(vname[i])("_")}
+         printf("%s%s=\"%s\"\n", vn, $2, $3);
+      }
+   }'
+}
+
+array=$(parse_yaml /etc/mongod.conf)
+result=0
+AUTH_ENABLED=0
+while IFS=' ' read -ra VALUES; do
+    for value in "${VALUES[@]}"; do
+        if [[ $value =~ ([^,]+).*"="\"([^,]+)\" ]]; then
+            name=${BASH_REMATCH[1]}
+            val=${BASH_REMATCH[2]}
+        fi
+        if [[ $name =~ security && $name =~ auth ]]; then
+            result=$val
+            break
+        fi
+    done
+done <<< "$array"
+
+if [[ $result == enabled  ]]; then
+    AUTH_ENABLED=1
+elif [[ $result == disabled  ]]; then
+    AUTH_ENABLED=0
+elif [[ `egrep '^auth=1' /etc/mongod.conf` ]]; then
+    AUTH_ENABLED=1
+elif [[ `egrep '^auth=0' /etc/mongod.conf` ]]; then
+    AUTH_ENABLED=0
+fi
+
+if [[ $AUTH_ENABLED == 0 ]]; then
+    echo " ** WARNING: Access control is not enabled for the database."
+    echo " ** Read and write access to data and configuration is unrestricted."
+    echo " ** To fix this please use /usr/bin/percona-server-mongodb-enable-auth.sh "
+fi
+
+case "$1" in
+    configure)
+      chown -R mongod:mongod /var/lib/mongodb
+      chown -R mongod:mongod /var/log/mongodb
+      db_set percona-server-mongodb-server/postrm_remove_database false || true
+    ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+    ;;
+esac
+
+if [ -e /usr/bin/deb-systemd-helper ]; then
+    deb-systemd-helper unmask mongod.service >/dev/null || true
+    if deb-systemd-helper --quiet was-enabled mongod.service; then
+        deb-systemd-helper enable mongod.service >/dev/null || true
+    else
+        deb-systemd-helper update-state mongod.service >/dev/null || true
+    fi
+    if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ]; then
+        if [ -x "/etc/init.d/mongod" ]; then
+            update-rc.d mongod defaults >/dev/null
+            if [ -n $2 ]; then
+                invoke-rc.d mongod restart || exit $?
+            else
+                invoke-rc.d mongod start|| exit $?
+            fi
+        fi
+    fi
+else
+    if [ -x "/etc/init.d/mongod" ] || [ -e "/etc/init/mongod.conf" ]; then
+        if [ ! -e "/etc/init/mongod.conf" ]; then
+                update-rc.d mongod defaults >/dev/null
+        fi
+        if [ -n $2 ]; then
+            invoke-rc.d mongod restart || exit $?
+        else
+            invoke-rc.d mongod start || exit $?
+        fi
+    fi
+fi
+
+exit 0

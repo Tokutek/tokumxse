@@ -2,26 +2,43 @@
 
 Import("env")
 
+env = env.Clone()
+
 env.Library(
-    target='catalog_manager',
+    target='sharding_catalog_client',
     source=[
-        'catalog_manager.cpp',
-        'type_changelog.cpp',
+        'sharding_catalog_client.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/base/base',
-        '$BUILD_DIR/mongo/bson',
-        '$BUILD_DIR/mongo/db/common',
-        '$BUILD_DIR/mongo/s/batch_write_types',
+        '$BUILD_DIR/mongo/db/keys_collection_document',
+        '$BUILD_DIR/mongo/db/write_concern_options',
     ],
 )
 
-env.CppUnitTest(
-    target='catalog_manager_test',
+env.Library(
+    target='sharding_catalog_client_impl',
     source=[
-        'type_changelog_test.cpp'
+        'sharding_catalog_client_impl.cpp',
     ],
     LIBDEPS=[
-        '$BUILD_DIR/mongo/s/catalog/catalog_manager',
+        '$BUILD_DIR/mongo/db/repl/read_concern_args',
+        '$BUILD_DIR/mongo/db/storage/duplicate_key_error_info',
+        '$BUILD_DIR/mongo/executor/network_interface',
+        '$BUILD_DIR/mongo/s/client/sharding_client',
+        '$BUILD_DIR/mongo/s/coreshard',
+        'sharding_catalog_client',
+    ],
+    LIBDEPS_PRIVATE=[
+        '$BUILD_DIR/mongo/db/logical_session_id_helpers'
+    ]
+)
+
+env.Library(
+    target='sharding_catalog_client_mock',
+    source=[
+        'sharding_catalog_client_mock.cpp',
+    ],
+    LIBDEPS=[
+        'sharding_catalog_client',
     ]
 )

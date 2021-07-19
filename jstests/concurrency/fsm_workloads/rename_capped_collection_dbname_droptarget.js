@@ -6,11 +6,13 @@
  * Creates a capped collection and then repeatedly executes the renameCollection
  * command against it, specifying a different database name in the namespace.
  * Inserts documents into the "to" namespace and specifies dropTarget=true.
+ *
+ * @tags: [
+ *   requires_capped,
+ * ]
  */
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js'); // for dropDatabases
 
 var $config = (function() {
-
     var data = {
         // Use the workload name as a prefix for the collection name,
         // since the workload name is assumed to be unique.
@@ -18,11 +20,7 @@ var $config = (function() {
     };
 
     var states = (function() {
-
-        var options = {
-            capped: true,
-            size: 4096
-        };
+        var options = {capped: true, size: 4096};
 
         function uniqueDBName(prefix, tid, num) {
             return prefix + tid + '_' + num;
@@ -31,15 +29,15 @@ var $config = (function() {
         function insert(db, collName, numDocs) {
             for (var i = 0; i < numDocs; ++i) {
                 var res = db[collName].insert({});
-                assertAlways.writeOK(res);
+                assertAlways.commandWorked(res);
                 assertAlways.eq(1, res.nInserted);
             }
         }
 
         function init(db, collName) {
             var num = 0;
-            this.fromDBName = uniqueDBName(this.prefix, this.tid, num++);
-            this.toDBName = uniqueDBName(this.prefix, this.tid, num++);
+            this.fromDBName = db.getName() + uniqueDBName(this.prefix, this.tid, num++);
+            this.toDBName = db.getName() + uniqueDBName(this.prefix, this.tid, num++);
 
             var fromDB = db.getSiblingDB(this.fromDBName);
             assertAlways.commandWorked(fromDB.createCollection(collName, options));
@@ -80,22 +78,10 @@ var $config = (function() {
             this.toDBName = temp;
         }
 
-        return {
-            init: init,
-            rename: rename
-        };
-
+        return {init: init, rename: rename};
     })();
 
-    var transitions = {
-        init: { rename: 1 },
-        rename: { rename: 1 }
-    };
-
-    function teardown(db, collName, cluster) {
-        var pattern = new RegExp('^' + this.prefix + '\\d+_\\d+$');
-        dropDatabases(db, pattern);
-    }
+    var transitions = {init: {rename: 1}, rename: {rename: 1}};
 
     return {
         threadCount: 10,
@@ -103,7 +89,5 @@ var $config = (function() {
         data: data,
         states: states,
         transitions: transitions,
-        teardown: teardown
     };
-
 })();

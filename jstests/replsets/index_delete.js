@@ -1,77 +1,133 @@
 /**
- * TODO: SERVER-13204
- * This  tests inserts a huge number of documents, initiates a background index build
- * and tries to perform another task in parallel while the background index task is
- * active. The problem is that this is timing dependent and the current test setup
- * tries to achieve this by inserting insane amount of documents.
+ * This test builds an index and then drops the index once the secondary has started building it.
+ * After the drop, we assert that the secondary no longer has the index.
+ * We then create two indexes and assert that dropping all indexes with '*' replicates properly.
+ * @tags: [multiversion_incompatible]
  */
 
-/**
- * Starts a replica set with arbiter, build an index 
- * drop index once secondary starts building index, 
- * index should not exist on secondary afterwards
- */
-
-var checkOp = function(checkDB) {
-    var curOp = checkDB.currentOp(true);
-    for (var i=0; i < curOp.inprog.length; i++) {
-        try {
-            if (curOp.inprog[i].query.background){
-                // should throw something when string contains > 90% 
-                printjson(curOp.inprog[i].msg);
-                return true; 
+function indexBuildInProgress(checkDB) {
+    var inprog = checkDB.currentOp().inprog;
+    var indexOps = inprog.filter(function(op) {
+        if (op.msg && op.msg.includes('Index Build')) {
+            if (op.progress && (op.progress.done / op.progress.total) > 0.20) {
+                printjson(op);
+                return true;
             }
-        } catch (e) {
-            // catchem if you can
         }
-    }
-    return false;
+    });
+    return indexOps.length > 0;
 }
-// Set up replica set
-var replTest = new ReplSetTest({ name: 'fgIndex', nodes: 3 });
+
+// Set up replica set.
+var replTest = new ReplSetTest({
+    nodes: [{}, {}, {arbiter: true}],
+});
 var nodes = replTest.nodeList();
 
-// We need an arbiter to ensure that the primary doesn't step down when we restart the secondary
+// We need an arbiter to ensure that the primary doesn't step down when we restart the secondary.
 replTest.startSet();
-replTest.initiate({"_id" : "fgIndex",
-                   "members" : [
-                       {"_id" : 0, "host" : nodes[0]},
-                       {"_id" : 1, "host" : nodes[1]},
-                       {"_id" : 2, "host" : nodes[2], "arbiterOnly" : true}]});
+replTest.initiate();
 
-var master = replTest.getMaster();
+var dbName = 'foo';
+var collName = 'coll';
+var primary = replTest.getPrimary();
 var second = replTest.getSecondary();
-var masterDB = master.getDB('fgIndexSec');
-var secondDB = second.getDB('fgIndexSec');
+var primaryDB = primary.getDB(dbName);
+var secondDB = second.getDB(dbName);
 
-var size = 50000;
+var size = 100;
 
-jsTest.log("creating test data " + size + " documents");
-var bulk = masterDB.jstests_fgsec.initializeUnorderedBulkOp();
-for(var i = 0; i < size; ++i) {
-    bulk.insert({ i: i });
+// The default WC is majority and this test can't satisfy majority writes.
+assert.commandWorked(primary.adminCommand(
+    {setDefaultRWConcern: 1, defaultWriteConcern: {w: 1}, writeConcern: {w: "majority"}}));
+
+// Make sure that the index build does not terminate on the secondary.
+assert.commandWorked(
+    secondDB.adminCommand({configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'alwaysOn'}));
+
+var bulk = primaryDB[collName].initializeUnorderedBulkOp();
+for (var i = 0; i < size; ++i) {
+    bulk.insert({i: i, j: i, k: i});
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
+// This test create indexes with fail point enabled on secondary which prevents secondary from
+// voting. So, disabling index build commit quorum.
 jsTest.log("Creating index");
-masterDB.jstests_fgsec.ensureIndex( {i:1} );
-assert.eq(2, masterDB.jstests_fgsec.getIndexes().length );
+assert.commandWorked(primaryDB[collName].createIndex({i: 1}, {}, 0));
+assert.eq(2, primaryDB[collName].getIndexes().length);
 
-// Wait for the secondary to get the index entry
-assert.soon( function() { 
-    return 2 == secondDB.jstests_fgsec.getIndexes().length; },
-             "index not created on secondary", 1000*60*10, 50 );
+try {
+    assert.soon(function() {
+        return indexBuildInProgress(secondDB);
+    }, "index not started on secondary");
+} finally {
+    // Turn off failpoint and let the index build resume.
+    assert.commandWorked(
+        secondDB.adminCommand({configureFailPoint: 'hangAfterStartingIndexBuild', mode: 'off'}));
+}
 
 jsTest.log("Index created on secondary");
-masterDB.runCommand( {dropIndexes: "jstests_fgsec", index: "i_1"} );
-jsTest.log("Waiting on replication");
+primaryDB.runCommand({dropIndexes: collName, index: "i_1"});
+assert.eq(1, primaryDB[collName].getIndexes().length);
+
+jsTest.log("Waiting on replication of first index drop");
 replTest.awaitReplication();
-assert.soon( function() {return !checkOp(secondDB)}, "index not cancelled on secondary", 30000, 50);
-masterDB.jstests_fgsec.getIndexes().forEach(printjson);
-secondDB.jstests_fgsec.getIndexes().forEach(printjson);
-assert.soon( function() { 
-    return 1 == secondDB.jstests_fgsec.getIndexes().length; }, 
-             "Index not dropped on secondary", 30000, 50 );
 
-jsTest.log("index-restart-secondary.js complete");
+print("Primary indexes");
+primaryDB[collName].getIndexes().forEach(printjson);
+print("Secondary indexes");
+secondDB[collName].getIndexes().forEach(printjson);
+assert.soon(function() {
+    return 1 == secondDB[collName].getIndexes().length;
+}, "Index not dropped on secondary");
+assert.eq(1, secondDB[collName].getIndexes().length);
 
+// Secondary index builds have been unblocked, so we can build indexes with commit quorum enabled.
+jsTest.log("Creating two more indexes on primary");
+assert.commandWorked(primaryDB[collName].createIndex({j: 1}));
+assert.commandWorked(primaryDB[collName].createIndex({k: 1}));
+assert.eq(3, primaryDB[collName].getIndexes().length);
+
+jsTest.log("Waiting on replication of second index creations");
+replTest.awaitReplication();
+
+print("Primary indexes");
+primaryDB[collName].getIndexes().forEach(printjson);
+print("Secondary indexes");
+secondDB[collName].getIndexes().forEach(printjson);
+assert.soon(function() {
+    return 3 == secondDB[collName].getIndexes().length;
+}, "Indexes not created on secondary");
+assert.eq(3, secondDB[collName].getIndexes().length);
+
+jsTest.log("Dropping the rest of the indexes");
+
+assert.commandWorked(primaryDB.runCommand({deleteIndexes: collName, index: "*"}));
+assert.eq(1, primaryDB[collName].getIndexes().length);
+
+// Assert that we normalize 'dropIndexes' oplog entries properly.
+primary.getCollection('local.oplog.rs').find().forEach(function(entry) {
+    assert.neq(entry.o.index, "*");
+    assert(!entry.o.deleteIndexes);
+    if (entry.o.dropIndexes) {
+        assert(entry.o2.name);
+        assert(entry.o2.key);
+        assert.eq(entry.o2.v, 2);
+        assert.eq(entry.ns, dbName + ".$cmd");
+    }
+});
+
+jsTest.log("Waiting on replication of second index drops");
+replTest.awaitReplication();
+
+print("Primary indexes");
+primaryDB[collName].getIndexes().forEach(printjson);
+print("Secondary indexes");
+secondDB[collName].getIndexes().forEach(printjson);
+assert.soon(function() {
+    return 1 == secondDB[collName].getIndexes().length;
+}, "Indexes not dropped on secondary");
+assert.eq(1, secondDB[collName].getIndexes().length);
+
+replTest.stopSet();

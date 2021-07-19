@@ -11,54 +11,54 @@
  * All threads update the same TTL index on the same collection.
  */
 var $config = (function() {
-
     var data = {
         numDocs: 1000,
-        maxTTL: 5000 // max time to live
+        maxTTL: 5000  // max time to live
     };
 
     var states = (function() {
-
         function collMod(db, collName) {
             var newTTL = Random.randInt(this.maxTTL);
-            var res = db.runCommand({ collMod: this.threadCollName,
-                                      index: {
-                                          keyPattern: { createdAt: 1 },
-                                          expireAfterSeconds: newTTL
-                                      }
-                                    });
+            var res = db.runCommand({
+                collMod: this.threadCollName,
+                index: {keyPattern: {createdAt: 1}, expireAfterSeconds: newTTL}
+            });
             assertAlways.commandWorked(res);
             // only assert if new expireAfterSeconds differs from old one
             if (res.hasOwnProperty('expireAfterSeconds_new')) {
                 assertWhenOwnDB.eq(res.expireAfterSeconds_new, newTTL);
             }
+
+            // Attempt an invalid collMod which should always fail regardless of whether a WCE
+            // occurred. This is meant to reproduce SERVER-56772.
+            const encryptSchema = {$jsonSchema: {properties: {_id: {encrypt: {}}}}};
+            assertAlways.commandFailedWithCode(db.runCommand({
+                collMod: this.threadCollName,
+                validator: encryptSchema,
+                validationAction: "warn"
+            }),
+                                               ErrorCodes.QueryFeatureNotAllowed);
         }
 
-        return {
-            collMod: collMod
-        };
-
+        return {collMod: collMod};
     })();
 
-    var transitions = {
-        collMod: { collMod: 1 }
-    };
+    var transitions = {collMod: {collMod: 1}};
 
     function setup(db, collName, cluster) {
         // other workloads that extend this one might have set 'this.threadCollName'
         this.threadCollName = this.threadCollName || collName;
         var bulk = db[this.threadCollName].initializeUnorderedBulkOp();
         for (var i = 0; i < this.numDocs; ++i) {
-            bulk.insert({ createdAt: new Date() });
+            bulk.insert({createdAt: new Date()});
         }
 
         var res = bulk.execute();
-        assertAlways.writeOK(res);
+        assertAlways.commandWorked(res);
         assertAlways.eq(this.numDocs, res.nInserted);
 
         // create TTL index
-        res = db[this.threadCollName].ensureIndex({ createdAt: 1 },
-                                                  { expireAfterSeconds: 3600 });
+        res = db[this.threadCollName].createIndex({createdAt: 1}, {expireAfterSeconds: 3600});
         assertAlways.commandWorked(res);
     }
 
@@ -71,5 +71,4 @@ var $config = (function() {
         transitions: transitions,
         setup: setup
     };
-
 })();

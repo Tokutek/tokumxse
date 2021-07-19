@@ -1,10 +1,16 @@
+/.ccls_cache
 /build
 /src/mongo/db/modules
 /.jsdbshell
+/.cache
 /.dbshell
+/*.ninja
+/*.ninja.*
+/.ninja_deps
+/.ninja_log
 /perf.data
+/perf.data.old
 /massif.out.*
-/smoke-last.json
 
 *~
 *.swp
@@ -16,10 +22,10 @@
 *.tar.gz
 *.suo
 *.ncb
-*.idb 
-*.obj 
-*.opt 
-*.pch 
+*.idb
+*.obj
+*.opt
+*.pch
 *.jsh
 *.jsall
 *.pyc
@@ -34,6 +40,8 @@
 *.gch
 *.*sdf
 *.psess
+*.tmp
+*.eslintcache
 *#
 .#*
 
@@ -50,14 +58,18 @@
 /src/third_party/*/*.cache
 /src/third_party/*/*.tlog
 /src/third_party/*/*.lastbuildstate
+/src/third_party/install/*
+/buildscripts/libdeps/graph_visualizer_web_stack/build
+/buildscripts/libdeps/graph_visualizer_web_stack/node_modules
+package-lock.json
+libdeps.graphml
 config.log
 settings.py
 log_config.py
 /tags
 TAGS
-failfile.smoke
 
-#temp dirs
+# temp dirs
 dump
 /log
 logs
@@ -68,17 +80,24 @@ docs/doxygen
 scratch
 
 # binaries
-/mongo
-/mongod
-/mongogrid
-/mongos
-
-/mongosniff
-/mongobridge
-/mongoperf
-/mongoshim
-/loadgen
 /docgen
+/loadgen
+/mongo
+/mongobridge
+/mongocryptd
+/mongod
+/mongoed
+/mongogrid
+/mongokerberos
+/mongoldap
+/mongoperf
+/mongos
+/mongoshim
+/mongosniff
+/mongotmock
+/mongotrafficreader
+/perconadecrypt
+/wt
 
 *.tgz
 *.zip
@@ -89,6 +108,7 @@ scratch
 /libmongotestfiles.*
 /libmongoshellfiles.*
 /sharedclient
+/genny
 
 /emr.jar
 *.class
@@ -107,15 +127,20 @@ scratch
 /perftest
 /clientTest
 /httpClientTest
+/genny_results
+
+# benchrun files
+/benchrun_embedded
+
+# Linters
+.mypy_cache
 
 #debian
 build-stamp
 configure-stamp
 debian/mongodb
-# This was inserted 2009-08-16, nobody knows why.
-#debian/mongodb.*
 
-#osx
+# OSX files
 .DS_Store
 ._.DS_Store
 *.fuse_*
@@ -128,29 +153,62 @@ debian/mongodb
 *.includes
 *.orig
 
-#built by Visual Studio
-src/mongo/base/error_codes.cpp
-src/mongo/base/error_codes.h
-src/mongo/db/auth/action_type.cpp
-src/mongo/db/auth/action_type.h
-src/mongo/db/fts/stop_words_list.cpp
-src/mongo/db/fts/stop_words_list.h
-src/mongo/shell/mongo-server.cpp
-src/mongo/shell/mongo.cpp
-src/third_party/v8/src/experimental-libraries.cc
-src/third_party/v8/src/libraries.cc
-
 # Eclipse build artifacts
 .cproject
 .project
+.pydevproject
+.externalToolBuilders/
+.settings/
 
-# old things that should be removed
-# maybe remove this mid 2012
-src/mongo/buildinfo.cpp
-buildinfo.cpp
-/.settings/
+# Idea CLion project artifacts
+.idea
+CMakeLists.txt
 
+# XCode projects
+.xcworkspace
+
+# Visual Studio and VSCode projects
+.vscode/
+.vs/
+/x64/
+
+# Windows MSI builder artifacts
 *.msi
 *.wixobj
 *.wixpdb
 DriverInclude.wxs
+
+# Gradle
+.gradle
+src/mongo/embedded/java/build/
+src/mongo/embedded/java/aar/build/
+src/mongo/embedded/java/jar/build/
+local.properties
+
+# clangd language server
+.clangd/
+
+compile_commands.json
+generated_resmoke_config
+selected_tests_config
+
+# Code review tool config
+codereview.rc
+
+# Python venvs and virtualenvs
+python3-venv
+python2-venv
+
+# Generated resmoke configuration file
+resmoke.ini
+
+# UndoDB Recordings
+*.undo
+
+# Resmoke runtime trackers
+.resmoke_start_time.yml
+
+# libfuzzer artifacts
+default.profraw
+/corpora
+/corpora-merged

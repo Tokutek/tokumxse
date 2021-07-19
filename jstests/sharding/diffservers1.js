@@ -1,20 +1,25 @@
+(function() {
+'use strict';
 
+var s = new ShardingTest({shards: 2});
 
-s = new ShardingTest( "diffservers1" , 2 );
+assert.eq(2, s.config.shards.count(), "server count wrong");
 
-assert.eq( 2 , s.config.shards.count() , "server count wrong" );
-assert.eq( 2 , s._connections[0].getDB( "config" ).shards.count() , "where are servers!" );
-assert.eq( 0 , s._connections[1].getDB( "config" ).shards.count() , "shouldn't be here" );
+var test1 = s.getDB("test1").foo;
+assert.commandWorked(test1.insert({a: 1}));
+assert.commandWorked(test1.insert({a: 2}));
+assert.commandWorked(test1.insert({a: 3}));
+assert.eq(3, test1.count());
 
-test1 = s.getDB( "test1" ).foo;
-test1.save( { a : 1 } );
-test1.save( { a : 2 } );
-test1.save( { a : 3 } );
-assert( 3 , test1.count() );
+assert.commandFailed(s.s0.adminCommand({addshard: "sdd$%", maxTimeMS: 60000}), "Bad hostname");
 
-assert( ! s.admin.runCommand( { addshard: "sdd$%" } ).ok , "bad hostname" );
-assert( ! s.admin.runCommand( { addshard: "127.0.0.1:43415" } ).ok , "host not up" );
-assert( ! s.admin.runCommand( { addshard: "10.0.0.1:43415" } ).ok , "allowed shard in IP when config is localhost" );
+var portWithoutHostRunning = allocatePort();
+assert.commandFailed(
+    s.s0.adminCommand({addshard: "127.0.0.1:" + portWithoutHostRunning, maxTimeMS: 60000}),
+    "Host which is not up");
+assert.commandFailed(
+    s.s0.adminCommand({addshard: "10.0.0.1:" + portWithoutHostRunning, maxTimeMS: 60000}),
+    "Allowed shard in IP when config is localhost");
 
 s.stop();
-
+})();

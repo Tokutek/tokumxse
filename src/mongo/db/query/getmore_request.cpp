@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,92 +27,93 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kQuery
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kQuery
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/query/getmore_request.h"
 
+#include <boost/optional.hpp>
+
+#include "mongo/db/api_parameters_gen.h"
+#include "mongo/db/commands.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/repl/bson_extract_optime.h"
+#include "mongo/idl/command_generic_argument.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/str.h"
+
 namespace mongo {
 
-    const int GetMoreRequest::kDefaultBatchSize = 101;
+namespace {
 
-    GetMoreRequest::GetMoreRequest()
-        : cursorid(0),
-          batchSize(0) { }
+const char kCollectionField[] = "collection";
+const char kBatchSizeField[] = "batchSize";
+const char kAwaitDataTimeoutField[] = "maxTimeMS";
+const char kTermField[] = "term";
+const char kLastKnownCommittedOpTimeField[] = "lastKnownCommittedOpTime";
 
-    GetMoreRequest::GetMoreRequest(const std::string& fullns, CursorId id, int sizeOfBatch)
-        : nss(fullns),
-          cursorid(id),
-          batchSize(sizeOfBatch) { }
+}  // namespace
 
-    Status GetMoreRequest::isValid() const {
-        if (!nss.isValid()) {
-            return Status(ErrorCodes::BadValue, str::stream()
-                << "Invalid namespace for getMore: " << nss.ns());
-        }
+const char GetMoreRequest::kGetMoreCommandName[] = "getMore";
 
-        if (cursorid == 0) {
-            return Status(ErrorCodes::BadValue, "Cursor id for getMore must be non-zero");
-        }
+GetMoreRequest::GetMoreRequest() : cursorid(0), batchSize(0) {}
 
-        if (batchSize < 0) {
-            return Status(ErrorCodes::BadValue, str::stream()
-                << "Batch size for getMore must be non-negative, "
-                << "but received: " << batchSize);
-        }
+GetMoreRequest::GetMoreRequest(NamespaceString namespaceString,
+                               CursorId id,
+                               boost::optional<std::int64_t> sizeOfBatch,
+                               boost::optional<Milliseconds> awaitDataTimeout,
+                               boost::optional<long long> term,
+                               boost::optional<repl::OpTime> lastKnownCommittedOpTime)
+    : nss(std::move(namespaceString)),
+      cursorid(id),
+      batchSize(sizeOfBatch),
+      awaitDataTimeout(awaitDataTimeout),
+      term(term),
+      lastKnownCommittedOpTime(lastKnownCommittedOpTime) {}
 
-        return Status::OK();
+Status GetMoreRequest::isValid() const {
+    if (!nss.isValid()) {
+        return Status(ErrorCodes::InvalidNamespace,
+                      str::stream() << "Invalid namespace for getMore: " << nss.ns());
     }
 
-    // static
-    std::string GetMoreRequest::parseNs(const std::string& dbname, const BSONObj& cmdObj) {
-        BSONElement collElt = cmdObj["collection"];
-        const std::string coll = (collElt.type() == BSONType::String) ? collElt.String()
-                                                                      : "";
-
-        return str::stream() << dbname << "." << coll;
+    if (cursorid == 0) {
+        return Status(ErrorCodes::BadValue, "Cursor id for getMore must be non-zero");
     }
 
-    // static
-    StatusWith<GetMoreRequest> GetMoreRequest::parseFromBSON(const std::string& dbname,
-                                                             const BSONObj& cmdObj) {
-        if (!str::equals(cmdObj.firstElementFieldName(), "getMore")) {
-            return StatusWith<GetMoreRequest>(ErrorCodes::FailedToParse, str::stream()
-                << "First field name must be 'getMore' in: " << cmdObj);
-        }
-
-        BSONElement cursorIdElt = cmdObj.firstElement();
-        if (cursorIdElt.type() != BSONType::NumberLong) {
-            return StatusWith<GetMoreRequest>(ErrorCodes::TypeMismatch, str::stream()
-                << "Field 'getMore' must be of type long in: " << cmdObj);
-        }
-        const CursorId cursorid = cursorIdElt.Long();
-
-        BSONElement collElt = cmdObj["collection"];
-        if (collElt.type() != BSONType::String) {
-            return StatusWith<GetMoreRequest>(ErrorCodes::TypeMismatch, str::stream()
-                << "Field 'collection' must be of type string in: " << cmdObj);
-        }
-        const std::string fullns = parseNs(dbname, cmdObj);
-
-        int batchSize = kDefaultBatchSize;
-        BSONElement batchSizeElt = cmdObj["batchSize"];
-        if (batchSizeElt.type() != BSONType::NumberInt && !batchSizeElt.eoo()) {
-            return StatusWith<GetMoreRequest>(ErrorCodes::TypeMismatch, str::stream()
-                << "Field 'batchSize' must be of type int in: " << cmdObj);
-        }
-        else if (!batchSizeElt.eoo()) {
-            batchSize = batchSizeElt.Int();
-        }
-
-        GetMoreRequest request(fullns, cursorid, batchSize);
-        Status validStatus = request.isValid();
-        if (!validStatus.isOK()) {
-            return StatusWith<GetMoreRequest>(validStatus);
-        }
-
-        return StatusWith<GetMoreRequest>(request);
+    if (batchSize && *batchSize <= 0) {
+        return Status(ErrorCodes::BadValue,
+                      str::stream() << "Batch size for getMore must be positive, "
+                                    << "but received: " << *batchSize);
     }
 
-} // namespace mongo
+    return Status::OK();
+}
+
+BSONObj GetMoreRequest::toBSON() const {
+    BSONObjBuilder builder;
+
+    builder.append(kGetMoreCommandName, cursorid);
+    builder.append(kCollectionField, nss.coll());
+
+    if (batchSize) {
+        builder.append(kBatchSizeField, *batchSize);
+    }
+
+    if (awaitDataTimeout) {
+        builder.append(kAwaitDataTimeoutField, durationCount<Milliseconds>(*awaitDataTimeout));
+    }
+
+    if (term) {
+        builder.append(kTermField, *term);
+    }
+
+    if (lastKnownCommittedOpTime) {
+        lastKnownCommittedOpTime->append(&builder, kLastKnownCommittedOpTimeField);
+    }
+
+    return builder.obj();
+}
+
+}  // namespace mongo

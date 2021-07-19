@@ -1,43 +1,38 @@
+/**
+ * Tests find with $elemMatch when supporting indexes are in place.
+ * @tags: [
+ *   assumes_balancer_off,
+ * ]
+ */
+(function() {
+"use strict";
 
-t = db.index_elemmatch1
-t.drop()
+const coll = db.index_elemmatch1;
+coll.drop();
 
-x = 0
-y = 0
-var bulk = t.initializeUnorderedBulkOp();
-for ( a=0; a<100; a++ ){
-    for ( b=0; b<100; b++ ){
-        bulk.insert( { a : a , b : b % 10 , arr : [ { x : x++ % 10 , y : y++ % 10 } ] } );
+let x = 0;
+let y = 0;
+const bulk = coll.initializeUnorderedBulkOp();
+for (let a = 0; a < 10; a++) {
+    for (let b = 0; b < 10; b++) {
+        bulk.insert({a: a, b: b % 10, arr: [{x: x++ % 10, y: y++ % 10}]});
     }
 }
-assert.writeOK(bulk.execute());
+assert.commandWorked(bulk.execute());
 
-t.ensureIndex( { a : 1 , b : 1 } )
-t.ensureIndex( { "arr.x" : 1 , a : 1 } )
+assert.commandWorked(coll.createIndex({a: 1, b: 1}));
+assert.commandWorked(coll.createIndex({"arr.x": 1, a: 1}));
 
-assert.eq( 100 , t.find( { a : 55 } ).itcount() , "A1" );
-assert.eq( 10 , t.find( { a : 55 , b : 7 } ).itcount() , "A2" );
+const query = {
+    a: 5,
+    b: {$in: [1, 3, 5]},
+    arr: {$elemMatch: {x: 5, y: 5}}
+};
 
-q = { a : 55 , b : { $in : [ 1 , 5 , 8 ] } }
-assert.eq( 30 , t.find( q ).itcount() , "A3" )
+const count = coll.find(query).itcount();
+assert.eq(count, 1);
 
-q.arr = { $elemMatch : { x : 5 , y : 5 } }
-assert.eq( 10 , t.find( q ).itcount() , "A4" )
-
-function nscannedForCursor( explain, cursor ) {
-    plans = explain.allPlans;
-    for( i in plans ) {
-        if ( plans[ i ].cursor == cursor ) {
-            return plans[ i ].nscanned;
-        }
-    }
-    return -1;
-}
-
-var explain = t.find(q).hint( { "arr.x" : 1 , a : 1 } ).explain("executionStats");
-assert.eq( t.find(q).itcount(), explain.executionStats.totalKeysExamined );
-
-printjson(t.find(q).explain());
-print("Num results:");
-assert.eq(10, t.find(q).itcount());
-printjson(t.find(q).itcount());
+const explain = coll.find(query).hint({"arr.x": 1, a: 1}).explain("executionStats");
+assert.commandWorked(explain);
+assert.eq(count, explain.executionStats.totalKeysExamined, explain);
+})();

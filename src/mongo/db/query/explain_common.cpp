@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013-2014 MongoDB Inc.
+ *    Copyright (C) 2019-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,47 +31,60 @@
 
 #include "mongo/db/query/explain_common.h"
 
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/db/query/query_knobs_gen.h"
+#include "mongo/db/server_options.h"
+#include "mongo/util/net/socket_utils.h"
+#include "mongo/util/version.h"
 
-namespace mongo {
+namespace mongo::explain_common {
 
-    // static
-    const char* ExplainCommon::verbosityString(ExplainCommon::Verbosity verbosity) {
-        switch (verbosity) {
-        case QUERY_PLANNER:
-            return "queryPlanner";
-        case EXEC_STATS:
-            return "executionStats";
-        case EXEC_ALL_PLANS:
-            return "allPlansExecution";
-        default:
-            invariant(0);
-            return "unknown";
-        }
+void generateServerInfo(BSONObjBuilder* out) {
+    BSONObjBuilder serverBob(out->subobjStart("serverInfo"));
+    out->append("host", getHostNameCached());
+    out->appendNumber("port", serverGlobalParams.port);
+    auto&& vii = VersionInfoInterface::instance();
+    out->append("version", vii.version());
+    out->append("gitVersion", vii.gitVersion());
+    serverBob.doneFast();
+}
+
+void generateServerParameters(BSONObjBuilder* out) {
+    BSONObjBuilder serverBob(out->subobjStart("serverParameters"));
+    out->appendNumber("internalQueryFacetBufferSizeBytes",
+                      internalQueryFacetBufferSizeBytes.load());
+    out->appendNumber("internalQueryFacetMaxOutputDocSizeBytes",
+                      internalQueryFacetMaxOutputDocSizeBytes.load());
+    out->appendNumber("internalLookupStageIntermediateDocumentMaxSizeBytes",
+                      internalLookupStageIntermediateDocumentMaxSizeBytes.load());
+    out->appendNumber("internalDocumentSourceGroupMaxMemoryBytes",
+                      internalDocumentSourceGroupMaxMemoryBytes.load());
+    out->appendNumber("internalQueryMaxBlockingSortMemoryUsageBytes",
+                      internalQueryMaxBlockingSortMemoryUsageBytes.load());
+    out->appendNumber("internalQueryProhibitBlockingMergeOnMongoS",
+                      internalQueryProhibitBlockingMergeOnMongoS.load());
+    out->appendNumber("internalQueryMaxAddToSetBytes", internalQueryMaxAddToSetBytes.load());
+    out->appendNumber("internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+                      internalDocumentSourceSetWindowFieldsMaxMemoryBytes.load());
+}
+
+bool appendIfRoom(const BSONObj& toAppend, StringData fieldName, BSONObjBuilder* out) {
+    if ((out->len() + toAppend.objsize()) < BSONObjMaxUserSize) {
+        out->append(fieldName, toAppend);
+        return true;
     }
 
-    // static
-    Status ExplainCommon::parseCmdBSON(const BSONObj& cmdObj, ExplainCommon::Verbosity* verbosity) {
-        if (Object != cmdObj.firstElement().type()) {
-            return Status(ErrorCodes::BadValue, "explain command requires a nested object");
-        }
+    // The reserved buffer size for the warning message if 'out' exceeds the max BSON user size.
+    const int warningMsgSize = fieldName.size() + 60;
 
-        *verbosity = ExplainCommon::EXEC_ALL_PLANS;
-        if (!cmdObj["verbosity"].eoo()) {
-            const char* verbStr = cmdObj["verbosity"].valuestrsafe();
-            if (mongoutils::str::equals(verbStr, "queryPlanner")) {
-                *verbosity = ExplainCommon::QUERY_PLANNER;
-            }
-            else if (mongoutils::str::equals(verbStr, "executionStats")) {
-                *verbosity = ExplainCommon::EXEC_STATS;
-            }
-            else if (!mongoutils::str::equals(verbStr, "allPlansExecution")) {
-                return Status(ErrorCodes::BadValue, "verbosity string must be one of "
-                    "{'queryPlanner', 'executionStats', 'allPlansExecution'}");
-            }
-        }
-
-        return Status::OK();
+    // Unless 'out' has already exceeded the max BSON user size, add a warning indicating
+    // that data has been truncated.
+    if (out->len() < BSONObjMaxUserSize - warningMsgSize) {
+        out->append("warning",
+                    str::stream() << "'" << fieldName << "'"
+                                  << " has been omitted due to BSON size limit");
     }
 
-} // namespace mongo
+    return false;
+}
+
+}  // namespace mongo::explain_common

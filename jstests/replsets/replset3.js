@@ -1,10 +1,10 @@
-var doTest = function (signal) {
+var doTest = function(signal) {
     "use strict";
     // Test replica set step down
 
     // Replica set testing API
     // Create a new replica set test. Specify set name and the number of nodes you want.
-    var replTest = new ReplSetTest({ name: 'testSet', nodes: 3 });
+    var replTest = new ReplSetTest({name: 'testSet', nodes: 3});
 
     // call startSet() to start each mongod in the replica set
     // this returns a list of nodes
@@ -14,65 +14,62 @@ var doTest = function (signal) {
     // This will wait for initiation
     replTest.initiate();
 
-    // Get master node
-    var master = replTest.getMaster();
+    // Get primary node
+    var primary = replTest.getPrimary();
 
-    // Write some data to master
+    // Write some data to primary
     // NOTE: this test fails unless we write some data.
-    master.getDB("foo").foo.insert({ a: 1 }, { writeConcern: { w: 3, wtimeout: 20000 }});
+    primary.getDB("foo").foo.insert({a: 1}, {writeConcern: {w: 3, wtimeout: 20000}});
 
     var phase = 1;
 
     print(phase++);
 
-    // Step down master.  Note: this may close our connection!
+    // Step down primary.
+    assert.commandWorked(primary.getDB("admin").runCommand({replSetStepDown: 0, force: 1}));
+
+    print(phase++);
+
     try {
-        master.getDB("admin").runCommand({ replSetStepDown: true, force: 1 });
+        var newPrimary = replTest.getPrimary();
     } catch (err) {
-        print("caught: " + err + " on stepdown");
+        throw ("Could not elect new primary before timeout.");
     }
 
     print(phase++);
 
-    try {
-        var new_master = replTest.getMaster();
-    }
-    catch (err) {
-        throw ("Could not elect new master before timeout.");
-    }
+    assert(primary != newPrimary, "Old primary shouldn't be equal to new primary.");
 
     print(phase++);
 
-    assert(master != new_master, "Old master shouldn't be equal to new master.");
+    // Make sure that secondaries are still up
+    var result = newPrimary.getDB("admin").runCommand({replSetGetStatus: 1});
+    assert(result['ok'] == 1, "Could not verify that secondaries were still up:" + result);
 
     print(phase++);
 
-    // Make sure that slaves are still up
-    var result = new_master.getDB("admin").runCommand({ replSetGetStatus: 1 });
-    assert(result['ok'] == 1, "Could not verify that slaves were still up:" + result);
-
-    print(phase++);
-
-    var slaves = replTest.liveNodes.slaves;
-    assert.soon(function () {
+    var secondaries = replTest.getSecondaries();
+    assert.soon(function() {
         try {
-            var res = slaves[0].getDB("admin").runCommand({ replSetGetStatus: 1 });
-        } catch (err) { }
+            var res = secondaries[0].getDB("admin").runCommand({replSetGetStatus: 1});
+        } catch (err) {
+        }
         return res.myState == 2;
-    }, "Slave 0 state not ready.");
+    }, "Secondary 0 state not ready.");
 
     print(phase++);
 
-    assert.soon(function () {
+    assert.soon(function() {
         try {
-            var res = slaves[1].getDB("admin").runCommand({ replSetGetStatus: 1 });
-        } catch (err) { }
+            var res = secondaries[1].getDB("admin").runCommand({replSetGetStatus: 1});
+        } catch (err) {
+        }
         return res.myState == 2;
-    }, "Slave 1 state not ready.");
+    }, "Secondary 1 state not ready.");
 
     print("replset3.js SUCCESS");
 
     replTest.stopSet(15);
 };
 
-doTest( 15 );
+doTest(15);

@@ -1,56 +1,70 @@
-// multcollections.js
+// @tags: [requires_sharding]
 
-s = new ShardingTest( "multcollections" , 2 , 1 , 1 , { chunksize : 1, enableBalancer : true }  );
+(function() {
+'use strict';
 
-s.adminCommand( { enablesharding : "test" } );
+var s = new ShardingTest({shards: 2, mongos: 1, other: {chunkSize: 1, enableBalancer: true}});
 
-db = s.getDB( "test" )
+assert.commandWorked(s.s0.adminCommand({enablesharding: "test"}));
+s.ensurePrimaryShard('test', s.shard1.shardName);
 
-N = 100000
-
-S = ""
-while ( S.length < 500 )
+var S = "";
+while (S.length < 500) {
     S += "123123312312";
+}
 
+var N = 100000;
+
+var db = s.getDB("test");
 var bulk = db.foo.initializeUnorderedBulkOp();
 var bulk2 = db.bar.initializeUnorderedBulkOp();
-for ( i=0; i<N; i++ ){
-    bulk.insert({ _id: i, s: S });
-    bulk2.insert({ _id: i, s: S, s2: S });
+for (i = 0; i < N; i++) {
+    bulk.insert({_id: i, s: S});
+    bulk2.insert({_id: i, s: S, s2: S});
 }
-assert.writeOK(bulk.execute());
-assert.writeOK(bulk2.execute());
+assert.commandWorked(bulk.execute());
+assert.commandWorked(bulk2.execute());
 
-db.printShardingStatus()
+s.printShardingStatus();
 
-function mytest( coll , i , loopNumber ){
-    x = coll.find( { _id : i } ).explain();
-    if ( x )
+function mytest(coll, i, loopNumber) {
+    try {
+        var x = coll.find({_id: i}).explain();
+    } catch (e) {
+        // Ignore stale shard version exceptions, since there are many migrations happening, and
+        // mongos may not be able to complete the find within the stale version retries limit.
+        if (e.message.contains("stale config")) {
+            return;
+        }
+        throw e;
+    }
+    if (x)
         return;
-    throw Error( "can't find " + i + " in " + coll.getName() + " on loopNumber: " + loopNumber +  " explain: " + tojson( x ) );
+    throw Error("can't find " + i + " in " + coll.getName() + " on loopNumber: " + loopNumber +
+                " explain: " + tojson(x));
 }
 
-loopNumber = 0
-while ( 1 ){
-    for ( i=0; i<N; i++ ){
-        mytest( db.foo , i , loopNumber );
-        mytest( db.bar , i , loopNumber );
-        if ( i % 1000 == 0 )
-            print( i )
+for (var loopNumber = 0;; loopNumber++) {
+    for (var i = 0; i < N; i++) {
+        mytest(db.foo, i, loopNumber);
+        mytest(db.bar, i, loopNumber);
+        if (i % 1000 == 0)
+            print(i);
     }
-    db.printShardingStatus()
-    loopNumber++;
 
-    if ( loopNumber == 1 ){
-        s.adminCommand( { shardcollection : "test.foo" , key : { _id : 1 } } );
-        s.adminCommand( { shardcollection : "test.bar" , key : { _id : 1 } } );
+    s.printShardingStatus();
+
+    if (loopNumber == 0) {
+        assert.commandWorked(s.s0.adminCommand({shardcollection: "test.foo", key: {_id: 1}}));
+        assert.commandWorked(s.s0.adminCommand({shardcollection: "test.bar", key: {_id: 1}}));
     }
-        
-    assert( loopNumber < 1000 , "taking too long" );
 
-    if ( s.chunkDiff( "foo" ) < 12 && s.chunkDiff( "bar" ) < 12 )
-        break
+    assert(loopNumber < 1000, "taking too long");
+
+    if (s.chunkDiff("foo") < 12 && s.chunkDiff("bar") < 12) {
+        break;
+    }
 }
 
-s.stop()
-
+s.stop();
+})();

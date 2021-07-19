@@ -1,2 +1,6 @@
 Import("env")
-env.Library("murmurhash3", ["MurmurHash3.cpp"])
+
+env.Library(
+    target='murmurhash3',
+    source=['MurmurHash3.cpp'],
+)

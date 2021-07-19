@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2015 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -26,121 +27,84 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kCommand
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kCommand
 
 #include "mongo/platform/basic.h"
 
-#include <vector>
-
 #include "mongo/db/audit.h"
 #include "mongo/db/commands.h"
-#include "mongo/s/catalog/legacy/catalog_manager_legacy.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/type_shard.h"
-#include "mongo/util/log.h"
+#include "mongo/s/request_types/add_shard_request_type.h"
+#include "mongo/util/scopeguard.h"
 
 namespace mongo {
-
-    using std::string;
-
 namespace {
 
-    class AddShardCmd : public Command {
-    public:
-        AddShardCmd() : Command("addShard", false, "addshard") { }
+const ReadPreferenceSetting kPrimaryOnlyReadPreference{ReadPreference::PrimaryOnly};
+const char kShardAdded[] = "shardAdded";
 
-        virtual bool slaveOk() const {
-            return true;
-        }
+class AddShardCmd : public BasicCommand {
+public:
+    AddShardCmd() : BasicCommand("addShard", "addshard") {}
 
-        virtual bool adminOnly() const {
-            return true;
-        }
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kAlways;
+    }
 
-        virtual bool isWriteCommandForConfigServer() const {
-            return false;
-        }
+    bool adminOnly() const override {
+        return true;
+    }
 
-        virtual void help(std::stringstream& help) const {
-            help << "add a new shard to the system";
-        }
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return true;
+    }
 
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
+    std::string help() const override {
+        return "add a new shard to the system";
+    }
 
-            ActionSet actions;
-            actions.addAction(ActionType::addShard);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
-        }
+    void addRequiredPrivileges(const std::string& dbname,
+                               const BSONObj& cmdObj,
+                               std::vector<Privilege>* out) const override {
+        ActionSet actions;
+        actions.addAction(ActionType::addShard);
+        out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+    }
 
-        virtual bool run(OperationContext* txn,
-                         const std::string& dbname,
-                         BSONObj& cmdObj,
-                         int options,
-                         std::string& errmsg,
-                         BSONObjBuilder& result,
-                         bool fromRepl) {
+    bool run(OperationContext* opCtx,
+             const std::string& dbname,
+             const BSONObj& cmdObj,
+             BSONObjBuilder& result) override {
+        auto parsedRequest = uassertStatusOK(AddShardRequest::parseFromMongosCommand(cmdObj));
 
-            // get replica set component hosts
-            ConnectionString servers = ConnectionString::parse(
-                                            cmdObj.firstElement().valuestrsafe(), errmsg);
-            if (!errmsg.empty()) {
-                log() << "addshard request " << cmdObj << " failed: " << errmsg;
-                return false;
-            }
+        audit::logAddShard(Client::getCurrent(),
+                           parsedRequest.hasName() ? parsedRequest.getName() : "",
+                           parsedRequest.getConnString().toString(),
+                           parsedRequest.hasMaxSize() ? parsedRequest.getMaxSize()
+                                                      : 0 /*kMaxSizeMBDefault*/);
 
-            // using localhost in server names implies every other process must use localhost addresses too
-            std::vector<HostAndPort> serverAddrs = servers.getServers();
-            for (size_t i = 0; i < serverAddrs.size(); i++) {
-                if (serverAddrs[i].isLocalHost() != grid.allowLocalHost()) {
-                    errmsg = str::stream() <<
-                                "Can't use localhost as a shard since all shards need to" <<
-                                " communicate. Either use all shards and configdbs in localhost" <<
-                                " or all in actual IPs. host: " << serverAddrs[i].toString() <<
-                                " isLocalHost:" << serverAddrs[i].isLocalHost();
+        auto configShard = Grid::get(opCtx)->shardRegistry()->getConfigShard();
 
-                    log() << "addshard request " << cmdObj
-                          << " failed: attempt to mix localhosts and IPs";
-                    return false;
-                }
+        // Force a reload of this node's shard list cache at the end of this command.
+        auto cmdResponseWithStatus = configShard->runCommandWithFixedRetryAttempts(
+            opCtx,
+            kPrimaryOnlyReadPreference,
+            "admin",
+            CommandHelpers::appendMajorityWriteConcern(
+                CommandHelpers::appendGenericCommandArgs(cmdObj,
+                                                         parsedRequest.toCommandForConfig()),
+                opCtx->getWriteConcern()),
+            Shard::RetryPolicy::kIdempotent);
 
-                // it's fine if mongods of a set all use default port
-                if (!serverAddrs[i].hasPort()) {
-                    serverAddrs[i] = HostAndPort(serverAddrs[i].host(),
-                                                 ServerGlobalParams::ShardServerPort);
-                }
-            }
+        Grid::get(opCtx)->shardRegistry()->reload(opCtx);
 
-            // name is optional; addShard will provide one if needed
-            string name = "";
-            if (cmdObj["name"].type() == String) {
-                name = cmdObj["name"].valuestrsafe();
-            }
+        auto cmdResponse = uassertStatusOK(cmdResponseWithStatus);
+        CommandHelpers::filterCommandReplyForPassthrough(cmdResponse.response, &result);
+        return true;
+    }
 
-            // maxSize is the space usage cap in a shard in MBs
-            long long maxSize = 0;
-            if (cmdObj[ShardType::maxSize()].isNumber()) {
-                maxSize = cmdObj[ShardType::maxSize()].numberLong();
-            }
+} addShardCmd;
 
-            audit::logAddShard(ClientBasic::getCurrent(), name, servers.toString(), maxSize);
-
-            StatusWith<string> addShardResult =
-                grid.catalogManager()->addShard(name, servers, maxSize);
-            if (!addShardResult.isOK()) {
-                log() << "addShard request '" << cmdObj << "'"
-                      << " failed: " << addShardResult.getStatus().reason();
-                return appendCommandStatus(result, addShardResult.getStatus());
-            }
-
-            result << "shardAdded" << addShardResult.getValue();
-
-            return true;
-        }
-
-    } addShard;
-
-
-} // namespace
-} // namespace mongo
+}  // namespace
+}  // namespace mongo

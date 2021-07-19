@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -35,78 +36,58 @@
 
 namespace mongo {
 
-    class RecordId;
+class RecordId;
+
+/**
+ * QueuedDataStage is a data-producing stage.  Unlike the other two leaf stages (CollectionScan
+ * and IndexScan) QueuedDataStage does not require any underlying storage layer.
+ *
+ * A QueuedDataStage is "programmed" by pushing return values from work() onto its internal
+ * queue.  Calls to QueuedDataStage::work() pop values off that queue and return them in FIFO
+ * order, annotating the working set with data when appropriate.
+ */
+class QueuedDataStage final : public PlanStage {
+public:
+    QueuedDataStage(ExpressionContext* expCtx, WorkingSet* ws);
+
+    StageState doWork(WorkingSetID* out) final;
+
+    bool isEOF() final;
+
+    StageType stageType() const final {
+        return STAGE_QUEUED_DATA;
+    }
+
+    //
+    // Exec stats
+    //
+
+    std::unique_ptr<PlanStageStats> getStats() final;
+
+    const SpecificStats* getSpecificStats() const final;
 
     /**
-     * QueuedDataStage is a data-producing stage.  Unlike the other two leaf stages (CollectionScan
-     * and IndexScan) QueuedDataStage does not require any underlying storage layer.
+     * Add a result to the back of the queue.
      *
-     * A QueuedDataStage is "programmed" by pushing return values from work() onto its internal
-     * queue.  Calls to QueuedDataStage::work() pop values off that queue and return them in FIFO
-     * order, annotating the working set with data when appropriate.
+     * The caller is responsible for allocating 'id' and filling out the WSM keyed by 'id'
+     * appropriately.
+     *
+     * The QueuedDataStage takes ownership of 'id', so the caller should not call WorkingSet::free()
+     * on it.
      */
-    class QueuedDataStage : public PlanStage {
-    public:
-        QueuedDataStage(WorkingSet* ws);
-        virtual ~QueuedDataStage() { }
+    void pushBack(const WorkingSetID& id);
 
-        virtual StageState work(WorkingSetID* out);
+    static const char* kStageType;
 
-        virtual bool isEOF();
+private:
+    // We don't own this.
+    WorkingSet* _ws;
 
-        // These don't really mean anything here.
-        // Some day we could count the # of calls to the yield functions to check that other stages
-        // have correct yielding behavior.
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    // The data we return.
+    std::queue<WorkingSetID> _members;
 
-        virtual std::vector<PlanStage*> getChildren() const;
-
-        virtual StageType stageType() const { return STAGE_QUEUED_DATA; }
-
-        //
-        // Exec stats
-        //
-
-        virtual PlanStageStats* getStats();
-
-        virtual const CommonStats* getCommonStats();
-
-        virtual const SpecificStats* getSpecificStats();
-
-        /**
-         * Add a result to the back of the queue.
-         *
-         * Note: do not add PlanStage::ADVANCED with this method, ADVANCED can
-         * only be added with a data member.
-         *
-         * Work() goes through the queue.
-         * Either no data is returned (just a state), or...
-         */
-        void pushBack(const PlanStage::StageState state);
-
-        /**
-         * ...data is returned (and we ADVANCED)
-         *
-         * Allocates a new member and copies 'member' into it.
-         * Does not take ownership of anything in 'member'.
-         */
-        void pushBack(const WorkingSetMember& member);
-
-        static const char* kStageType;
-
-    private:
-        // We don't own this.
-        WorkingSet* _ws;
-
-        // The data we return.
-        std::queue<PlanStage::StageState> _results;
-        std::queue<WorkingSetID> _members;
-
-        // Stats
-        CommonStats _commonStats;
-        MockStats _specificStats;
-    };
+    // Stats
+    MockStats _specificStats;
+};
 
 }  // namespace mongo

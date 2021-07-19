@@ -1,25 +1,24 @@
-// fts_language_test.cpp
-
 /**
- *    Copyright (C) 2013 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,110 +27,55 @@
  *    it in the license file.
  */
 
-#include "mongo/platform/basic.h"
 #include "mongo/db/fts/fts_language.h"
 #include "mongo/db/fts/fts_spec.h"
+#include "mongo/platform/basic.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-    namespace fts {
+namespace fts {
 
-        // Positive tests for FTSLanguage::make() with TEXT_INDEX_VERSION_2.
+namespace {
 
-        TEST( FTSLanguageV2, ExactLanguage ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "spanish", TEXT_INDEX_VERSION_2 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "spanish" );
-        }
+using LanguageMakeException = mongo::ExceptionFor<ErrorCodes::BadValue>;
 
-        TEST( FTSLanguageV2, ExactCode ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "es", TEXT_INDEX_VERSION_2 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "spanish" );
-        }
-
-        TEST( FTSLanguageV2, UpperCaseLanguage ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "SPANISH", TEXT_INDEX_VERSION_2 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "spanish" );
-        }
-
-        TEST( FTSLanguageV2, UpperCaseCode ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "ES", TEXT_INDEX_VERSION_2 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "spanish" );
-        }
-        
-        TEST( FTSLanguageV2, NoneLanguage ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "none", TEXT_INDEX_VERSION_2 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "none" );
-        }
-
-        // Negative tests for FTSLanguage::make() with TEXT_INDEX_VERSION_2.
-
-        TEST( FTSLanguageV2, Unknown ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "spanglish", TEXT_INDEX_VERSION_2 );
-            ASSERT( !swl.getStatus().isOK() );
-        }
-
-        TEST( FTSLanguageV2, Empty ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "", TEXT_INDEX_VERSION_2 );
-            ASSERT( !swl.getStatus().isOK() );
-        }
-
-        // Positive tests for FTSLanguage::make() with TEXT_INDEX_VERSION_1.
-
-        TEST( FTSLanguageV1, ExactLanguage ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "spanish", TEXT_INDEX_VERSION_1 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "spanish" );
-        }
-
-        TEST( FTSLanguageV1, DeprecatedLanguage ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "porter", TEXT_INDEX_VERSION_1 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "porter" );
-        }
-
-        TEST( FTSLanguageV1, StemmerOnlyLanguage1 ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "en", TEXT_INDEX_VERSION_1 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "en" );
-        }
-
-        TEST( FTSLanguageV1, StemmerOnlyLanguage2 ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "eng", TEXT_INDEX_VERSION_1 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "eng" );
-        }
-
-        TEST( FTSLanguageV1, NoneLanguage ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "none", TEXT_INDEX_VERSION_1 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "none" );
-        }
-
-        // Negative tests for FTSLanguage::make() with TEXT_INDEX_VERSION_1.
-
-        TEST( FTSLanguageV1, CaseSensitive ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "SPANISH", TEXT_INDEX_VERSION_1 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "none" );
-        }
-
-        TEST( FTSLanguageV1, Unknown ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "asdf", TEXT_INDEX_VERSION_1 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "none" );
-        }
-
-        TEST( FTSLanguageV1, Empty ) {
-            StatusWithFTSLanguage swl = FTSLanguage::make( "", TEXT_INDEX_VERSION_1 );
-            ASSERT( swl.getStatus().isOK() );
-            ASSERT_EQUALS( swl.getValue()->str(), "none" );
-        }
-
-    }
+TEST(FTSLanguageV3, Make) {
+    static constexpr auto kVer = TEXT_INDEX_VERSION_3;
+    ASSERT_EQUALS(FTSLanguage::make("spanish", kVer).str(), "spanish");
+    ASSERT_EQUALS(FTSLanguage::make("es", kVer).str(), "spanish");
+    ASSERT_EQUALS(FTSLanguage::make("SPANISH", kVer).str(), "spanish");
+    ASSERT_EQUALS(FTSLanguage::make("ES", kVer).str(), "spanish");
+    ASSERT_EQUALS(FTSLanguage::make("none", kVer).str(), "none");
+    ASSERT_THROWS(FTSLanguage::make("", kVer), LanguageMakeException);
+    ASSERT_THROWS(FTSLanguage::make("spanglish", kVer), LanguageMakeException);
 }
+
+TEST(FTSLanguageV2, Make) {
+    static constexpr auto kVer = TEXT_INDEX_VERSION_2;
+    ASSERT_EQUALS(FTSLanguage::make("spanish", kVer).str(), "spanish");
+    ASSERT_EQUALS(FTSLanguage::make("es", kVer).str(), "spanish");
+    ASSERT_EQUALS(FTSLanguage::make("SPANISH", kVer).str(), "spanish");
+    ASSERT_EQUALS(FTSLanguage::make("ES", kVer).str(), "spanish");
+    ASSERT_EQUALS(FTSLanguage::make("none", kVer).str(), "none");
+    ASSERT_THROWS(FTSLanguage::make("spanglish", kVer), LanguageMakeException);
+    ASSERT_THROWS(FTSLanguage::make("", kVer), LanguageMakeException);
+}
+
+TEST(FTSLanguageV1, Make) {
+    static constexpr auto kVer = TEXT_INDEX_VERSION_1;
+    ASSERT_EQUALS(FTSLanguage::make("spanish", kVer).str(), "spanish");
+    ASSERT_EQUALS(FTSLanguage::make("porter", kVer).str(), "porter") << "deprecated";
+    ASSERT_EQUALS(FTSLanguage::make("en", kVer).str(), "en");
+    ASSERT_EQUALS(FTSLanguage::make("eng", kVer).str(), "eng");
+    ASSERT_EQUALS(FTSLanguage::make("none", kVer).str(), "none");
+    // Negative V1 tests
+    ASSERT_EQUALS(FTSLanguage::make("SPANISH", kVer).str(), "none") << "case sensitive";
+    ASSERT_EQUALS(FTSLanguage::make("asdf", kVer).str(), "none") << "unknown";
+    ASSERT_EQUALS(FTSLanguage::make("", kVer).str(), "none");
+}
+
+}  // namespace
+}  // namespace fts
+}  // namespace mongo

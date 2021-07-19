@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,68 +29,60 @@
 
 #pragma once
 
+#include <memory>
+#include <vector>
+
 #include "mongo/db/catalog/collection.h"
-#include "mongo/db/exec/plan_stage.h"
 #include "mongo/db/exec/plan_stats.h"
+#include "mongo/db/exec/requires_collection_stage.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
 
-    /**
-     * Iterates over a collection using multiple underlying RecordIterators.
-     *
-     * This is a special stage which is not used automatically by queries. It is intended for
-     * special commands that work with RecordIterators. For example, it is used by the
-     * parallelCollectionScan and repairCursor commands
-     */
-    class MultiIteratorStage : public PlanStage {
-    public:
-        MultiIteratorStage(OperationContext* txn, WorkingSet* ws, Collection* collection);
+/**
+ * Iterates over a collection using multiple underlying RecordCursors.
+ *
+ * This is a special stage which is not used automatically by queries. It is intended for special
+ * commands that work with RecordCursors.
+ */
+class MultiIteratorStage final : public RequiresCollectionStage {
+public:
+    MultiIteratorStage(ExpressionContext* expCtx, WorkingSet* ws, const CollectionPtr& collection);
 
-        ~MultiIteratorStage() { }
+    void addIterator(std::unique_ptr<RecordCursor> it);
 
-        /**
-         * Takes ownership of 'it'.
-         */
-        void addIterator(RecordIterator* it);
+    PlanStage::StageState doWork(WorkingSetID* out) final;
 
-        virtual PlanStage::StageState work(WorkingSetID* out);
+    bool isEOF() final;
 
-        virtual bool isEOF();
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
 
-        void kill();
+    // Returns empty PlanStageStats object
+    std::unique_ptr<PlanStageStats> getStats() final;
 
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
+    // Not used.
+    SpecificStats* getSpecificStats() const final {
+        return nullptr;
+    }
 
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    // Not used.
+    StageType stageType() const final {
+        return STAGE_MULTI_ITERATOR;
+    }
 
-        //
-        // These should not be used.
-        //
+    static const char* kStageType;
 
-        virtual PlanStageStats* getStats() { return NULL; }
-        virtual CommonStats* getCommonStats() { return NULL; }
-        virtual SpecificStats* getSpecificStats() { return NULL; }
+protected:
+    void doSaveStateRequiresCollection() final;
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    void doRestoreStateRequiresCollection() final;
 
-        virtual StageType stageType() const { return STAGE_MULTI_ITERATOR; }
+private:
+    std::vector<std::unique_ptr<RecordCursor>> _iterators;
 
-    private:
+    // Not owned by us.
+    WorkingSet* _ws;
+};
 
-        void _advance();
-
-        OperationContext* _txn;
-        Collection* _collection;
-        OwnedPointerVector<RecordIterator> _iterators;
-
-        // Not owned by us.
-        WorkingSet* _ws;
-
-        // We allocate a working set member with this id on construction of the stage. It gets
-        // used for all fetch requests, changing the RecordId as appropriate.
-        const WorkingSetID _wsidForFetch;
-    };
-
-} // namespace mongo
+}  // namespace mongo

@@ -1,53 +1,47 @@
-// jump1.js
+(function() {
+'use strict';
 
-s = new ShardingTest( "jump1" , 2 /* numShards */, 2 /* verboseLevel */, 1 /* numMongos */, { chunksize : 1 } )
+load("jstests/sharding/libs/find_chunks_util.js");
 
-s.adminCommand( { enablesharding : "test" } );
-s.adminCommand( { shardcollection : "test.foo" , key : { x : 1 } } );
+var s = new ShardingTest({shards: 2, other: {chunkSize: 1}});
 
-db = s.getDB( "test" );
+assert.commandWorked(s.s.adminCommand({enablesharding: "test"}));
+s.ensurePrimaryShard('test', s.shard1.shardName);
+assert.commandWorked(
+    s.s.adminCommand({addShardToZone: s.shard0.shardName, zone: 'finalDestination'}));
 
-sh.setBalancerState( false )
+// Set the chunk range with a zone that will cause the chunk to be in the wrong place so the
+// balancer will be forced to attempt to move it out.
+assert.commandWorked(s.s.adminCommand({shardcollection: "test.foo", key: {x: 1}}));
+assert.commandWorked(s.s.adminCommand(
+    {updateZoneKeyRange: 'test.foo', min: {x: 0}, max: {x: MaxKey}, zone: 'finalDestination'}));
 
-big = ""
-while ( big.length < 10000 )
-    big += "."
+var db = s.getDB("test");
 
-x = 0;
+const big = 'X'.repeat(10000);
+
+// Create sufficient documents to create a jumbo chunk, and use the same shard key in all of
+// them so that the chunk cannot be split.
 var bulk = db.foo.initializeUnorderedBulkOp();
-for ( ; x < 500; x++ )
-    bulk.insert( { x : x , big : big } );
-
-for ( i=0; i<500; i++ )
-    bulk.insert( { x : x , big : big } );
-
-for ( ; x < 2000; x++ )
-    bulk.insert( { x : x , big : big } );
-
-assert.writeOK( bulk.execute() );
-
-sh.status(true)
-
-res = sh.moveChunk( "test.foo" , { x : 0 } , "shard0001" )
-if ( ! res.ok )
-    res = sh.moveChunk( "test.foo" , { x : 0 } , "shard0000" )
-
-sh.status(true)
-
-sh.setBalancerState( true )
-
-function diff1(){
-    var x = s.chunkCounts( "foo" );
-    printjson( x )
-    return Math.max( x.shard0000 , x.shard0001 ) - Math.min( x.shard0000 , x.shard0001 );
+for (var i = 0; i < 200; i++) {
+    bulk.insert({x: 0, big: big});
 }
 
-assert.soon( function(){
-    var d = diff1();
-    print( "diff: " + d );
-    sh.status(true)
-    return d < 5;
-} , "balance didn't happen" , 1000 * 60 * 5 , 5000 );
+assert.commandWorked(bulk.execute());
 
+s.startBalancer();
 
-s.stop()
+// Wait for the balancer to try to move the chunk and mark it as jumbo.
+assert.soon(() => {
+    let chunk = findChunksUtil.findOneChunkByNs(s.getDB('config'), 'test.foo', {min: {x: 0}});
+    if (chunk == null) {
+        // Balancer hasn't run and enforce the zone boundaries yet.
+        return false;
+    }
+
+    assert.eq(s.shard1.shardName, chunk.shard, `${tojson(chunk)} was moved by the balancer`);
+    return chunk.jumbo;
+});
+
+s.stop();
+})();

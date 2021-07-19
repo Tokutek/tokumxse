@@ -1,35 +1,48 @@
-/*    Copyright 2012 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+
+#include "mongo/platform/basic.h"
 
 #include "mongo/dbtests/mock/mock_remote_db_server.h"
 
+#include <memory>
+#include <tuple>
+
+#include "mongo/db/exec/projection_executor_builder.h"
+#include "mongo/db/pipeline/expression_context_for_test.h"
+#include "mongo/db/query/projection_parser.h"
 #include "mongo/dbtests/mock/mock_dbclient_connection.h"
-#include "mongo/util/mongoutils/str.h"
-#include "mongo/util/net/sock.h"
+#include "mongo/rpc/metadata.h"
+#include "mongo/rpc/op_msg_rpc_impls.h"
+#include "mongo/util/assert_util.h"
+#include "mongo/util/net/socket_exception.h"
+#include "mongo/util/str.h"
 #include "mongo/util/time_support.h"
 
 using std::string;
@@ -37,200 +50,222 @@ using std::vector;
 
 namespace mongo {
 
-    MockRemoteDBServer::CircularBSONIterator::CircularBSONIterator(
-            const vector<BSONObj>& replyVector) {
-        for (std::vector<mongo::BSONObj>::const_iterator iter = replyVector.begin();
-                iter != replyVector.end(); ++iter) {
-            _replyObjs.push_back(iter->copy());
-        }
+MockRemoteDBServer::CircularBSONIterator::CircularBSONIterator(
+    const vector<StatusWith<BSONObj>>& replyVector) {
+    for (auto iter = replyVector.begin(); iter != replyVector.end(); ++iter) {
+        _replyObjs.push_back(iter->isOK() ? StatusWith(iter->getValue().copy()) : *iter);
+    }
 
+    _iter = _replyObjs.begin();
+}
+
+StatusWith<BSONObj> MockRemoteDBServer::CircularBSONIterator::next() {
+    verify(_iter != _replyObjs.end());
+
+    StatusWith<BSONObj> reply = _iter->isOK() ? StatusWith(_iter->getValue().copy()) : *_iter;
+    ++_iter;
+
+    if (_iter == _replyObjs.end()) {
         _iter = _replyObjs.begin();
     }
 
-    BSONObj MockRemoteDBServer::CircularBSONIterator::next() {
-        verify(_iter != _replyObjs.end());
+    return reply;
+}
 
-        BSONObj reply = _iter->copy();
-        ++_iter;
+MockRemoteDBServer::MockRemoteDBServer(const string& hostAndPort)
+    : _isRunning(true),
+      _hostAndPort(HostAndPort(hostAndPort)),
+      _delayMilliSec(0),
+      _cmdCount(0),
+      _queryCount(0),
+      _instanceID(0) {
+    insert(IdentityNS, BSON(HostField(hostAndPort)), 0);
+    setCommandReply("dbStats", BSON(HostField(hostAndPort)));
+}
 
-        if (_iter == _replyObjs.end()) {
-            _iter = _replyObjs.begin();
-        }
+MockRemoteDBServer::~MockRemoteDBServer() {}
 
-        return reply;
+void MockRemoteDBServer::setDelay(long long milliSec) {
+    scoped_spinlock sLock(_lock);
+    _delayMilliSec = milliSec;
+}
+
+void MockRemoteDBServer::shutdown() {
+    scoped_spinlock sLock(_lock);
+    _isRunning = false;
+}
+
+void MockRemoteDBServer::reboot() {
+    scoped_spinlock sLock(_lock);
+    _isRunning = true;
+    _instanceID++;
+}
+
+MockRemoteDBServer::InstanceID MockRemoteDBServer::getInstanceID() const {
+    scoped_spinlock sLock(_lock);
+    return _instanceID;
+}
+
+bool MockRemoteDBServer::isRunning() const {
+    scoped_spinlock sLock(_lock);
+    return _isRunning;
+}
+
+void MockRemoteDBServer::setCommandReply(const string& cmdName,
+                                         const StatusWith<mongo::BSONObj>& replyObj) {
+    vector<StatusWith<BSONObj>> replySequence;
+    replySequence.push_back(replyObj);
+    setCommandReply(cmdName, replySequence);
+}
+
+void MockRemoteDBServer::setCommandReply(const string& cmdName,
+                                         const vector<StatusWith<BSONObj>>& replySequence) {
+    scoped_spinlock sLock(_lock);
+    _cmdMap[cmdName].reset(new CircularBSONIterator(replySequence));
+}
+
+void MockRemoteDBServer::insert(const string& ns, BSONObj obj, int flags) {
+    scoped_spinlock sLock(_lock);
+
+    vector<BSONObj>& mockCollection = _dataMgr[ns];
+    mockCollection.push_back(obj.copy());
+}
+
+void MockRemoteDBServer::remove(const string& ns, Query query, int flags) {
+    scoped_spinlock sLock(_lock);
+    if (_dataMgr.count(ns) == 0) {
+        return;
     }
 
-    MockRemoteDBServer::MockRemoteDBServer(const string& hostAndPort):
-            _isRunning(true),
-            _hostAndPort(hostAndPort),
-            _delayMilliSec(0),
-            _cmdCount(0),
-            _queryCount(0),
-            _instanceID(0) {
-        insert(IdentityNS, BSON(HostField(hostAndPort)), 0);
+    _dataMgr.erase(ns);
+}
+
+void MockRemoteDBServer::assignCollectionUuid(const std::string& ns, const mongo::UUID& uuid) {
+    scoped_spinlock sLock(_lock);
+    _uuidToNs[uuid] = ns;
+}
+
+rpc::UniqueReply MockRemoteDBServer::runCommand(InstanceID id, const OpMsgRequest& request) {
+    checkIfUp(id);
+    std::string cmdName = request.getCommandName().toString();
+
+    StatusWith<BSONObj> reply([this, &cmdName] {
+        scoped_spinlock lk(_lock);
+
+        uassert(ErrorCodes::IllegalOperation,
+                str::stream() << "no reply for command: " << cmdName,
+                _cmdMap.count(cmdName));
+
+        return _cmdMap[cmdName]->next();
+    }());
+
+    if (_delayMilliSec > 0) {
+        mongo::sleepmillis(_delayMilliSec);
     }
 
-    MockRemoteDBServer::~MockRemoteDBServer() {
-    }
+    checkIfUp(id);
 
-    void MockRemoteDBServer::setDelay(long long milliSec) {
-        scoped_spinlock sLock(_lock);
-        _delayMilliSec = milliSec;
-    }
-
-    void MockRemoteDBServer::shutdown() {
-        scoped_spinlock sLock(_lock);
-        _isRunning = false;
-    }
-
-    void MockRemoteDBServer::reboot() {
-        scoped_spinlock sLock(_lock);
-        _isRunning = true;
-        _instanceID++;
-    }
-
-    MockRemoteDBServer::InstanceID MockRemoteDBServer::getInstanceID() const {
-        scoped_spinlock sLock(_lock);
-        return _instanceID;
-    }
-
-    bool MockRemoteDBServer::isRunning() const {
-        scoped_spinlock sLock(_lock);
-        return _isRunning;
-    }
-
-    void MockRemoteDBServer::setCommandReply(const string& cmdName,
-            const mongo::BSONObj& replyObj) {
-        vector<BSONObj> replySequence;
-        replySequence.push_back(replyObj);
-        setCommandReply(cmdName, replySequence);
-    }
-
-    void MockRemoteDBServer::setCommandReply(const string& cmdName,
-            const vector<BSONObj>& replySequence) {
-        scoped_spinlock sLock(_lock);
-        _cmdMap[cmdName].reset(new CircularBSONIterator(replySequence));
-    }
-
-    void MockRemoteDBServer::insert(const string &ns, BSONObj obj, int flags) {
-        scoped_spinlock sLock(_lock);
-
-        vector<BSONObj>& mockCollection = _dataMgr[ns];
-        mockCollection.push_back(obj.copy());
-    }
-
-    void MockRemoteDBServer::remove(const string& ns, Query query, int flags) {
-        scoped_spinlock sLock(_lock);
-        if (_dataMgr.count(ns) == 0) {
-            return;
-        }
-
-        _dataMgr.erase(ns);
-    }
-
-    bool MockRemoteDBServer::runCommand(MockRemoteDBServer::InstanceID id,
-            const string& dbname,
-            const BSONObj& cmdObj,
-            BSONObj &info,
-            int options) {
-        checkIfUp(id);
-
-        // Get the name of the command - copied from _runCommands @ db/dbcommands.cpp
-        BSONObj innerCmdObj;
-        {
-            mongo::BSONElement e = cmdObj.firstElement();
-            if (e.type() == mongo::Object && (e.fieldName()[0] == '$'
-                    ? mongo::str::equals("query", e.fieldName()+1) :
-                            mongo::str::equals("query", e.fieldName()))) {
-                innerCmdObj = e.embeddedObject();
-            }
-            else {
-                innerCmdObj = cmdObj;
-            }
-        }
-
-        string cmdName = innerCmdObj.firstElement().fieldName();
-        uassert(16430, str::stream() << "no reply for cmd: " << cmdName,
-                _cmdMap.count(cmdName) == 1);
-
-        {
-            scoped_spinlock sLock(_lock);
-            info = _cmdMap[cmdName]->next();
-        }
-
-        if (_delayMilliSec > 0) {
-            mongo::sleepmillis(_delayMilliSec);
-        }
-
-        checkIfUp(id);
-
-        scoped_spinlock sLock(_lock);
+    {
+        scoped_spinlock lk(_lock);
         _cmdCount++;
-        return info["ok"].trueValue();
     }
 
-    mongo::BSONArray MockRemoteDBServer::query(
-            MockRemoteDBServer::InstanceID id,
-            const string& ns,
-            mongo::Query query,
-            int nToReturn,
-            int nToSkip,
-            const BSONObj* fieldsToReturn,
-            int queryOptions,
-            int batchSize) {
-        checkIfUp(id);
+    // We need to construct a reply message - it will always be read through a view so it
+    // doesn't matter whether we use OpMsgReplyBuilder or LegacyReplyBuilder
+    auto message = rpc::OpMsgReplyBuilder{}.setCommandReply(reply).done();
+    auto replyView = std::make_unique<rpc::OpMsgReply>(&message);
+    return rpc::UniqueReply(std::move(message), std::move(replyView));
+}
 
-        if (_delayMilliSec > 0) {
-            mongo::sleepmillis(_delayMilliSec);
-        }
+std::unique_ptr<projection_executor::ProjectionExecutor>
+MockRemoteDBServer::createProjectionExecutor(const BSONObj& projectionSpec) {
+    const boost::intrusive_ptr<ExpressionContextForTest> expCtx(new ExpressionContextForTest());
+    ProjectionPolicies defaultPolicies;
+    auto projection = projection_ast::parse(expCtx, projectionSpec, defaultPolicies);
+    return projection_executor::buildProjectionExecutor(
+        expCtx, &projection, defaultPolicies, projection_executor::kDefaultBuilderParams);
+}
 
-        checkIfUp(id);
+BSONObj MockRemoteDBServer::project(projection_executor::ProjectionExecutor* projectionExecutor,
+                                    const BSONObj& o) {
+    if (!projectionExecutor)
+        return o.copy();
+    Document doc(o);
+    auto projectedDoc = projectionExecutor->applyTransformation(doc);
+    return projectedDoc.toBson().getOwned();
+}
 
-        scoped_spinlock sLock(_lock);
-        _queryCount++;
+mongo::BSONArray MockRemoteDBServer::query(MockRemoteDBServer::InstanceID id,
+                                           const NamespaceStringOrUUID& nsOrUuid,
+                                           mongo::Query query,
+                                           int nToReturn,
+                                           int nToSkip,
+                                           const BSONObj* fieldsToReturn,
+                                           int queryOptions,
+                                           int batchSize,
+                                           boost::optional<BSONObj> readConcernObj) {
+    checkIfUp(id);
 
-        const vector<BSONObj>& coll = _dataMgr[ns];
-        BSONArrayBuilder result;
-        for (vector<BSONObj>::const_iterator iter = coll.begin(); iter != coll.end(); ++ iter) {
-            result.append(iter->copy());
-        }
-
-        return BSONArray(result.obj());
+    if (_delayMilliSec > 0) {
+        mongo::sleepmillis(_delayMilliSec);
     }
 
-    mongo::ConnectionString::ConnectionType MockRemoteDBServer::type() const {
-        return mongo::ConnectionString::CUSTOM;
+    checkIfUp(id);
+
+    std::unique_ptr<projection_executor::ProjectionExecutor> projectionExecutor;
+    if (fieldsToReturn) {
+        projectionExecutor = createProjectionExecutor(*fieldsToReturn);
+    }
+    scoped_spinlock sLock(_lock);
+    _queryCount++;
+
+    auto ns = nsOrUuid.uuid() ? _uuidToNs[*nsOrUuid.uuid()] : nsOrUuid.nss()->ns();
+    const vector<BSONObj>& coll = _dataMgr[ns];
+    BSONArrayBuilder result;
+    for (vector<BSONObj>::const_iterator iter = coll.begin(); iter != coll.end(); ++iter) {
+        result.append(project(projectionExecutor.get(), *iter));
     }
 
-    size_t MockRemoteDBServer::getCmdCount() const {
-        scoped_spinlock sLock(_lock);
-        return _cmdCount;
-    }
+    return BSONArray(result.obj());
+}
 
-    size_t MockRemoteDBServer::getQueryCount() const {
-        scoped_spinlock sLock(_lock);
-        return _queryCount;
-    }
+mongo::ConnectionString::ConnectionType MockRemoteDBServer::type() const {
+    return mongo::ConnectionString::ConnectionType::kCustom;
+}
 
-    void MockRemoteDBServer::clearCounters() {
-        scoped_spinlock sLock(_lock);
-        _cmdCount = 0;
-        _queryCount = 0;
-    }
+size_t MockRemoteDBServer::getCmdCount() const {
+    scoped_spinlock sLock(_lock);
+    return _cmdCount;
+}
 
-    string MockRemoteDBServer::getServerAddress() const {
-        return _hostAndPort;
-    }
+size_t MockRemoteDBServer::getQueryCount() const {
+    scoped_spinlock sLock(_lock);
+    return _queryCount;
+}
 
-    string MockRemoteDBServer::toString() {
-        return _hostAndPort;
-    }
+void MockRemoteDBServer::clearCounters() {
+    scoped_spinlock sLock(_lock);
+    _cmdCount = 0;
+    _queryCount = 0;
+}
 
-    void MockRemoteDBServer::checkIfUp(InstanceID id) const {
-        scoped_spinlock sLock(_lock);
+string MockRemoteDBServer::getServerAddress() const {
+    return _hostAndPort.toString();
+}
 
-        if (!_isRunning || id < _instanceID) {
-            throw mongo::SocketException(mongo::SocketException::CLOSED, _hostAndPort);
-        }
+string MockRemoteDBServer::toString() {
+    return _hostAndPort.toString();
+}
+
+const HostAndPort& MockRemoteDBServer::getServerHostAndPort() const {
+    return _hostAndPort;
+}
+
+void MockRemoteDBServer::checkIfUp(InstanceID id) const {
+    scoped_spinlock sLock(_lock);
+
+    if (!_isRunning || id < _instanceID) {
+        throwSocketError(mongo::SocketErrorKind::CLOSED, _hostAndPort.toString());
     }
 }
+}  // namespace mongo

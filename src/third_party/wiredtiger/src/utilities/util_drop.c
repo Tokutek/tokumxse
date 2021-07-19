@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -8,44 +8,40 @@
 
 #include "util.h"
 
-static int usage(void);
+static int
+usage(void)
+{
+    util_usage("drop uri", NULL, NULL);
+    return (1);
+}
 
 int
 util_drop(WT_SESSION *session, int argc, char *argv[])
 {
-	WT_DECL_RET;
-	int ch;
-	char *name;
+    WT_DECL_RET;
+    int ch;
+    char *uri;
 
-	while ((ch = __wt_getopt(progname, argc, argv, "")) != EOF)
-		switch (ch) {
-		case '?':
-		default:
-			return (usage());
-		}
+    uri = NULL;
+    while ((ch = __wt_getopt(progname, argc, argv, "")) != EOF)
+        switch (ch) {
+        case '?':
+        default:
+            return (usage());
+        }
 
-	argc -= __wt_optind;
-	argv += __wt_optind;
+    argc -= __wt_optind;
+    argv += __wt_optind;
 
-	/* The remaining argument is the uri. */
-	if (argc != 1)
-		return (usage());
-	if ((name = util_name(session, *argv, "table")) == NULL)
-		return (1);
+    /* The remaining argument is the uri. */
+    if (argc != 1)
+        return (usage());
+    if ((uri = util_uri(session, *argv, "table")) == NULL)
+        return (1);
 
-	ret = session->drop(session, name, "force");
+    if ((ret = session->drop(session, uri, "force")) != 0)
+        (void)util_err(session, ret, "session.drop: %s", uri);
 
-	if (name != NULL)
-		free(name);
-	return (ret);
-}
-
-static int
-usage(void)
-{
-	(void)fprintf(stderr,
-	    "usage: %s %s "
-	    "drop uri\n",
-	    progname, usage_prefix);
-	return (1);
+    free(uri);
+    return (ret);
 }

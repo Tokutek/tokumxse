@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 mongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -32,60 +33,62 @@
 
 #include "mongo/db/exec/sort.h"
 
+#include <boost/optional.hpp>
+#include <memory>
+
 #include "mongo/db/exec/queued_data_stage.h"
 #include "mongo/db/json.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/query/collation/collator_factory_mock.h"
+#include "mongo/db/query/collation/collator_interface_mock.h"
+#include "mongo/db/service_context_d_test_fixture.h"
 #include "mongo/unittest/unittest.h"
+#include "mongo/util/clock_source_mock.h"
 
 using namespace mongo;
 
 namespace {
 
+static const NamespaceString kNss("db.dummy");
 
-    TEST(SortStageTest, SortEmptyWorkingSet) {
-        WorkingSet ws;
+class SortStageDefaultTest : public ServiceContextMongoDTest {
+public:
+    static constexpr uint64_t kMaxMemoryUsageBytes = 1024u * 1024u;
 
-        // QueuedDataStage will be owned by SortStage.
-        QueuedDataStage* ms = new QueuedDataStage(&ws);
-        SortStageParams params;
-        SortStage sort(params, &ws, ms);
+    SortStageDefaultTest() {
+        getServiceContext()->setFastClockSource(std::make_unique<ClockSourceMock>());
+        _opCtx = makeOperationContext();
+        CollatorFactoryInterface::set(getServiceContext(), std::make_unique<CollatorFactoryMock>());
+    }
 
-        // Check initial EOF state.
-        ASSERT_TRUE(ms->isEOF());
-        ASSERT_FALSE(sort.isEOF());
-
-        // First call to work() initializes sort key generator.
-        WorkingSetID id = WorkingSet::INVALID_ID;
-        PlanStage::StageState state = sort.work(&id);
-        ASSERT_EQUALS(state, PlanStage::NEED_TIME);
-
-        // Second call to work() sorts data in vector.
-        state = sort.work(&id);
-        ASSERT_EQUALS(state, PlanStage::NEED_TIME);
-
-        // Finally we hit EOF.
-        state = sort.work(&id);
-        ASSERT_EQUALS(state, PlanStage::IS_EOF);
-
-        ASSERT_TRUE(sort.isEOF());
+    OperationContext* opCtx() {
+        return _opCtx.get();
     }
 
     /**
-     * Test function to verify sort stage.
-     * SortStageParams will be initialized using patternStr, queryStr and limit.
-     * inputStr represents the input data set in a BSONObj.
+     * Test function to verify sort stage. SortStageDefault will be initialized using 'patternStr',
+     * 'collator', and 'limit;.
+     *
+     * 'inputStr' represents the input data set in a BSONObj.
      *     {input: [doc1, doc2, doc3, ...]}
-     * expectedStr represents the expected sorted data set.
+     *
+     * 'expectedStr; represents the expected sorted data set.
      *     {output: [docA, docB, docC, ...]}
      */
-    void testWork(const char* patternStr, const char* queryStr, int limit,
-                  const char* inputStr, const char* expectedStr) {
-
+    void testWork(const char* patternStr,
+                  CollatorInterface* collator,
+                  int limit,
+                  const char* inputStr,
+                  const char* expectedStr) {
         // WorkingSet is not owned by stages
         // so it's fine to declare
         WorkingSet ws;
 
-        // QueuedDataStage will be owned by SortStage.
-        QueuedDataStage* ms = new QueuedDataStage(&ws);
+        auto expCtx = make_intrusive<ExpressionContext>(
+            opCtx(), CollatorInterface::cloneCollator(collator), kNss);
+
+        // QueuedDataStage will be owned by SortStageDefault.
+        auto queuedDataStage = std::make_unique<QueuedDataStage>(expCtx.get(), &ws);
         BSONObj inputObj = fromjson(inputStr);
         BSONElement inputElt = inputObj.getField("input");
         ASSERT(inputElt.isABSONObj());
@@ -93,23 +96,28 @@ namespace {
         while (inputIt.more()) {
             BSONElement elt = inputIt.next();
             ASSERT(elt.isABSONObj());
-            BSONObj obj = elt.embeddedObject();
+            BSONObj obj = elt.embeddedObject().getOwned();
 
             // Insert obj from input array into working set.
-            WorkingSetMember wsm;
-            wsm.state = WorkingSetMember::OWNED_OBJ;
-            wsm.obj = Snapshotted<BSONObj>(SnapshotId(), obj);
-            ms->pushBack(wsm);
+            WorkingSetID id = ws.allocate();
+            WorkingSetMember* wsm = ws.get(id);
+            wsm->doc = {SnapshotId(), Document{obj}};
+            wsm->transitionToOwnedObj();
+            queuedDataStage->pushBack(id);
         }
 
-        // Initialize SortStageParams
-        // Setting limit to 0 means no limit
-        SortStageParams params;
-        params.pattern = fromjson(patternStr);
-        params.query = fromjson(queryStr);
-        params.limit = limit;
+        auto sortPattern = fromjson(patternStr);
 
-        SortStage sort(params, &ws, ms);
+        auto sortKeyGen = std::make_unique<SortKeyGeneratorStage>(
+            expCtx, std::move(queuedDataStage), &ws, sortPattern);
+
+        SortStageDefault sort(expCtx,
+                              &ws,
+                              SortPattern{sortPattern, expCtx},
+                              limit,
+                              kMaxMemoryUsageBytes,
+                              false,  // addSortKeyMetadata
+                              std::move(sortKeyGen));
 
         WorkingSetID id = WorkingSet::INVALID_ID;
         PlanStage::StageState state = PlanStage::NEED_TIME;
@@ -119,8 +127,8 @@ namespace {
             state = sort.work(&id);
         }
 
-        // Child's state should be EOF when sort is ready to advance.
-        ASSERT_TRUE(ms->isEOF());
+        // QueuedDataStage's state should be EOF when sort is ready to advance.
+        ASSERT_TRUE(sort.child()->child()->isEOF());
 
         // While there's data to be retrieved, state should be equal to ADVANCED.
         // Insert documents into BSON document in this format:
@@ -129,7 +137,7 @@ namespace {
         BSONArrayBuilder arr(bob.subarrayStart("output"));
         while (state == PlanStage::ADVANCED) {
             WorkingSetMember* member = ws.get(id);
-            const BSONObj& obj = member->obj.value();
+            BSONObj obj = member->doc.value().toBson();
             arr.append(obj);
             state = sort.work(&id);
         }
@@ -142,100 +150,158 @@ namespace {
 
         // Finally, we get to compare the sorted results against what we expect.
         BSONObj expectedObj = fromjson(expectedStr);
-        if (outputObj != expectedObj) {
-            mongoutils::str::stream ss;
+        if (SimpleBSONObjComparator::kInstance.evaluate(outputObj != expectedObj)) {
+            str::stream ss;
             // Even though we have the original string representation of the expected output,
             // we invoke BSONObj::toString() to get a format consistent with outputObj.
-            ss << "Unexpected sort result with query=" << queryStr << "; pattern=" << patternStr
-               << "; limit=" << limit << ":\n"
+            ss << "Unexpected sort result with pattern=" << patternStr << "; limit=" << limit
+               << ":\n"
                << "Expected: " << expectedObj.toString() << "\n"
                << "Actual:   " << outputObj.toString() << "\n";
             FAIL(ss);
         }
     }
 
-    //
-    // Limit values
-    // The server interprets limit values from the user as follows:
-    //     0: no limit on query results. This is passed along unchanged to the sort stage.
-    //     >0: soft limit. Also unchanged in sort stage.
-    //     <0: hard limit. Absolute value is stored in parsed query and passed to sort stage.
-    // The sort stage treats both soft and hard limits in the same manner
+private:
+    ServiceContext::UniqueOperationContext _opCtx;
+};
 
-    //
-    // Sort without limit
-    // Implementation should keep all items fetched from child.
-    //
+TEST_F(SortStageDefaultTest, SortEmptyWorkingSet) {
+    WorkingSet ws;
 
-    TEST(SortStageTest, SortAscending) {
-        testWork("{a: 1}", "{}", 0,
-                 "{input: [{a: 2}, {a: 1}, {a: 3}]}",
-                 "{output: [{a: 1}, {a: 2}, {a: 3}]}");
-    }
+    auto expCtx = make_intrusive<ExpressionContext>(opCtx(), nullptr, kNss);
 
-    TEST(SortStageTest, SortDescending) {
-        testWork("{a: -1}", "{}", 0,
-                 "{input: [{a: 2}, {a: 1}, {a: 3}]}",
-                 "{output: [{a: 3}, {a: 2}, {a: 1}]}");
-    }
+    // QueuedDataStage will be owned by SortStageDefault.
+    auto queuedDataStage = std::make_unique<QueuedDataStage>(expCtx.get(), &ws);
+    auto sortKeyGen =
+        std::make_unique<SortKeyGeneratorStage>(expCtx, std::move(queuedDataStage), &ws, BSONObj());
+    auto sortPattern = BSON("a" << 1);
+    SortStageDefault sort(expCtx,
+                          &ws,
+                          SortPattern{sortPattern, expCtx},
+                          0u,
+                          kMaxMemoryUsageBytes,
+                          false,  // addSortKeyMetadata
+                          std::move(sortKeyGen));
 
-    TEST(SortStageTest, SortIrrelevantSortKey) {
-        testWork("{b: 1}", "{}", 0,
-                 "{input: [{a: 2}, {a: 1}, {a: 3}]}",
-                 "{output: [{a: 2}, {a: 1}, {a: 3}]}");
-    }
+    // Check initial EOF state.
+    ASSERT_FALSE(sort.isEOF());
 
-    //
-    // Sorting with limit > 1
-    // Implementation should retain top N items
-    // and discard the rest.
-    //
+    // First call to work() sorts data in vector.
+    WorkingSetID id = WorkingSet::INVALID_ID;
+    auto state = sort.work(&id);
+    ASSERT_EQUALS(state, PlanStage::NEED_TIME);
 
-    TEST(SortStageTest, SortAscendingWithLimit) {
-        testWork("{a: 1}", "{}", 2,
-                 "{input: [{a: 2}, {a: 1}, {a: 3}]}",
-                 "{output: [{a: 1}, {a: 2}]}");
-    }
+    // Finally we hit EOF.
+    state = sort.work(&id);
+    ASSERT_EQUALS(state, PlanStage::IS_EOF);
 
-    TEST(SortStageTest, SortDescendingWithLimit) {
-        testWork("{a: -1}", "{}", 2,
-                 "{input: [{a: 2}, {a: 1}, {a: 3}]}",
-                 "{output: [{a: 3}, {a: 2}]}");
-    }
+    ASSERT_TRUE(sort.isEOF());
+}
 
-    //
-    // Sorting with limit > size of data set
-    // Implementation should retain top N items
-    // and discard the rest.
-    //
+//
+// Limit values
+// The server interprets limit values from the user as follows:
+//     0: no limit on query results. This is passed along unchanged to the sort stage.
+//     >0: soft limit. Also unchanged in sort stage.
+//     <0: hard limit. Absolute value is stored in parsed query and passed to sort stage.
+// The sort stage treats both soft and hard limits in the same manner
 
-    TEST(SortStageTest, SortAscendingWithLimitGreaterThanInputSize) {
-        testWork("{a: 1}", "{}", 10,
-                 "{input: [{a: 2}, {a: 1}, {a: 3}]}",
-                 "{output: [{a: 1}, {a: 2}, {a: 3}]}");
-    }
+//
+// Sort without limit
+// Implementation should keep all items fetched from child.
+//
 
-    TEST(SortStageTest, SortDescendingWithLimitGreaterThanInputSize) {
-        testWork("{a: -1}", "{}", 10,
-                 "{input: [{a: 2}, {a: 1}, {a: 3}]}",
-                 "{output: [{a: 3}, {a: 2}, {a: 1}]}");
-    }
+TEST_F(SortStageDefaultTest, SortAscending) {
+    testWork("{a: 1}",
+             nullptr,
+             0,
+             "{input: [{a: 2}, {a: 1}, {a: 3}]}",
+             "{output: [{a: 1}, {a: 2}, {a: 3}]}");
+}
 
-    //
-    // Sorting with limit 1
-    // Implementation should optimize this into a running maximum.
-    //
+TEST_F(SortStageDefaultTest, SortDescending) {
+    testWork("{a: -1}",
+             nullptr,
+             0,
+             "{input: [{a: 2}, {a: 1}, {a: 3}]}",
+             "{output: [{a: 3}, {a: 2}, {a: 1}]}");
+}
 
-    TEST(SortStageTest, SortAscendingWithLimitOfOne) {
-        testWork("{a: 1}", "{}", 1,
-                 "{input: [{a: 2}, {a: 1}, {a: 3}]}",
-                 "{output: [{a: 1}]}");
-    }
+TEST_F(SortStageDefaultTest, SortIrrelevantSortKey) {
+    testWork("{b: 1}",
+             nullptr,
+             0,
+             "{input: [{a: 2}, {a: 1}, {a: 3}]}",
+             "{output: [{a: 2}, {a: 1}, {a: 3}]}");
+}
 
-    TEST(SortStageTest, SortDescendingWithLimitOfOne) {
-        testWork("{a: -1}", "{}", 1,
-                 "{input: [{a: 2}, {a: 1}, {a: 3}]}",
-                 "{output: [{a: 3}]}");
-    }
+//
+// Sorting with limit > 1
+// Implementation should retain top N items
+// and discard the rest.
+//
 
+TEST_F(SortStageDefaultTest, SortAscendingWithLimit) {
+    testWork(
+        "{a: 1}", nullptr, 2, "{input: [{a: 2}, {a: 1}, {a: 3}]}", "{output: [{a: 1}, {a: 2}]}");
+}
+
+TEST_F(SortStageDefaultTest, SortDescendingWithLimit) {
+    testWork(
+        "{a: -1}", nullptr, 2, "{input: [{a: 2}, {a: 1}, {a: 3}]}", "{output: [{a: 3}, {a: 2}]}");
+}
+
+//
+// Sorting with limit > size of data set
+// Implementation should retain top N items
+// and discard the rest.
+//
+
+TEST_F(SortStageDefaultTest, SortAscendingWithLimitGreaterThanInputSize) {
+    testWork("{a: 1}",
+             nullptr,
+             10,
+             "{input: [{a: 2}, {a: 1}, {a: 3}]}",
+             "{output: [{a: 1}, {a: 2}, {a: 3}]}");
+}
+
+TEST_F(SortStageDefaultTest, SortDescendingWithLimitGreaterThanInputSize) {
+    testWork("{a: -1}",
+             nullptr,
+             10,
+             "{input: [{a: 2}, {a: 1}, {a: 3}]}",
+             "{output: [{a: 3}, {a: 2}, {a: 1}]}");
+}
+
+//
+// Sorting with limit 1
+// Implementation should optimize this into a running maximum.
+//
+
+TEST_F(SortStageDefaultTest, SortAscendingWithLimitOfOne) {
+    testWork("{a: 1}", nullptr, 1, "{input: [{a: 2}, {a: 1}, {a: 3}]}", "{output: [{a: 1}]}");
+}
+
+TEST_F(SortStageDefaultTest, SortDescendingWithLimitOfOne) {
+    testWork("{a: -1}", nullptr, 1, "{input: [{a: 2}, {a: 1}, {a: 3}]}", "{output: [{a: 3}]}");
+}
+
+TEST_F(SortStageDefaultTest, SortAscendingWithCollation) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    testWork("{a: 1}",
+             &collator,
+             0,
+             "{input: [{a: 'ba'}, {a: 'aa'}, {a: 'ab'}]}",
+             "{output: [{a: 'aa'}, {a: 'ba'}, {a: 'ab'}]}");
+}
+
+TEST_F(SortStageDefaultTest, SortDescendingWithCollation) {
+    CollatorInterfaceMock collator(CollatorInterfaceMock::MockType::kReverseString);
+    testWork("{a: -1}",
+             &collator,
+             0,
+             "{input: [{a: 'ba'}, {a: 'aa'}, {a: 'ab'}]}",
+             "{output: [{a: 'ab'}, {a: 'ba'}, {a: 'aa'}]}");
+}
 }  // namespace

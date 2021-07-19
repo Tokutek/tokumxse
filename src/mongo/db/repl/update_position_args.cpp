@@ -1,23 +1,24 @@
 /**
- *    Copyright 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -34,113 +35,112 @@
 #include "mongo/bson/util/bson_check.h"
 #include "mongo/bson/util/bson_extract.h"
 #include "mongo/db/jsobj.h"
+#include "mongo/db/repl/bson_extract_optime.h"
 
 namespace mongo {
 namespace repl {
 
+const char UpdatePositionArgs::kCommandFieldName[] = "replSetUpdatePosition";
+const char UpdatePositionArgs::kUpdateArrayFieldName[] = "optimes";
+const char UpdatePositionArgs::kAppliedOpTimeFieldName[] = "appliedOpTime";
+const char UpdatePositionArgs::kAppliedWallTimeFieldName[] = "appliedWallTime";
+const char UpdatePositionArgs::kDurableOpTimeFieldName[] = "durableOpTime";
+const char UpdatePositionArgs::kDurableWallTimeFieldName[] = "durableWallTime";
+const char UpdatePositionArgs::kMemberIdFieldName[] = "memberId";
+const char UpdatePositionArgs::kConfigVersionFieldName[] = "cfgver";
 
-    UpdatePositionArgs::UpdateInfo::UpdateInfo(
-            const OID& anRid, const OpTime& aTs, long long aCfgver, long long aMemberId)
-        : rid(anRid), ts(aTs), cfgver(aCfgver), memberId(aMemberId) {}
+UpdatePositionArgs::UpdateInfo::UpdateInfo(const OpTime& applied,
+                                           const Date_t& appliedWall,
+                                           const OpTime& durable,
+                                           const Date_t& durableWall,
+                                           long long aCfgver,
+                                           long long aMemberId)
+    : appliedOpTime(applied),
+      appliedWallTime(appliedWall),
+      durableOpTime(durable),
+      durableWallTime(durableWall),
+      cfgver(aCfgver),
+      memberId(aMemberId) {}
 
-namespace {
+Status UpdatePositionArgs::initialize(const BSONObj& argsObj) {
+    // grab the array of changes
+    BSONElement updateArray;
+    Status status = bsonExtractTypedField(argsObj, kUpdateArrayFieldName, Array, &updateArray);
+    if (!status.isOK())
+        return status;
 
-    const std::string kCommandFieldName = "replSetUpdatePosition";
-    const std::string kUpdateArrayFieldName = "optimes";
+    // now parse each array entry into an update
+    BSONObjIterator i(updateArray.Obj());
+    while (i.more()) {
+        BSONObj entry = i.next().Obj();
 
-    const std::string kLegalUpdatePositionFieldNames[] = {
-        kCommandFieldName,
-        kUpdateArrayFieldName,
-    };
+        OpTime appliedOpTime;
+        status = bsonExtractOpTimeField(entry, kAppliedOpTimeFieldName, &appliedOpTime);
+        if (!status.isOK()) {
+            return status;
+        }
+        Date_t appliedWallTime = Date_t();
+        BSONElement appliedWallTimeElement;
+        status = bsonExtractTypedField(
+            entry, kAppliedWallTimeFieldName, BSONType::Date, &appliedWallTimeElement);
+        if (!status.isOK()) {
+            return status;
+        }
+        appliedWallTime = appliedWallTimeElement.Date();
 
-    const std::string kMemberRIDFieldName = "_id";
-    const std::string kMemberConfigFieldName = "config";
-    const std::string kOpTimeFieldName = "optime";
-    const std::string kMemberIdFieldName = "memberId";
-    const std::string kConfigVersionFieldName = "cfgver";
+        Date_t durableWallTime = Date_t();
+        BSONElement durableWallTimeElement;
+        status = bsonExtractTypedField(
+            entry, kDurableWallTimeFieldName, BSONType::Date, &durableWallTimeElement);
+        if (!status.isOK()) {
+            return status;
+        }
+        durableWallTime = durableWallTimeElement.Date();
 
-    const std::string kLegalUpdateInfoFieldNames[] = {
-        kMemberConfigFieldName,
-        kMemberRIDFieldName,
-        kOpTimeFieldName,
-        kMemberIdFieldName,
-        kConfigVersionFieldName,
-    };
-
-} // namespace
-
-    Status UpdatePositionArgs::initialize(const BSONObj& argsObj) {
-        Status status = bsonCheckOnlyHasFields("UpdatePositionArgs",
-                                               argsObj,
-                                               kLegalUpdatePositionFieldNames);
-
+        OpTime durableOpTime;
+        status = bsonExtractOpTimeField(entry, kDurableOpTimeFieldName, &durableOpTime);
         if (!status.isOK())
             return status;
 
-        // grab the array of changes
-        BSONElement updateArray;
-        status = bsonExtractTypedField(argsObj, kUpdateArrayFieldName, Array, &updateArray);
+        // TODO(spencer): The following three fields are optional in 3.0, but should be made
+        // required or ignored in 3.0
+        long long cfgver;
+        status = bsonExtractIntegerFieldWithDefault(entry, kConfigVersionFieldName, -1, &cfgver);
         if (!status.isOK())
             return status;
 
-        // now parse each array entry into an update
-        BSONObjIterator i(updateArray.Obj());
-        while(i.more()) {
-            BSONObj entry = i.next().Obj();
-            status = bsonCheckOnlyHasFields("UpdateInfoArgs",
-                                            entry,
-                                            kLegalUpdateInfoFieldNames);
-            if (!status.isOK())
-                return status;
+        long long memberID;
+        status = bsonExtractIntegerFieldWithDefault(entry, kMemberIdFieldName, -1, &memberID);
+        if (!status.isOK())
+            return status;
 
-            OpTime ts;
-            status = bsonExtractOpTimeField(entry, kOpTimeFieldName, &ts);
-            if (!status.isOK())
-                return status;
-
-            // TODO(spencer): The following three fields are optional in 3.0, but should be made
-            // required or ignored in 3.0
-            long long cfgver;
-            status = bsonExtractIntegerFieldWithDefault(entry, kConfigVersionFieldName, -1, &cfgver);
-            if (!status.isOK())
-                return status;
-
-            OID rid;
-            status = bsonExtractOIDFieldWithDefault(entry, kMemberRIDFieldName, OID(), &rid);
-            if (!status.isOK())
-                return status;
-
-            long long memberID;
-            status = bsonExtractIntegerFieldWithDefault(entry, kMemberIdFieldName, -1, &memberID);
-            if (!status.isOK())
-                return status;
-
-            _updates.push_back(UpdateInfo(rid, ts, cfgver, memberID));
-        }
-
-        return Status::OK();
+        _updates.push_back(UpdateInfo(
+            appliedOpTime, appliedWallTime, durableOpTime, durableWallTime, cfgver, memberID));
     }
 
-    BSONObj UpdatePositionArgs::toBSON() const {
-        BSONObjBuilder builder;
-        // add command name
-        builder.append(kCommandFieldName, 1);
-        
-        // build array of updates
-        if (!_updates.empty()) {
-            BSONArrayBuilder updateArray(builder.subarrayStart(kUpdateArrayFieldName));
-            for (UpdatePositionArgs::UpdateIterator update = updatesBegin();
-                    update != updatesEnd();
-                    ++update) {
-                updateArray.append(BSON(kMemberRIDFieldName << update->rid <<
-                                        kOpTimeFieldName << update->ts <<
-                                        kConfigVersionFieldName << update->cfgver <<
-                                        kMemberIdFieldName << update->memberId));
-            }
-            updateArray.doneFast();
+    return Status::OK();
+}
+
+BSONObj UpdatePositionArgs::toBSON() const {
+    BSONObjBuilder builder;
+    // add command name
+    builder.append(kCommandFieldName, 1);
+
+    // build array of updates
+    if (!_updates.empty()) {
+        BSONArrayBuilder updateArray(builder.subarrayStart(kUpdateArrayFieldName));
+        for (UpdatePositionArgs::UpdateIterator update = updatesBegin(); update != updatesEnd();
+             ++update) {
+            BSONObjBuilder updateEntry(updateArray.subobjStart());
+            updateEntry.append(kConfigVersionFieldName, update->cfgver);
+            updateEntry.append(kMemberIdFieldName, update->memberId);
+            update->durableOpTime.append(&updateEntry, kDurableOpTimeFieldName);
+            update->appliedOpTime.append(&updateEntry, kAppliedOpTimeFieldName);
         }
-        return builder.obj();
+        updateArray.doneFast();
     }
+    return builder.obj();
+}
 
 }  // namespace repl
 }  // namespace mongo

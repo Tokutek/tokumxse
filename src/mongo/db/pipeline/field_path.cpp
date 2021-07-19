@@ -1,120 +1,152 @@
 /**
- * Copyright (c) 2011 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- * This program is free software: you can redistribute it and/or  modify
- * it under the terms of the GNU Affero General Public License, version 3,
- * as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU Affero General Public License for more details.
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
  *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
- * As a special exception, the copyright holders give permission to link the
- * code of portions of this program with the OpenSSL library under certain
- * conditions as described in each individual source file and distribute
- * linked combinations including the program with the OpenSSL library. You
- * must comply with the GNU Affero General Public License in all respects for
- * all of the code used other than as permitted herein. If you modify file(s)
- * with this exception, you may extend this exception to your version of the
- * file(s), but you are not obligated to do so. If you do not wish to do so,
- * delete this exception statement from your version. If you delete this
- * exception statement from all source files in the program, then also delete
- * it in the license file.
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/pipeline/field_path.h"
+#include "mongo/db/query/query_feature_flags_gen.h"
+#include "mongo/db/query/query_knobs_gen.h"
 
-#include "mongo/util/mongoutils/str.h"
+#include "mongo/base/string_data.h"
+#include "mongo/bson/bson_depth.h"
+#include "mongo/util/str.h"
+#include "mongo/util/string_map.h"
 
 namespace mongo {
 
-    using std::ostream;
-    using std::string;
-    using std::stringstream;
-    using std::vector;
+namespace {
+const StringDataSet kAllowedDollarPrefixedFields = {
+    // For DBRef
+    "$id"_sd,
+    "$ref"_sd,
+    "$db"_sd,
 
-    using namespace mongoutils;
+    // Metadata fields.
 
-    const char FieldPath::prefix[] = "$";
+    // This is necessary for sharded query execution of find() commands. mongos may attach a
+    // $sortKey field to the projection sent to shards so that it can merge the results correctly.
+    "$sortKey",
 
-    FieldPath::FieldPath(const vector<string>& fieldPath) {
-        massert(16409, "FieldPath cannot be constructed from an empty vector.", !fieldPath.empty());
-        vFieldName.reserve(fieldPath.size());
-        for(vector<string>::const_iterator i = fieldPath.begin(); i != fieldPath.end(); ++i) {
-            pushFieldName(*i);
-        }
-        verify(getPathLength() > 0);
+    // This is necessary for the "showRecordId" feature.
+    "$recordId"};
+
+}  // namespace
+
+using std::string;
+using std::vector;
+
+string FieldPath::getFullyQualifiedPath(StringData prefix, StringData suffix) {
+    if (prefix.empty()) {
+        return suffix.toString();
     }
 
-    FieldPath::FieldPath(const string& fieldPath) {
-        /*
-          The field path could be using dot notation.
-          Break the field path up by peeling off successive pieces.
-        */
-        size_t startpos = 0;
-        while(true) {
-            /* find the next dot */
-            const size_t dotpos = fieldPath.find('.', startpos);
-
-            /* if there are no more dots, use the remainder of the string */
-            if (dotpos == fieldPath.npos) {
-                string lastFieldName = fieldPath.substr(startpos, dotpos);
-                pushFieldName(lastFieldName);
-                break;
-            }
-
-            /* use the string up to the dot */
-            const size_t length = dotpos - startpos;
-            string nextFieldName = fieldPath.substr(startpos, length);
-            pushFieldName(nextFieldName);
-
-            /* next time, search starting one spot after that */
-            startpos = dotpos + 1;
-        }
-        verify(getPathLength() > 0);
-    }
-
-    string FieldPath::getPath(bool fieldPrefix) const {
-        stringstream ss;
-        writePath(ss, fieldPrefix);
-        return ss.str();
-    }
-
-    void FieldPath::writePath(ostream &outStream, bool fieldPrefix) const {
-        if (fieldPrefix)
-            outStream << prefix;
-
-        const size_t n = vFieldName.size();
-
-        verify(n > 0);
-        outStream << vFieldName[0];
-        for(size_t i = 1; i < n; ++i)
-            outStream << '.' << vFieldName[i];
-    }
-
-    FieldPath FieldPath::tail() const {
-        vector<string> allButFirst(vFieldName.begin()+1, vFieldName.end());
-        return FieldPath(allButFirst);
-    }
-
-    void FieldPath::uassertValidFieldName(const string& fieldName) {
-        uassert(15998, "FieldPath field names may not be empty strings.", fieldName.length() > 0);
-        uassert(16410, "FieldPath field names may not start with '$'.", fieldName[0] != '$');
-        uassert(16411, "FieldPath field names may not contain '\0'.",
-                fieldName.find('\0') == string::npos);
-        uassert(16412, "FieldPath field names may not contain '.'.",
-                !str::contains(fieldName, '.'));
-    }
-
-    void FieldPath::pushFieldName(const string& fieldName) {
-        uassertValidFieldName(fieldName);
-        vFieldName.push_back(fieldName);
-    }
-
+    return str::stream() << prefix << "." << suffix;
 }
+
+FieldPath::FieldPath(std::string inputPath)
+    : _fieldPath(std::move(inputPath)), _fieldPathDotPosition{string::npos} {
+    uassert(40352, "FieldPath cannot be constructed with empty string", !_fieldPath.empty());
+    uassert(40353, "FieldPath must not end with a '.'.", _fieldPath[_fieldPath.size() - 1] != '.');
+
+    // Store index delimiter position for use in field lookup.
+    size_t dotPos;
+    size_t startPos = 0;
+    while (string::npos != (dotPos = _fieldPath.find('.', startPos))) {
+        _fieldPathDotPosition.push_back(dotPos);
+        startPos = dotPos + 1;
+    }
+
+    _fieldPathDotPosition.push_back(_fieldPath.size());
+
+    // Validate the path length and the fields.
+    const auto pathLength = getPathLength();
+    uassert(ErrorCodes::Overflow,
+            "FieldPath is too long",
+            pathLength <= BSONDepth::getMaxAllowableDepth());
+    for (size_t i = 0; i < pathLength; ++i) {
+        uassertValidFieldName(getFieldName(i));
+    }
+}
+
+void FieldPath::uassertValidFieldName(StringData fieldName) {
+    uassert(15998, "FieldPath field names may not be empty strings.", !fieldName.empty());
+
+    const auto dotsAndDollarsHint =
+        feature_flags::gFeatureFlagDotsAndDollars.isEnabledAndIgnoreFCV()
+        ? " Consider using $getField or $setField."
+        : "";
+
+    if (fieldName[0] == '$' && !kAllowedDollarPrefixedFields.count(fieldName)) {
+        uasserted(16410,
+                  str::stream() << "FieldPath field names may not start with '$'."
+                                << dotsAndDollarsHint);
+    }
+
+    uassert(
+        16411, "FieldPath field names may not contain '\0'.", fieldName.find('\0') == string::npos);
+
+    uassert(16412,
+            str::stream() << "FieldPath field names may not contain '.'." << dotsAndDollarsHint,
+            fieldName.find('.') == string::npos);
+}
+
+FieldPath FieldPath::concat(const FieldPath& tail) const {
+    const FieldPath& head = *this;
+
+    std::string concat;
+    const auto expectedStringSize = _fieldPath.size() + 1 + tail._fieldPath.size();
+    concat.reserve(expectedStringSize);
+    concat.insert(concat.begin(), head._fieldPath.begin(), head._fieldPath.end());
+    concat.push_back('.');
+    concat.insert(concat.end(), tail._fieldPath.begin(), tail._fieldPath.end());
+    invariant(concat.size() == expectedStringSize);
+
+    std::vector<size_t> newDots;
+    // Subtract 2 since both contain std::string::npos at the beginning and the entire size at
+    // the end. Add one because we inserted a dot in order to concatenate the two paths.
+    const auto expectedDotSize =
+        head._fieldPathDotPosition.size() + tail._fieldPathDotPosition.size() - 2 + 1;
+    newDots.reserve(expectedDotSize);
+
+    // The first one in head._fieldPathDotPosition is npos. The last one, is, conveniently, the
+    // size of head fieldPath, which also happens to be the index at which we added a new dot.
+    newDots.insert(
+        newDots.begin(), head._fieldPathDotPosition.begin(), head._fieldPathDotPosition.end());
+
+    invariant(tail._fieldPathDotPosition.size() >= 2);
+    for (size_t i = 1; i < tail._fieldPathDotPosition.size(); ++i) {
+        // Move each index back by size of the first field path, plus one, for the newly added dot.
+        newDots.push_back(tail._fieldPathDotPosition[i] + head._fieldPath.size() + 1);
+    }
+    invariant(newDots.back() == concat.size());
+    invariant(newDots.size() == expectedDotSize);
+
+    return FieldPath(std::move(concat), std::move(newDots));
+}
+}  // namespace mongo

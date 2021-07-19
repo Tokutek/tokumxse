@@ -1,262 +1,277 @@
 /**
- *    Copyright (C) 2012 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
-#include "mongo/client/dbclientcursor.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/client/dbclient_cursor.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/client.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/db_raii.h"
 #include "mongo/db/dbdirectclient.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/global_settings.h"
+#include "mongo/db/op_observer_impl.h"
+#include "mongo/db/op_observer_registry.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/range_arithmetic.h"
+#include "mongo/db/repl/replication_coordinator.h"
+#include "mongo/db/repl/replication_coordinator_mock.h"
 #include "mongo/db/write_concern_options.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/unittest/unittest.h"
 
 namespace mongo {
 
-    using std::auto_ptr;
-    using std::set;
+namespace {
 
-    /**
-     * Unit tests related to DBHelpers
-     */
+using std::set;
+using std::unique_ptr;
 
-    static const char * const ns = "unittests.removetests";
+/**
+ * Unit tests related to DBHelpers
+ */
 
-    // TODO: Normalize with test framework
-    /** Simple test for Helpers::RemoveRange. */
-    class RemoveRange {
-    public:
-        RemoveRange() :
-                _min( 4 ), _max( 8 )
-        {
+static const char* const ns = "unittests.removetests";
+
+// TODO: Normalize with test framework
+/** Simple test for Helpers::RemoveRange. */
+class RemoveRange {
+public:
+    RemoveRange() : _min(4), _max(8) {}
+
+    void run() {}
+
+private:
+    BSONArray expected() const {
+        BSONArrayBuilder bab;
+        for (int i = 0; i < _min; ++i) {
+            bab << BSON("_id" << i);
+        }
+        for (int i = _max; i < 10; ++i) {
+            bab << BSON("_id" << i);
+        }
+        return bab.arr();
+    }
+
+    BSONArray docs(OperationContext* opCtx) const {
+        DBDirectClient client(opCtx);
+        unique_ptr<DBClientCursor> cursor =
+            client.query(NamespaceString(ns), Query().hint(BSON("_id" << 1)));
+        BSONArrayBuilder bab;
+        while (cursor->more()) {
+            bab << cursor->next();
+        }
+        return bab.arr();
+    }
+    int _min;
+    int _max;
+};
+
+class FindAndNoopUpdateTest {
+public:
+    void run() {
+        auto serviceContext = getGlobalServiceContext();
+
+        // This test is designed for storage engines that detect write conflicts when they attempt
+        // to write to a record. ephemeralForTest, however, only detects write conflicts when a
+        // WriteUnitOfWork commits.
+        if (storageGlobalParams.engine == "ephemeralForTest") {
+            return;
         }
 
-        void run() {
-            OperationContextImpl txn;
-            DBDirectClient client(&txn);
+        repl::ReplSettings replSettings;
+        replSettings.setOplogSizeBytes(10 * 1024 * 1024);
+        replSettings.setReplSetString("rs");
+        setGlobalReplSettings(replSettings);
+        auto coordinatorMock = new repl::ReplicationCoordinatorMock(serviceContext, replSettings);
+        _coordinatorMock = coordinatorMock;
+        coordinatorMock->alwaysAllowWrites(true);
+        repl::ReplicationCoordinator::set(
+            serviceContext, std::unique_ptr<repl::ReplicationCoordinator>(coordinatorMock));
 
-            for ( int i = 0; i < 10; ++i ) {
-                client.insert( ns, BSON( "_id" << i ) );
-            }
+        NamespaceString nss("test.findandnoopupdate");
+
+        auto client1 = serviceContext->makeClient("client1");
+        auto opCtx1 = client1->makeOperationContext();
+
+        auto client2 = serviceContext->makeClient("client2");
+        auto opCtx2 = client2->makeOperationContext();
+
+        auto registry = std::make_unique<OpObserverRegistry>();
+        registry->addObserver(std::make_unique<OpObserverImpl>());
+        opCtx1.get()->getServiceContext()->setOpObserver(std::move(registry));
+        repl::createOplog(opCtx1.get());
+
+        Lock::DBLock dbLk1(opCtx1.get(), nss.db(), LockMode::MODE_IX);
+        Lock::CollectionLock collLk1(opCtx1.get(), nss, LockMode::MODE_IX);
+
+        Lock::DBLock dbLk2(opCtx2.get(), nss.db(), LockMode::MODE_IX);
+        Lock::CollectionLock collLk2(opCtx2.get(), nss, LockMode::MODE_IX);
+
+        Database* db = DatabaseHolder::get(opCtx1.get())->openDb(opCtx1.get(), nss.db(), nullptr);
+
+        // Create the collection and insert one doc
+        BSONObj doc = BSON("_id" << 1 << "x" << 2);
+        BSONObj idQuery = BSON("_id" << 1);
+
+        CollectionPtr collection1;
+        {
+            WriteUnitOfWork wuow(opCtx1.get());
+            collection1 = db->createCollection(opCtx1.get(), nss, CollectionOptions(), true);
+            ASSERT_TRUE(collection1 != nullptr);
+            ASSERT_TRUE(collection1
+                            ->insertDocument(
+                                opCtx1.get(), InsertStatement(doc), nullptr /* opDebug */, false)
+                            .isOK());
+            wuow.commit();
+        }
+
+        BSONObj result;
+        Helpers::findById(opCtx1.get(), db, nss.ns(), idQuery, result, nullptr, nullptr);
+        ASSERT_BSONOBJ_EQ(result, doc);
+
+        // Assert that the same doc still exists after findByIdAndNoopUpdate
+        {
+            WriteUnitOfWork wuow(opCtx1.get());
+            BSONObj res;
+            auto foundDoc = Helpers::findByIdAndNoopUpdate(opCtx1.get(), collection1, idQuery, res);
+            wuow.commit();
+            ASSERT_TRUE(foundDoc);
+            ASSERT_BSONOBJ_EQ(res, doc);
+        }
+
+        // Assert that findByIdAndNoopUpdate did not generate an oplog entry.
+        BSONObj oplogEntry;
+        Helpers::getLast(opCtx1.get(), NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry);
+        ASSERT_BSONOBJ_NE(oplogEntry, BSONObj());
+        ASSERT_TRUE(oplogEntry.getStringField("op") == "i"_sd);
+
+        // Run two concurrent storage transactions. Run findByIdAndNoopUpdate in one, and then
+        // attempt to delete all docs in the collection in the other. Assert that the delete op
+        // throws a WCE.
+        assertWriteAttemptAfterFindAndNoopUpdateThrowsWCE(
+            opCtx1.get(), opCtx2.get(), nss, db, doc, idQuery);
+
+        // Run two concurrent storage transactions. Run a delete op to remove all documents in the
+        // collection in one, and then attempt to run findByIdAndNoopUpdate in the second. Assert
+        // that findByIdAndNoopUpdate throws WCE.
+        assertFindAndNoopUpdateAfterWriteThrowsWCE(
+            opCtx1.get(), opCtx2.get(), nss, db, doc, idQuery);
+    }
+
+private:
+    void assertWriteAttemptAfterFindAndNoopUpdateThrowsWCE(OperationContext* opCtx1,
+                                                           OperationContext* opCtx2,
+                                                           const NamespaceString& nss,
+                                                           Database* db,
+                                                           const BSONObj& doc,
+                                                           const BSONObj& idQuery) {
+        {
+            WriteUnitOfWork wuow1(opCtx1);
+
+            WriteUnitOfWork wuow2(opCtx2);
+            auto collection2 =
+                CollectionCatalog::get(opCtx2)->lookupCollectionByNamespace(opCtx2, nss);
+            ASSERT(collection2 != nullptr);
+            BSONObj res;
+            ASSERT_TRUE(Helpers::findByIdAndNoopUpdate(opCtx2, collection2, idQuery, res));
+
+            ASSERT_THROWS(Helpers::emptyCollection(opCtx1, nss), WriteConflictException);
+
+            wuow2.commit();
+        }
+
+        // Assert that the doc still exists in the collection.
+        BSONObj res1;
+        Helpers::findById(opCtx1, db, nss.ns(), idQuery, res1, nullptr, nullptr);
+        ASSERT_BSONOBJ_EQ(res1, doc);
+
+        BSONObj res2;
+        Helpers::findById(opCtx2, db, nss.ns(), idQuery, res2, nullptr, nullptr);
+        ASSERT_BSONOBJ_EQ(res2, doc);
+
+        // Assert that findByIdAndNoopUpdate did not generate an oplog entry.
+        BSONObj oplogEntry;
+        Helpers::getLast(opCtx2, NamespaceString::kRsOplogNamespace.ns().c_str(), oplogEntry);
+        ASSERT_BSONOBJ_NE(oplogEntry, BSONObj());
+        ASSERT_TRUE(oplogEntry.getStringField("op") == "i"_sd);
+    }
+
+    void assertFindAndNoopUpdateAfterWriteThrowsWCE(OperationContext* opCtx1,
+                                                    OperationContext* opCtx2,
+                                                    const NamespaceString& nss,
+                                                    Database* db,
+                                                    const BSONObj& doc,
+                                                    const BSONObj& idQuery) {
+        {
+            WriteUnitOfWork wuow1(opCtx1);
+            Helpers::emptyCollection(opCtx1, nss);
 
             {
-                // Remove _id range [_min, _max).
-                ScopedTransaction transaction(&txn, MODE_IX);
-                Lock::DBLock lk(txn.lockState(), nsToDatabaseSubstring(ns), MODE_X);
-                OldClientContext ctx(&txn,  ns );
+                WriteUnitOfWork wuow2(opCtx2);
+                auto collection2 =
+                    CollectionCatalog::get(opCtx2)->lookupCollectionByNamespace(opCtx2, nss);
+                ASSERT(collection2 != nullptr);
 
-                KeyRange range( ns,
-                                BSON( "_id" << _min ),
-                                BSON( "_id" << _max ),
-                                BSON( "_id" << 1 ) );
-                mongo::WriteConcernOptions dummyWriteConcern;
-                Helpers::removeRange(&txn, range, false, dummyWriteConcern);
+                BSONObj res;
+                ASSERT_THROWS(Helpers::findByIdAndNoopUpdate(opCtx2, collection2, idQuery, res),
+                              WriteConflictException);
             }
 
-            // Check that the expected documents remain.
-            ASSERT_EQUALS( expected(), docs(&txn) );
-        }
-    private:
-        BSONArray expected() const {
-            BSONArrayBuilder bab;
-            for ( int i = 0; i < _min; ++i ) {
-                bab << BSON( "_id" << i );
-            }
-            for ( int i = _max; i < 10; ++i ) {
-                bab << BSON( "_id" << i );
-            }
-            return bab.arr();
+            wuow1.commit();
         }
 
-        BSONArray docs(OperationContext* txn) const {
-            DBDirectClient client(txn);
-            auto_ptr<DBClientCursor> cursor = client.query( ns,
-                                                            Query().hint( BSON( "_id" << 1 ) ) );
-            BSONArrayBuilder bab;
-            while ( cursor->more() ) {
-                bab << cursor->next();
-            }
-            return bab.arr();
-        }
-        int _min;
-        int _max;
-    };
+        // Assert that the first storage transaction succeeded and that the doc is removed.
+        BSONObj res1;
+        Helpers::findById(opCtx1, db, nss.ns(), idQuery, res1, nullptr, nullptr);
+        ASSERT_BSONOBJ_EQ(res1, BSONObj());
 
-    class All: public Suite {
-    public:
-        All() :
-                Suite( "remove" )
-        {
-        }
-        void setupTests() {
-            add<RemoveRange>();
-        }
-    } myall;
-
-    //
-    // Tests getting disk locs for an index range
-    //
-
-    TEST(DBHelperTests, FindDiskLocs) {
-        OperationContextImpl txn;
-        DBDirectClient client(&txn);
-
-        // Some unique tag we can use to make sure we're pulling back the right data
-        OID tag = OID::gen();
-        client.remove( ns, BSONObj() );
-
-        int numDocsInserted = 10;
-        for ( int i = 0; i < numDocsInserted; ++i ) {
-            client.insert( ns, BSON( "_id" << i << "tag" << tag ) );
-        }
-
-        long long maxSizeBytes = 1024 * 1024 * 1024;
-
-        set<RecordId> locs;
-        long long numDocsFound;
-        long long estSizeBytes;
-        {
-            // search _id range (0, 10)
-            ScopedTransaction transaction(&txn, MODE_IS);
-            Lock::DBLock lk(txn.lockState(), nsToDatabaseSubstring(ns), MODE_S);
-
-            KeyRange range( ns,
-                            BSON( "_id" << 0 ),
-                            BSON( "_id" << numDocsInserted ),
-                            BSON( "_id" << 1 ) );
-
-            Status result = Helpers::getLocsInRange( &txn,
-                                                     range,
-                                                     maxSizeBytes,
-                                                     &locs,
-                                                     &numDocsFound,
-                                                     &estSizeBytes );
-
-            ASSERT_EQUALS( result, Status::OK() );
-            ASSERT_EQUALS( numDocsFound, numDocsInserted );
-            ASSERT_NOT_EQUALS( estSizeBytes, 0 );
-            ASSERT_LESS_THAN( estSizeBytes, maxSizeBytes );
-
-            Database* db = dbHolder().get( &txn, nsToDatabase(range.ns) );
-            const Collection* collection = db->getCollection(ns);
-
-            // Make sure all the disklocs actually correspond to the right info
-            for ( set<RecordId>::const_iterator it = locs.begin(); it != locs.end(); ++it ) {
-                const BSONObj obj = collection->docFor(&txn, *it).value();
-                ASSERT_EQUALS(obj["tag"].OID(), tag);
-            }
-        }
+        BSONObj res2;
+        Helpers::findById(opCtx2, db, nss.ns(), idQuery, res2, nullptr, nullptr);
+        ASSERT_BSONOBJ_EQ(res2, BSONObj());
     }
 
-    //
-    // Tests index not found error getting disk locs
-    //
+    repl::ReplicationCoordinatorMock* _coordinatorMock;
+};
 
-    TEST(DBHelperTests, FindDiskLocsNoIndex) {
-        OperationContextImpl txn;
-        DBDirectClient client(&txn);
-
-        client.remove( ns, BSONObj() );
-        client.insert( ns, BSON( "_id" << OID::gen() ) );
-
-        long long maxSizeBytes = 1024 * 1024 * 1024;
-
-        set<RecordId> locs;
-        long long numDocsFound;
-        long long estSizeBytes;
-        {
-            ScopedTransaction transaction(&txn, MODE_IS);
-            Lock::DBLock lk(txn.lockState(), nsToDatabaseSubstring(ns), MODE_S);
-
-            // search invalid index range
-            KeyRange range( ns,
-                            BSON( "badIndex" << 0 ),
-                            BSON( "badIndex" << 10 ),
-                            BSON( "badIndex" << 1 ) );
-
-            Status result = Helpers::getLocsInRange( &txn,
-                                                     range,
-                                                     maxSizeBytes,
-                                                     &locs,
-                                                     &numDocsFound,
-                                                     &estSizeBytes );
-
-            // Make sure we get the right error code
-            ASSERT_EQUALS( result.code(), ErrorCodes::IndexNotFound );
-            ASSERT_EQUALS( static_cast<long long>( locs.size() ), 0 );
-            ASSERT_EQUALS( numDocsFound, 0 );
-            ASSERT_EQUALS( estSizeBytes, 0 );
-        }
+class All : public OldStyleSuiteSpecification {
+public:
+    All() : OldStyleSuiteSpecification("dbhelpers") {}
+    void setupTests() {
+        add<RemoveRange>();
+        add<FindAndNoopUpdateTest>();
     }
+};
 
-    //
-    // Tests chunk too big error getting disk locs
-    //
+OldStyleSuiteInitializer<All> myall;
 
-    TEST(DBHelperTests, FindDiskLocsTooBig) {
-        OperationContextImpl txn;
-        DBDirectClient client(&txn);
-
-        client.remove( ns, BSONObj() );
-
-        int numDocsInserted = 10;
-        for ( int i = 0; i < numDocsInserted; ++i ) {
-            client.insert( ns, BSON( "_id" << i ) );
-        }
-
-        // Very small max size
-        long long maxSizeBytes = 10;
-
-        set<RecordId> locs;
-        long long numDocsFound;
-        long long estSizeBytes;
-        {
-            ScopedTransaction transaction(&txn, MODE_IS);
-            Lock::DBLock lk(txn.lockState(), nsToDatabaseSubstring(ns), MODE_S);
-
-            KeyRange range( ns,
-                            BSON( "_id" << 0 ),
-                            BSON( "_id" << numDocsInserted ),
-                            BSON( "_id" << 1 ) );
-
-            Status result = Helpers::getLocsInRange( &txn,
-                                                     range,
-                                                     maxSizeBytes,
-                                                     &locs,
-                                                     &numDocsFound,
-                                                     &estSizeBytes );
-
-            // Make sure we get the right error code and our count and size estimates are valid
-            ASSERT_EQUALS( result.code(), ErrorCodes::InvalidLength );
-            ASSERT_EQUALS( numDocsFound, numDocsInserted );
-            ASSERT_GREATER_THAN( estSizeBytes, maxSizeBytes );
-        }
-    }
-
-} // namespace RemoveTests
+}  // namespace
+}  // namespace mongo

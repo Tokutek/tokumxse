@@ -1,123 +1,185 @@
-// list_databases.cpp
-
 /**
-*    Copyright (C) 2014 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#include "mongo/db/catalog/database.h"
-#include "mongo/db/catalog/database_catalog_entry.h"
-#include "mongo/db/catalog/database_holder.h"
+#include "mongo/platform/basic.h"
+
+#include "mongo/db/auth/authorization_session.h"
+#include "mongo/db/catalog_raii.h"
 #include "mongo/db/client.h"
 #include "mongo/db/commands.h"
-#include "mongo/db/global_environment_experiment.h"
+#include "mongo/db/commands/list_databases_gen.h"
+#include "mongo/db/concurrency/write_conflict_exception.h"
+#include "mongo/db/curop_failpoint_helpers.h"
+#include "mongo/db/matcher/expression.h"
+#include "mongo/db/namespace_string.h"
+#include "mongo/db/operation_context.h"
+#include "mongo/db/service_context.h"
 #include "mongo/db/storage/storage_engine.h"
 
 namespace mongo {
 
-    using std::set;
-    using std::string;
-    using std::stringstream;
-    using std::vector;
+// XXX: remove and put into storage api
+std::intmax_t dbSize(const std::string& database);
 
-    // XXX: remove and put into storage api
-    intmax_t dbSize( const string& database );
+namespace {
 
-    class CmdListDatabases : public Command {
+// Failpoint which causes to hang "listDatabases" cmd after acquiring global lock in IS mode.
+MONGO_FAIL_POINT_DEFINE(hangBeforeListDatabases);
+
+constexpr auto kName = "name"_sd;
+class CmdListDatabases final : public ListDatabasesCmdVersion1Gen<CmdListDatabases> {
+public:
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const final {
+        return AllowedOnSecondary::kOptIn;
+    }
+    bool adminOnly() const final {
+        return true;
+    }
+    bool maintenanceOk() const final {
+        return false;
+    }
+    std::string help() const final {
+        return "{ listDatabases:1, [filter: <filterObject>] [, nameOnly: true ] }\n"
+               "list databases on this server";
+    }
+
+    class Invocation final : public InvocationBaseGen {
     public:
-        virtual bool slaveOk() const {
+        using InvocationBaseGen::InvocationBaseGen;
+
+        bool supportsWriteConcern() const final {
             return false;
         }
-        virtual bool slaveOverrideOk() const {
-            return true;
-        }
-        virtual bool adminOnly() const {
-            return true;
-        }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-        virtual void help( stringstream& help ) const { help << "list databases on this server"; }
-        virtual void addRequiredPrivileges(const std::string& dbname,
-                                           const BSONObj& cmdObj,
-                                           std::vector<Privilege>* out) {
-            ActionSet actions;
-            actions.addAction(ActionType::listDatabases);
-            out->push_back(Privilege(ResourcePattern::forClusterResource(), actions));
+
+        void doCheckAuthorization(OperationContext*) const final {}
+
+        NamespaceString ns() const final {
+            return NamespaceString(request().getDbName(), "");
         }
 
-        CmdListDatabases() : Command("listDatabases" , true ) {}
+        ListDatabasesReply typedRun(OperationContext* opCtx) final {
+            CommandHelpers::handleMarkKillOnClientDisconnect(opCtx);
+            auto* as = AuthorizationSession::get(opCtx->getClient());
+            auto cmd = request();
 
-        bool run(OperationContext* txn,
-                 const string& dbname,
-                 BSONObj& jsobj,
-                 int,
-                 string& errmsg,
-                 BSONObjBuilder& result,
-                 bool /*fromRepl*/) {
+            // {nameOnly: bool} - default false.
+            const bool nameOnly = cmd.getNameOnly();
 
-            vector< string > dbNames;
-            StorageEngine* storageEngine = getGlobalEnvironment()->getGlobalStorageEngine();
-            storageEngine->listDatabases( &dbNames );
+            // {authorizedDatabases: bool} - Dynamic default based on permissions.
+            const bool authorizedDatabases = ([as](const boost::optional<bool>& authDB) {
+                const bool mayListAllDatabases = as->isAuthorizedForActionsOnResource(
+                    ResourcePattern::forClusterResource(), ActionType::listDatabases);
 
-            vector< BSONObj > dbInfos;
-
-            set<string> seen;
-            intmax_t totalSize = 0;
-            for ( vector< string >::iterator i = dbNames.begin(); i != dbNames.end(); ++i ) {
-                const string& dbname = *i;
-
-                BSONObjBuilder b;
-                b.append( "name", dbname );
-
-                {
-                    ScopedTransaction transaction(txn, MODE_IS);
-                    Lock::DBLock dbLock(txn->lockState(), dbname, MODE_IS);
-
-                    Database* db = dbHolder().get( txn, dbname );
-                    if ( !db )
-                        continue;
-
-                    const DatabaseCatalogEntry* entry = db->getDatabaseCatalogEntry();
-                    invariant( entry );
-
-                    int64_t size = entry->sizeOnDisk( txn );
-                    b.append( "sizeOnDisk", static_cast<double>( size ) );
-                    totalSize += size;
-
-                    b.appendBool("empty", size == 0);
+                if (authDB) {
+                    uassert(ErrorCodes::Unauthorized,
+                            "Insufficient permissions to list all databases",
+                            authDB.get() || mayListAllDatabases);
+                    return authDB.get();
                 }
 
-                dbInfos.push_back( b.obj() );
+                // By default, list all databases if we can, otherwise
+                // only those we're allowed to find on.
+                return !mayListAllDatabases;
+            })(cmd.getAuthorizedDatabases());
 
-                seen.insert( i->c_str() );
+            // {filter: matchExpression}.
+            std::unique_ptr<MatchExpression> filter;
+            if (auto filterObj = cmd.getFilter()) {
+                // The collator is null because database metadata objects are compared using simple
+                // binary comparison.
+                auto expCtx = make_intrusive<ExpressionContext>(
+                    opCtx, std::unique_ptr<CollatorInterface>(nullptr), ns());
+                auto matcher = uassertStatusOK(
+                    MatchExpressionParser::parse(filterObj.get(), std::move(expCtx)));
+                filter = std::move(matcher);
             }
 
-            result.append( "databases", dbInfos );
-            result.append( "totalSize", double( totalSize ) );
-            return true;
-        }
-    } cmdListDatabases;
+            std::vector<std::string> dbNames;
+            StorageEngine* storageEngine = getGlobalServiceContext()->getStorageEngine();
+            {
+                Lock::GlobalLock lk(opCtx, MODE_IS);
+                CurOpFailpointHelpers::waitWhileFailPointEnabled(
+                    &hangBeforeListDatabases, opCtx, "hangBeforeListDatabases", []() {});
+                dbNames = storageEngine->listDatabases();
+            }
 
-}
+            std::vector<ListDatabasesReplyItem> items;
+
+            const bool filterNameOnly = filter &&
+                filter->getCategory() == MatchExpression::MatchCategory::kLeaf &&
+                filter->path() == kName;
+            long long totalSize = 0;
+            for (const auto& itemName : dbNames) {
+                if (authorizedDatabases &&
+                    !as->isAuthorizedForAnyActionOnAnyResourceInDB(itemName)) {
+                    // We don't have listDatabases on the cluser or find on this database.
+                    continue;
+                }
+
+                ListDatabasesReplyItem item(itemName);
+
+                long long size = 0;
+                if (!nameOnly) {
+                    // Filtering on name only should not require taking locks on filtered-out names.
+                    if (filterNameOnly && !filter->matchesBSON(item.toBSON())) {
+                        continue;
+                    }
+
+                    AutoGetDb autoDb(opCtx, itemName, MODE_IS);
+                    auto* const db = autoDb.getDb();
+                    if (!db) {
+                        continue;
+                    }
+
+                    writeConflictRetry(opCtx, "sizeOnDisk", itemName, [&] {
+                        size = storageEngine->sizeOnDiskForDb(opCtx, itemName);
+                    });
+                    item.setSizeOnDisk(size);
+                    item.setEmpty(CollectionCatalog::get(opCtx)
+                                      ->getAllCollectionUUIDsFromDb(itemName)
+                                      .empty());
+                }
+                if (!filter || filter->matchesBSON(item.toBSON())) {
+                    totalSize += size;
+                    items.push_back(std::move(item));
+                }
+            }
+
+            ListDatabasesReply reply(items);
+            if (!nameOnly) {
+                reply.setTotalSize(totalSize);
+                reply.setTotalSizeMb(totalSize / (1024 * 1024));
+            }
+
+            return reply;
+        }
+    };
+} cmdListDatabases;
+}  // namespace
+}  // namespace mongo

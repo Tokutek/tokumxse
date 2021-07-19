@@ -11,8 +11,9 @@
  * and then inserts 'modulus * countPerNum' documents. [250, 1000]
  * All threads insert into the same collection.
  */
-var $config = (function() {
+load("jstests/libs/fixture_helpers.js");  // For isMongos.
 
+var $config = (function() {
     var data = {
         randRange: function randRange(low, high) {
             // return random number in range [low, high]
@@ -23,13 +24,12 @@ var $config = (function() {
             return this.modulus * this.countPerNum;
         },
         getCount: function getCount(db, predicate) {
-            var query = Object.extend({ tid: this.tid }, predicate);
+            var query = Object.extend({tid: this.tid}, predicate);
             return db[this.threadCollName].count(query);
         }
     };
 
     var states = (function() {
-
         function init(db, collName) {
             this.modulus = this.randRange(5, 10);
             this.countPerNum = this.randRange(50, 100);
@@ -39,38 +39,27 @@ var $config = (function() {
 
             var bulk = db[this.threadCollName].initializeUnorderedBulkOp();
             for (var i = 0; i < this.getNumDocs(); ++i) {
-                bulk.insert({ i: i % this.modulus, tid: this.tid });
+                bulk.insert({i: i % this.modulus, tid: this.tid});
             }
             var res = bulk.execute();
-            assertAlways.writeOK(res);
+            assertAlways.commandWorked(res);
             assertAlways.eq(this.getNumDocs(), res.nInserted);
         }
 
         function count(db, collName) {
-            assertWhenOwnColl.eq(this.getCount(db), this.getNumDocs());
+            if (!isMongos(db)) {
+                // SERVER-33753: count() without a predicate can be wrong on sharded clusters.
+                assertWhenOwnColl.eq(this.getCount(db), this.getNumDocs());
+            }
 
             var num = Random.randInt(this.modulus);
-            assertWhenOwnColl.eq(this.getCount(db, { i: num }), this.countPerNum);
+            assertWhenOwnColl.eq(this.getCount(db, {i: num}), this.countPerNum);
         }
 
-        return {
-            init: init,
-            count: count
-        };
-
+        return {init: init, count: count};
     })();
 
-    var transitions = {
-        init: { count: 1 },
-        count: { count: 1 }
-    };
+    var transitions = {init: {count: 1}, count: {count: 1}};
 
-    return {
-        data: data,
-        threadCount: 10,
-        iterations: 20,
-        states: states,
-        transitions: transitions
-    };
-
+    return {data: data, threadCount: 10, iterations: 20, states: states, transitions: transitions};
 })();

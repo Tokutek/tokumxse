@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -10,52 +10,96 @@
 
 /*
  * __wt_thread_create --
- *	Create a new thread of control.
+ *     Create a new thread of control.
  */
 int
-__wt_thread_create(WT_SESSION_IMPL *session,
-    wt_thread_t *tidret, WT_THREAD_CALLBACK(*func)(void *), void *arg)
+__wt_thread_create(
+  WT_SESSION_IMPL *session, wt_thread_t *tidret, WT_THREAD_CALLBACK (*func)(void *), void *arg)
 {
-	/* Spawn a new thread of control. */
-	*tidret = (HANDLE)_beginthreadex(NULL, 0, func, arg, 0, NULL);
-	if (*tidret != 0)
-		return (0);
+    /*
+     * Creating a thread isn't a memory barrier, but WiredTiger commonly sets flags and or state and
+     * then expects worker threads to start. Include a barrier to ensure safety in those cases.
+     */
+    WT_FULL_BARRIER();
 
-	WT_RET_MSG(session, errno, "_beginthreadex");
+    /* Spawn a new thread of control. */
+    tidret->id = (HANDLE)_beginthreadex(NULL, 0, func, arg, 0, NULL);
+    if (tidret->id != 0) {
+        tidret->created = true;
+        return (0);
+    }
+
+    WT_RET_MSG(session, __wt_errno(), "thread create: _beginthreadex");
 }
 
 /*
  * __wt_thread_join --
- *	Wait for a thread of control to exit.
+ *     Wait for a thread of control to exit.
  */
 int
-__wt_thread_join(WT_SESSION_IMPL *session, wt_thread_t tid)
+__wt_thread_join(WT_SESSION_IMPL *session, wt_thread_t *tid)
 {
-	WT_DECL_RET;
+    WT_DECL_RET;
+    DWORD windows_error;
 
-	if ((ret = WaitForSingleObject(tid, INFINITE)) != WAIT_OBJECT_0)
-		/*
-		 * If we fail to wait, we will leak handles so do not continue
-		 */
-		WT_PANIC_RET(session, ret == WAIT_FAILED ? __wt_errno() : ret,
-		    "Wait for thread join failed");
+    /* Only attempt to join if thread was created successfully */
+    if (!tid->created)
+        return (0);
+    tid->created = false;
 
-	if (CloseHandle(tid) == 0) {
-		WT_RET_MSG(session, __wt_errno(),
-		    "CloseHandle: thread join");
-	}
+    /*
+     * Joining a thread isn't a memory barrier, but WiredTiger commonly sets flags and or state and
+     * then expects worker threads to halt. Include a barrier to ensure safety in those cases.
+     */
+    WT_FULL_BARRIER();
 
-	return (0);
+    if ((windows_error = WaitForSingleObject(tid->id, INFINITE)) != WAIT_OBJECT_0) {
+        if (windows_error == WAIT_FAILED)
+            windows_error = __wt_getlasterror();
+
+        /* If we fail to wait, we will leak handles, do not continue. */
+        return (__wt_panic(session, __wt_map_windows_error(windows_error),
+          "thread join: WaitForSingleObject: %s", __wt_formatmessage(session, windows_error)));
+    }
+
+    if (CloseHandle(tid->id) == 0) {
+        windows_error = __wt_getlasterror();
+        ret = __wt_map_windows_error(windows_error);
+        __wt_err(
+          session, ret, "thread join: CloseHandle: %s", __wt_formatmessage(session, windows_error));
+        return (ret);
+    }
+
+    return (0);
 }
 
 /*
  * __wt_thread_id --
- *	Fill in a printable version of the process and thread IDs.
+ *     Return an arithmetic representation of a thread ID on POSIX.
  */
 void
-__wt_thread_id(char* buf, size_t buflen)
+__wt_thread_id(uintmax_t *id)
 {
-	(void)snprintf(buf, buflen,
-	    "%" PRIu64 ":%" PRIu64,
-	    (uint64_t)GetCurrentProcessId(), (uint64_t)GetCurrentThreadId);
+    *id = (uintmax_t)GetCurrentThreadId();
+}
+
+/*
+ * __wt_thread_str --
+ *     Fill in a printable version of the process and thread IDs.
+ */
+int
+__wt_thread_str(char *buf, size_t buflen)
+{
+    return (__wt_snprintf(buf, buflen, "%" PRIu64 ":%" PRIu64, (uint64_t)GetCurrentProcessId(),
+      (uint64_t)GetCurrentThreadId));
+}
+
+/*
+ * __wt_process_id --
+ *     Return the process ID assigned by the operating system.
+ */
+uintmax_t
+__wt_process_id(void)
+{
+    return (uintmax_t)GetCurrentProcessId();
 }

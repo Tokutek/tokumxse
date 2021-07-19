@@ -1,0 +1,51 @@
+# -*- mode: python; -*-
+
+Import('env')
+Import('get_option')
+
+env = env.Clone()
+
+yamlEnv = env.Clone()
+yamlEnv.InjectThirdParty(libraries=['yaml'])
+
+mongobridge = env.Program(
+    target="mongobridge",
+    source=[
+        "bridge.cpp",
+        "bridge_commands.cpp",
+        "mongobridge_options.cpp",
+        "mongobridge_options.idl",
+        "mongobridge_options_init.cpp"
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/dbmessage',
+        '$BUILD_DIR/mongo/rpc/rpc',
+        '$BUILD_DIR/mongo/transport/message_compressor',
+        '$BUILD_DIR/mongo/transport/message_compressor_options_server',
+        '$BUILD_DIR/mongo/transport/service_entry_point',
+        '$BUILD_DIR/mongo/transport/service_executor',
+        '$BUILD_DIR/mongo/transport/transport_layer',
+        '$BUILD_DIR/mongo/util/net/network',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
+        '$BUILD_DIR/mongo/util/signal_handlers',
+    ],
+    AIB_COMPONENT='mongobridge',
+    AIB_COMPONENTS_EXTRA=[
+        "dist-test",
+    ],
+)
+perconadecrypt = env.Program(
+    target='perconadecrypt',
+    source=[
+        'perconadecrypt.cpp',
+        'perconadecrypt_options.cpp',
+        'perconadecrypt_options.idl',
+        'perconadecrypt_options_init.cpp'
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/db/encryption/encryption_options',
+        '$BUILD_DIR/mongo/db/encryption/encryption_vault',
+        '$BUILD_DIR/mongo/util/options_parser/options_parser_init',
+    ],
+    AIB_COMPONENT='perconadecrypt',
+)

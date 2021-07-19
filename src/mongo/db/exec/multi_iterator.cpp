@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -30,134 +31,88 @@
 
 #include "mongo/db/exec/multi_iterator.h"
 
+#include <memory>
+
 #include "mongo/db/concurrency/write_conflict_exception.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/storage/record_fetcher.h"
 
 namespace mongo {
 
-    using std::vector;
+using std::unique_ptr;
+using std::vector;
 
-    MultiIteratorStage::MultiIteratorStage(OperationContext* txn,
-                                           WorkingSet* ws,
-                                           Collection* collection)
-        : _txn(txn),
-          _collection(collection),
-          _ws(ws),
-          _wsidForFetch(_ws->allocate()) {
-        // We pre-allocate a WSM and use it to pass up fetch requests. This should never be used
-        // for anything other than passing up NEED_YIELD. We use the loc and owned obj state, but
-        // the loc isn't really pointing at any obj. The obj field of the WSM should never be used.
-        WorkingSetMember* member = _ws->get(_wsidForFetch);
-        member->state = WorkingSetMember::LOC_AND_OWNED_OBJ;
-    }
+const char* MultiIteratorStage::kStageType = "MULTI_ITERATOR";
 
-    void MultiIteratorStage::addIterator(RecordIterator* it) {
-        _iterators.push_back(it);
-    }
+MultiIteratorStage::MultiIteratorStage(ExpressionContext* expCtx,
+                                       WorkingSet* ws,
+                                       const CollectionPtr& collection)
+    : RequiresCollectionStage(kStageType, expCtx, collection), _ws(ws) {}
 
-    PlanStage::StageState MultiIteratorStage::work(WorkingSetID* out) {
-        if ( _collection == NULL )
-            return PlanStage::DEAD;
+void MultiIteratorStage::addIterator(unique_ptr<RecordCursor> it) {
+    _iterators.push_back(std::move(it));
+}
 
-        if (_iterators.empty())
-            return PlanStage::IS_EOF;
-
-        const RecordId curr = _iterators.back()->curr();
-        Snapshotted<BSONObj> obj;
-
-        // The RecordId we're about to look at it might not be in memory. In this case
-        // we request a yield while we fetch the document.
-        if (!curr.isNull()) {
-            std::auto_ptr<RecordFetcher> fetcher(_collection->documentNeedsFetch(_txn, curr));
-            if (NULL != fetcher.get()) {
-                WorkingSetMember* member = _ws->get(_wsidForFetch);
-                member->loc = curr;
-                // Pass the RecordFetcher off to the WSM on which we're performing the fetch.
-                member->setFetcher(fetcher.release());
-                *out = _wsidForFetch;
-                return NEED_YIELD;
-            }
-
-            obj = Snapshotted<BSONObj>(_txn->recoveryUnit()->getSnapshotId(),
-                                       _iterators.back()->dataFor(curr).releaseToBson());
+PlanStage::StageState MultiIteratorStage::doWork(WorkingSetID* out) {
+    boost::optional<Record> record;
+    try {
+        while (!_iterators.empty()) {
+            record = _iterators.back()->next();
+            if (record)
+                break;
+            _iterators.pop_back();
         }
-
-        try {
-            _advance();
-        }
-        catch (const WriteConflictException& wce) {
-            // If _advance throws a WCE we shouldn't have moved.
-            invariant(!_iterators.empty());
-            invariant(_iterators.back()->curr() == curr);
-            *out = WorkingSet::INVALID_ID;
-            return NEED_YIELD;
-        }
-
-        if (curr.isNull())
-            return NEED_TIME;
-
-        *out = _ws->allocate();
-        WorkingSetMember* member = _ws->get(*out);
-        member->loc = curr;
-        member->obj = obj;
-        member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
-        return PlanStage::ADVANCED;
+    } catch (const WriteConflictException&) {
+        // If _advance throws a WCE we shouldn't have moved.
+        invariant(!_iterators.empty());
+        *out = WorkingSet::INVALID_ID;
+        return NEED_YIELD;
     }
 
-    bool MultiIteratorStage::isEOF() {
-        return _collection == NULL || _iterators.empty();
-    }
+    if (!record)
+        return IS_EOF;
 
-    void MultiIteratorStage::kill() {
-        _collection = NULL;
-        _iterators.clear();
-    }
+    *out = _ws->allocate();
+    WorkingSetMember* member = _ws->get(*out);
+    member->recordId = record->id;
+    member->resetDocument(opCtx()->recoveryUnit()->getSnapshotId(), record->data.releaseToBson());
+    _ws->transitionToRecordIdAndObj(*out);
+    return PlanStage::ADVANCED;
+}
 
-    void MultiIteratorStage::saveState() {
-        _txn = NULL;
-        for (size_t i = 0; i < _iterators.size(); i++) {
-            _iterators[i]->saveState();
-        }
-    }
+bool MultiIteratorStage::isEOF() {
+    return _iterators.empty();
+}
 
-    void MultiIteratorStage::restoreState(OperationContext* opCtx) {
-        invariant(_txn == NULL);
-        _txn = opCtx;
-        for (size_t i = 0; i < _iterators.size(); i++) {
-            if (!_iterators[i]->restoreState(opCtx)) {
-                kill();
-            }
-        }
+void MultiIteratorStage::doSaveStateRequiresCollection() {
+    for (auto&& iterator : _iterators) {
+        iterator->save();
     }
+}
 
-    void MultiIteratorStage::invalidate(OperationContext* txn,
-                                        const RecordId& dl,
-                                        InvalidationType type) {
-        switch ( type ) {
-        case INVALIDATION_DELETION:
-            for (size_t i = 0; i < _iterators.size(); i++) {
-                _iterators[i]->invalidate(dl);
-            }
-            break;
-        case INVALIDATION_MUTATION:
-            // no-op
-            break;
-        }
+void MultiIteratorStage::doRestoreStateRequiresCollection() {
+    for (auto&& iterator : _iterators) {
+        const bool couldRestore = iterator->restore();
+        uassert(50991, "could not restore cursor for MULTI_ITERATOR stage", couldRestore);
     }
+}
 
-    vector<PlanStage*> MultiIteratorStage::getChildren() const {
-        vector<PlanStage*> empty;
-        return empty;
+void MultiIteratorStage::doDetachFromOperationContext() {
+    for (auto&& iterator : _iterators) {
+        iterator->detachFromOperationContext();
     }
+}
 
-    void MultiIteratorStage::_advance() {
-        if (_iterators.back()->isEOF()) {
-            _iterators.popAndDeleteBack();
-        }
-        else {
-            _iterators.back()->getNext();
-        }
+void MultiIteratorStage::doReattachToOperationContext() {
+    for (auto&& iterator : _iterators) {
+        iterator->reattachToOperationContext(opCtx());
     }
+}
 
-} // namespace mongo
+unique_ptr<PlanStageStats> MultiIteratorStage::getStats() {
+    unique_ptr<PlanStageStats> ret =
+        std::make_unique<PlanStageStats>(_commonStats, STAGE_MULTI_ITERATOR);
+    ret->specific = std::make_unique<CollectionScanStats>();
+    return ret;
+}
+
+}  // namespace mongo

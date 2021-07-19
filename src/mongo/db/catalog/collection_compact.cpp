@@ -1,198 +1,134 @@
-// collection_compact.cpp
-
 /**
-*    Copyright (C) 2013 MongoDB Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kStorage
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kStorage
 
-#include "mongo/db/catalog/collection.h"
+#include "mongo/db/catalog/collection_compact.h"
 
-#include "mongo/base/counter.h"
-#include "mongo/base/owned_pointer_map.h"
-#include "mongo/db/catalog/index_create.h"
-#include "mongo/db/clientcursor.h"
-#include "mongo/db/commands/server_status.h"
-#include "mongo/db/curop.h"
-#include "mongo/db/catalog/database.h"
+#include "mongo/db/catalog/collection_catalog.h"
+#include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/catalog/index_key_validate.h"
+#include "mongo/db/catalog/multi_index_block.h"
+#include "mongo/db/db_raii.h"
 #include "mongo/db/index/index_access_method.h"
+#include "mongo/db/index/index_descriptor.h"
+#include "mongo/db/index_builds_coordinator.h"
 #include "mongo/db/operation_context.h"
-#include "mongo/util/log.h"
-#include "mongo/util/touch_pages.h"
+#include "mongo/db/views/view_catalog.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/assert_util.h"
 
 namespace mongo {
 
-    using std::endl;
-    using std::vector;
+using logv2::LogComponent;
 
-    namespace {
-        BSONObj _compactAdjustIndexSpec( const BSONObj& oldSpec ) {
-            BSONObjBuilder b;
-            BSONObj::iterator i( oldSpec );
-            while( i.more() ) {
-                BSONElement e = i.next();
-                if ( str::equals( e.fieldName(), "v" ) ) {
-                    // Drop any preexisting index version spec.  The default index version will
-                    // be used instead for the new index.
-                    continue;
-                }
-                if ( str::equals( e.fieldName(), "background" ) ) {
-                    // Create the new index in the foreground.
-                    continue;
-                }
-                // Pass the element through to the new index spec.
-                b.append(e);
-            }
-            return b.obj();
-        }
+namespace {
 
-        class MyCompactAdaptor : public RecordStoreCompactAdaptor {
-        public:
-            MyCompactAdaptor(Collection* collection,
-                             MultiIndexBlock* indexBlock)
+CollectionPtr getCollectionForCompact(OperationContext* opCtx,
+                                      Database* database,
+                                      const NamespaceString& collectionNss) {
+    invariant(opCtx->lockState()->isCollectionLockedForMode(collectionNss, MODE_IX));
 
-                : _collection( collection ),
-                  _multiIndexBlock(indexBlock) {
-            }
+    auto collectionCatalog = CollectionCatalog::get(opCtx);
+    CollectionPtr collection = collectionCatalog->lookupCollectionByNamespace(opCtx, collectionNss);
 
-            virtual bool isDataValid( const RecordData& recData ) {
-                return recData.toBson().valid();
-            }
-
-            virtual size_t dataSize( const RecordData& recData ) {
-                return recData.toBson().objsize();
-            }
-
-            virtual void inserted( const RecordData& recData, const RecordId& newLocation ) {
-                _multiIndexBlock->insert( recData.toBson(), newLocation );
-            }
-
-        private:
-            Collection* _collection;
-
-            MultiIndexBlock* _multiIndexBlock;
-        };
-
+    if (!collection) {
+        std::shared_ptr<const ViewDefinition> view =
+            ViewCatalog::get(database)->lookup(opCtx, collectionNss.ns());
+        uassert(ErrorCodes::CommandNotSupportedOnView, "can't compact a view", !view);
+        uasserted(ErrorCodes::NamespaceNotFound, "collection does not exist");
     }
 
+    return collection;
+}
 
-    StatusWith<CompactStats> Collection::compact( OperationContext* txn,
-                                                  const CompactOptions* compactOptions ) {
-        dassert(txn->lockState()->isCollectionLockedForMode(ns().toString(), MODE_X));
+}  // namespace
 
-        if ( !_recordStore->compactSupported() )
-            return StatusWith<CompactStats>( ErrorCodes::CommandNotSupported,
-                                             str::stream() <<
-                                             "cannot compact collection with record store: " <<
-                                             _recordStore->name() );
+StatusWith<int64_t> compactCollection(OperationContext* opCtx,
+                                      const NamespaceString& collectionNss) {
+    AutoGetDb autoDb(opCtx, collectionNss.db(), MODE_IX);
+    Database* database = autoDb.getDb();
+    uassert(ErrorCodes::NamespaceNotFound, "database does not exist", database);
 
-        if (_recordStore->compactsInPlace()) {
-            // Since we are compacting in-place, we don't need to touch the indexes.
-            // TODO SERVER-16856 compact indexes
-            CompactStats stats;
-            Status status = _recordStore->compact(txn, NULL, compactOptions, &stats);
-            if (!status.isOK())
-                return StatusWith<CompactStats>(status);
+    // The collection lock will be downgraded to an intent lock if the record store supports
+    // online compaction.
+    boost::optional<Lock::CollectionLock> collLk;
+    collLk.emplace(opCtx, collectionNss, MODE_X);
 
-            return StatusWith<CompactStats>(stats);
-        }
+    CollectionPtr collection = getCollectionForCompact(opCtx, database, collectionNss);
+    DisableDocumentValidation validationDisabler(opCtx);
 
-        if ( _indexCatalog.numIndexesInProgress( txn ) )
-            return StatusWith<CompactStats>( ErrorCodes::BadValue,
-                                             "cannot compact when indexes in progress" );
+    auto recordStore = collection->getRecordStore();
 
+    OldClientContext ctx(opCtx, collectionNss.ns());
 
-        // same data, but might perform a little different after compact?
-        _infoCache.reset( txn );
+    if (!recordStore->compactSupported())
+        return Status(ErrorCodes::CommandNotSupported,
+                      str::stream() << "cannot compact collection with record store: "
+                                    << recordStore->name());
 
-        vector<BSONObj> indexSpecs;
-        {
-            IndexCatalog::IndexIterator ii( _indexCatalog.getIndexIterator( txn, false ) );
-            while ( ii.more() ) {
-                IndexDescriptor* descriptor = ii.next();
+    if (recordStore->supportsOnlineCompaction()) {
+        // Storage engines that allow online compaction should do so using an intent lock on the
+        // collection.
+        collLk.emplace(opCtx, collectionNss, MODE_IX);
 
-                const BSONObj spec = _compactAdjustIndexSpec(descriptor->infoObj());
-                const BSONObj key = spec.getObjectField("key");
-                const Status keyStatus = validateKeyPattern(key);
-                if (!keyStatus.isOK()) {
-                    return StatusWith<CompactStats>(
-                        ErrorCodes::CannotCreateIndex,
-                        str::stream() << "Cannot compact collection due to invalid index "
-                                      << spec << ": " << keyStatus.reason() << " For more info see"
-                                      << " http://dochub.mongodb.org/core/index-validation");
-                }
-                indexSpecs.push_back(spec);
-            }
-        }
-
-        // Give a chance to be interrupted *before* we drop all indexes.
-        txn->checkForInterrupt();
-
-        {
-            // note that the drop indexes call also invalidates all clientcursors for the namespace,
-            // which is important and wanted here
-            WriteUnitOfWork wunit(txn);
-            log() << "compact dropping indexes" << endl;
-            Status status = _indexCatalog.dropAllIndexes(txn, true);
-            if ( !status.isOK() ) {
-                return StatusWith<CompactStats>( status );
-            }
-            wunit.commit();
-        }
-
-        CompactStats stats;
-
-        MultiIndexBlock indexer(txn, this);
-        indexer.allowInterruption();
-        indexer.ignoreUniqueConstraint(); // in compact we should be doing no checking
-
-        Status status = indexer.init( indexSpecs );
-        if ( !status.isOK() )
-            return StatusWith<CompactStats>( status );
-
-        MyCompactAdaptor adaptor(this, &indexer);
-
-        status = _recordStore->compact( txn, &adaptor, compactOptions, &stats);
-        if (!status.isOK())
-            return StatusWith<CompactStats>(status);
-
-        log() << "starting index commits";
-        status = indexer.doneInserting();
-        if ( !status.isOK() )
-            return StatusWith<CompactStats>( status );
-
-        {
-            WriteUnitOfWork wunit(txn);
-            indexer.commit();
-            wunit.commit();
-        }
-
-        return StatusWith<CompactStats>( stats );
+        // Ensure the collection was not dropped during the re-lock.
+        collection = getCollectionForCompact(opCtx, database, collectionNss);
+        recordStore = collection->getRecordStore();
     }
+
+    LOGV2_OPTIONS(20284,
+                  {LogComponent::kCommand},
+                  "compact {namespace} begin",
+                  "Compact begin",
+                  "namespace"_attr = collectionNss);
+
+    auto oldTotalSize = recordStore->storageSize(opCtx) + collection->getIndexSize(opCtx);
+    auto indexCatalog = collection->getIndexCatalog();
+
+    Status status = recordStore->compact(opCtx);
+    if (!status.isOK())
+        return status;
+
+    // Compact all indexes (not including unfinished indexes)
+    status = indexCatalog->compactIndexes(opCtx);
+    if (!status.isOK())
+        return status;
+
+    auto totalSizeDiff =
+        oldTotalSize - recordStore->storageSize(opCtx) - collection->getIndexSize(opCtx);
+    LOGV2(20286,
+          "compact {namespace} end, bytes freed: {freedBytes}",
+          "Compact end",
+          "namespace"_attr = collectionNss,
+          "freedBytes"_attr = totalSizeDiff);
+    return totalSizeDiff;
+}
 
 }  // namespace mongo

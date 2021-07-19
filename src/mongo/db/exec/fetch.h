@@ -1,23 +1,24 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,80 +29,77 @@
 
 #pragma once
 
-#include <boost/scoped_ptr.hpp>
+#include <memory>
 
-#include "mongo/db/exec/plan_stage.h"
+#include "mongo/db/exec/requires_collection_stage.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression.h"
 #include "mongo/db/record_id.h"
 
 namespace mongo {
 
+class SeekableRecordCursor;
+
+/**
+ * This stage turns a RecordId into a BSONObj.
+ *
+ * In WorkingSetMember terms, it transitions from RID_AND_IDX to RID_AND_OBJ by reading
+ * the record at the provided RecordId.  Returns verbatim any data that already has an object.
+ *
+ * Preconditions: Valid RecordId.
+ */
+class FetchStage : public RequiresCollectionStage {
+public:
+    FetchStage(ExpressionContext* expCtx,
+               WorkingSet* ws,
+               std::unique_ptr<PlanStage> child,
+               const MatchExpression* filter,
+               const CollectionPtr& collection);
+
+    ~FetchStage();
+
+    bool isEOF() final;
+    StageState doWork(WorkingSetID* out) final;
+
+    void doDetachFromOperationContext() final;
+    void doReattachToOperationContext() final;
+
+    StageType stageType() const final {
+        return STAGE_FETCH;
+    }
+
+    std::unique_ptr<PlanStageStats> getStats();
+
+    const SpecificStats* getSpecificStats() const final;
+
+    static const char* kStageType;
+
+protected:
+    void doSaveStateRequiresCollection() final;
+
+    void doRestoreStateRequiresCollection() final;
+
+private:
     /**
-     * This stage turns a RecordId into a BSONObj.
-     *
-     * In WorkingSetMember terms, it transitions from LOC_AND_IDX to LOC_AND_UNOWNED_OBJ by reading
-     * the record at the provided loc.  Returns verbatim any data that already has an object.
-     *
-     * Preconditions: Valid RecordId.
+     * If the member (with id memberID) passes our filter, set *out to memberID and return that
+     * ADVANCED.  Otherwise, free memberID and return NEED_TIME.
      */
-    class FetchStage : public PlanStage {
-    public:
-        FetchStage(OperationContext* txn,
-                   WorkingSet* ws,
-                   PlanStage* child,
-                   const MatchExpression* filter,
-                   const Collection* collection);
+    StageState returnIfMatches(WorkingSetMember* member, WorkingSetID memberID, WorkingSetID* out);
 
-        virtual ~FetchStage();
+    // Used to fetch Records from _collection.
+    std::unique_ptr<SeekableRecordCursor> _cursor;
 
-        virtual bool isEOF();
-        virtual StageState work(WorkingSetID* out);
+    // _ws is not owned by us.
+    WorkingSet* _ws;
 
-        virtual void saveState();
-        virtual void restoreState(OperationContext* opCtx);
-        virtual void invalidate(OperationContext* txn, const RecordId& dl, InvalidationType type);
+    // The filter is not owned by us.
+    const MatchExpression* _filter;
 
-        virtual std::vector<PlanStage*> getChildren() const;
+    // If not Null, we use this rather than asking our child what to do next.
+    WorkingSetID _idRetrying;
 
-        virtual StageType stageType() const { return STAGE_FETCH; }
-
-        PlanStageStats* getStats();
-
-        virtual const CommonStats* getCommonStats();
-
-        virtual const SpecificStats* getSpecificStats();
-
-        static const char* kStageType;
-
-    private:
-
-        /**
-         * If the member (with id memberID) passes our filter, set *out to memberID and return that
-         * ADVANCED.  Otherwise, free memberID and return NEED_TIME.
-         */
-        StageState returnIfMatches(WorkingSetMember* member, WorkingSetID memberID,
-                                   WorkingSetID* out);
-
-        OperationContext* _txn;
-
-        // Collection which is used by this stage. Used to resolve record ids retrieved by child
-        // stages. The lifetime of the collection must supersede that of the stage.
-        const Collection* _collection;
-
-        // _ws is not owned by us.
-        WorkingSet* _ws;
-        boost::scoped_ptr<PlanStage> _child;
-
-        // The filter is not owned by us.
-        const MatchExpression* _filter;
-
-        // If not Null, we use this rather than asking our child what to do next.
-        WorkingSetID _idRetrying;
-
-        // Stats
-        CommonStats _commonStats;
-        FetchStats _specificStats;
-    };
+    // Stats
+    FetchStats _specificStats;
+};
 
 }  // namespace mongo

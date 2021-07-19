@@ -1,25 +1,24 @@
-//@file update_result.cpp
-
 /**
- *    Copyright (C) 2008-2014 MongoDB Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects for
+ *    must comply with the Server Side Public License in all respects for
  *    all of the code used other than as permitted herein. If you modify file(s)
  *    with this exception, you may extend this exception to your version of the
  *    file(s), but you are not obligated to do so. If you do not wish to do so,
@@ -28,33 +27,50 @@
  *    it in the license file.
  */
 
-#define MONGO_LOG_DEFAULT_COMPONENT ::mongo::logger::LogComponent::kWrite
+
+#define MONGO_LOGV2_DEFAULT_COMPONENT ::mongo::logv2::LogComponent::kWrite
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/db/ops/update_result.h"
 
-#include "mongo/util/log.h"
+#include "mongo/db/lasterror.h"
+#include "mongo/logv2/log.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-    UpdateResult::UpdateResult(bool existing_,
-                               bool modifiers_,
-                               unsigned long long numDocsModified_,
-                               unsigned long long numMatched_,
-                               const BSONObj& upsertedObject_,
-                               const BSONObj& newObj_)
-        : existing(existing_),
-          modifiers(modifiers_),
-          numDocsModified(numDocsModified_),
-          numMatched(numMatched_),
-          newObj(newObj_) {
-
-        BSONElement id = upsertedObject_["_id"];
-        if ( ! existing && numMatched == 1 && !id.eoo() ) {
-            upserted = id.wrap(kUpsertedFieldName);
-        }
-        LOG(4) << "UpdateResult -- " << toString();
+UpdateResult::UpdateResult(bool existing,
+                           bool modifiers,
+                           unsigned long long numDocsModified,
+                           unsigned long long numMatched,
+                           const BSONObj& upsertedObject,
+                           bool dotsAndDollarsField)
+    : existing(existing),
+      modifiers(modifiers),
+      numDocsModified(numDocsModified),
+      numMatched(numMatched),
+      containsDotsAndDollarsField(dotsAndDollarsField) {
+    BSONElement id = upsertedObject["_id"];
+    if (!existing && numMatched == 0 && !id.eoo()) {
+        upsertedId = id.wrap(kUpsertedFieldName);
     }
+    LOGV2_DEBUG(20885,
+                4,
+                "UpdateResult -- upserted: {upserted} modifiers: {modifiers} existing: {existing} "
+                "numDocsModified: {numModified} numMatched: {numMatched}",
+                "UpdateResult",
+                "numMatched"_attr = numMatched,
+                "numModified"_attr = numDocsModified,
+                "upsertedId"_attr = redact(upsertedId),
+                "modifiers"_attr = modifiers,
+                "existing"_attr = existing);
+}
+
+std::string UpdateResult::toString() const {
+    return str::stream() << " upsertedId: " << upsertedId << " modifiers: " << modifiers
+                         << " existing: " << existing << " numDocsModified: " << numDocsModified
+                         << " numMatched: " << numMatched;
+}
 
 }  // namespace mongo

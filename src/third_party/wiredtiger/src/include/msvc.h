@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2014-2015 MongoDB, Inc.
+ * Copyright (c) 2014-present MongoDB, Inc.
  * Copyright (c) 2008-2014 WiredTiger, Inc.
  *	All rights reserved.
  *
@@ -11,86 +11,114 @@
 #error "Only x64 is supported with MSVC"
 #endif
 
-#define	inline __inline
+#define inline __inline
 
-#define	WT_SIZET_FMT	"Iu"			/* size_t format string */
+/* MSVC Doesn't provide __func__, it has __FUNCTION__ */
+#ifdef _MSC_VER
+#define __func__ __FUNCTION__
+#endif
+
+#define WT_PTRDIFFT_FMT "Id" /* ptrdiff_t format string */
+#define WT_SIZET_FMT "Iu"    /* size_t format string */
+
+/* MSVC-specific attributes. */
+#define WT_PACKED_STRUCT_BEGIN(name) __pragma(pack(push, 1)) struct name {
+
+#define WT_PACKED_STRUCT_END \
+    }                        \
+    ;                        \
+    __pragma(pack(pop))
+
+#define WT_GCC_FUNC_ATTRIBUTE(x)
+#define WT_GCC_FUNC_DECL_ATTRIBUTE(x)
+
+#define WT_ATOMIC_FUNC(name, ret, type, s, t)                                               \
+    static inline ret __wt_atomic_add##name(type *vp, type v)                               \
+    {                                                                                       \
+        return (_InterlockedExchangeAdd##s((t *)(vp), (t)(v)) + (v));                       \
+    }                                                                                       \
+    static inline ret __wt_atomic_fetch_add##name(type *vp, type v)                         \
+    {                                                                                       \
+        return (_InterlockedExchangeAdd##s((t *)(vp), (t)(v)));                             \
+    }                                                                                       \
+    static inline ret __wt_atomic_sub##name(type *vp, type v)                               \
+    {                                                                                       \
+        return (_InterlockedExchangeAdd##s((t *)(vp), -(t)v) - (v));                        \
+    }                                                                                       \
+    static inline bool __wt_atomic_cas##name(type *vp, type old, type new)                  \
+    {                                                                                       \
+        return (_InterlockedCompareExchange##s((t *)(vp), (t)(new), (t)(old)) == (t)(old)); \
+    }
+
+WT_ATOMIC_FUNC(8, uint8_t, uint8_t, 8, char)
+WT_ATOMIC_FUNC(v8, uint8_t, volatile uint8_t, 8, char)
+WT_ATOMIC_FUNC(16, uint16_t, uint16_t, 16, short)
+WT_ATOMIC_FUNC(32, uint32_t, uint32_t, , long)
+WT_ATOMIC_FUNC(v32, uint32_t, volatile uint32_t, , long)
+WT_ATOMIC_FUNC(i32, int32_t, int32_t, , long)
+WT_ATOMIC_FUNC(iv32, int32_t, volatile int32_t, , long)
+WT_ATOMIC_FUNC(64, uint64_t, uint64_t, 64, __int64)
+WT_ATOMIC_FUNC(v64, uint64_t, volatile uint64_t, 64, __int64)
+WT_ATOMIC_FUNC(i64, int64_t, int64_t, 64, __int64)
+WT_ATOMIC_FUNC(iv64, int64_t, volatile int64_t, 64, __int64)
+WT_ATOMIC_FUNC(size, size_t, size_t, 64, __int64)
 
 /*
- * Add MSVC-specific attributes and pragmas to types and function declarations.
+ * __wt_atomic_cas_ptr --
+ *     Pointer compare and swap.
  */
-#define	WT_COMPILER_TYPE_ALIGN(x)	__declspec(align(x))
+static inline bool
+__wt_atomic_cas_ptr(void *vp, void *old, void *new)
+{
+    return (_InterlockedCompareExchange64(vp, (int64_t) new, (int64_t)old) == ((int64_t)old));
+}
 
-#define	WT_PACKED_STRUCT_BEGIN(name)					\
-	__pragma(pack(push,1))						\
-	struct name {
+/*
+ * WT_BARRIER --
+ *	MSVC implementation of WT_BARRIER.
+ */
+static inline void
+WT_BARRIER(void)
+{
+    _ReadWriteBarrier();
+}
 
-#define	WT_PACKED_STRUCT_END						\
-	};								\
-	__pragma(pack(pop))
+/*
+ * WT_FULL_BARRIER --
+ *	MSVC implementation of WT_FULL_BARRIER.
+ */
+static inline void
+WT_FULL_BARRIER(void)
+{
+    _mm_mfence();
+}
 
-#define	WT_GCC_FUNC_ATTRIBUTE(x)
-#define	WT_GCC_FUNC_DECL_ATTRIBUTE(x)
+/*
+ * WT_PAUSE --
+ *	MSVC implementation of WT_PAUSE.
+ */
+static inline void
+WT_PAUSE(void)
+{
+    _mm_pause();
+}
 
-#define	__WT_ATOMIC_ADD(v, val, n, s, t)				\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	_InterlockedExchangeAdd ## s((t*)&(v), (t)(val)) + (val))
-#define	__WT_ATOMIC_FETCH_ADD(v, val, n, s, t)				\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	_InterlockedExchangeAdd ## s((t*)&(v), (t)(val)))
-#define	__WT_ATOMIC_CAS(v, old, new, n, s, t)				\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	_InterlockedCompareExchange ## s				\
-	((t*)&(v), (t)(new), (t)(old)) == (t)(old))
-#define	__WT_ATOMIC_CAS_VAL(v, old, new, n, s, t)			\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	_InterlockedCompareExchange ## s((t*)&(v), (t)(new), (t)(old)))
-#define	__WT_ATOMIC_STORE(v, val, n, s, t)				\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	_InterlockedExchange ## s((t*)&(v), (t)(val)))
-#define	__WT_ATOMIC_SUB(v, val, n, s, t)				\
-	(WT_STATIC_ASSERT(sizeof(v) == (n)),				\
-	_InterlockedExchangeAdd ## s((t*)&(v), -(t) val) - (val))
+/*
+ * WT_READ_BARRIER --
+ *	MSVC implementation of WT_READ_BARRIER.
+ */
+static inline void
+WT_READ_BARRIER(void)
+{
+    _mm_lfence();
+}
 
-#define	WT_ATOMIC_ADD1(v, val)		__WT_ATOMIC_ADD(v, val, 1, 8, char)
-#define	WT_ATOMIC_FETCH_ADD1(v, val)					\
-	__WT_ATOMIC_FETCH_ADD(v, val, 1, 8, char)
-#define	WT_ATOMIC_CAS1(v, old, new)	__WT_ATOMIC_CAS(v, old, new, 1, 8, char)
-#define	WT_ATOMIC_CAS_VAL1(v, old, new)					\
-	__WT_ATOMIC_CAS_VAL(v, old, new, 1, 8, char)
-#define	WT_ATOMIC_STORE1(v, val)	__WT_ATOMIC_STORE(v, val, 1, 8, char)
-#define	WT_ATOMIC_SUB1(v, val)		__WT_ATOMIC_SUB(v, val, 1, 8, char)
-
-#define	WT_ATOMIC_ADD2(v, val)		__WT_ATOMIC_ADD(v, val, 2, 16, short)
-#define	WT_ATOMIC_FETCH_ADD2(v, val)					\
-	__WT_ATOMIC_FETCH_ADD(v, val, 2, 16, short)
-#define	WT_ATOMIC_CAS2(v, old, new)					\
-	__WT_ATOMIC_CAS(v, old, new, 2, 16, short)
-#define	WT_ATOMIC_CAS_VAL2(v, old, new)					\
-	__WT_ATOMIC_CAS_VAL(v, old, new, 2, 16, short)
-#define	WT_ATOMIC_STORE2(v, val)	__WT_ATOMIC_STORE(v, val, 2, 16, short)
-#define	WT_ATOMIC_SUB2(v, val)		__WT_ATOMIC_SUB(v, val, 2, 16, short)
-
-#define	WT_ATOMIC_ADD4(v, val)		__WT_ATOMIC_ADD(v, val, 4, , long)
-#define	WT_ATOMIC_FETCH_ADD4(v, val)	__WT_ATOMIC_FETCH_ADD(v, val, 4, , long)
-#define	WT_ATOMIC_CAS4(v, old, new)	__WT_ATOMIC_CAS(v, old, new, 4, , long)
-#define	WT_ATOMIC_CAS_VAL4(v, old, new)					\
-	__WT_ATOMIC_CAS_VAL(v, old, new, 4, , long)
-#define	WT_ATOMIC_STORE4(v, val)	__WT_ATOMIC_STORE(v, val, 4, , long)
-#define	WT_ATOMIC_SUB4(v, val)		__WT_ATOMIC_SUB(v, val, 4, , long)
-
-#define	WT_ATOMIC_ADD8(v, val)		__WT_ATOMIC_ADD(v, val, 8, 64, __int64)
-#define	WT_ATOMIC_FETCH_ADD8(v, val)					\
-	__WT_ATOMIC_FETCH_ADD(v, val, 8, 64, __int64)
-#define	WT_ATOMIC_CAS8(v, old, new)					\
-	__WT_ATOMIC_CAS(v, old, new, 8, 64, __int64)
-#define	WT_ATOMIC_CAS_VAL8(v, old, new)					\
-	__WT_ATOMIC_CAS_VAL(v, old, new, 8, 64, __int64)
-#define	WT_ATOMIC_STORE8(v, val)					\
-	__WT_ATOMIC_STORE(v, val, 8, 64, __int64)
-#define	WT_ATOMIC_SUB8(v, val)		__WT_ATOMIC_SUB(v, val, 8, 64, __int64)
-
-static inline void WT_BARRIER(void) { _ReadWriteBarrier(); }
-static inline void WT_FULL_BARRIER(void) { _mm_mfence(); }
-static inline void WT_PAUSE(void) { _mm_pause(); }
-static inline void WT_READ_BARRIER(void) { _mm_lfence(); }
-static inline void WT_WRITE_BARRIER(void) { _mm_sfence(); }
+/*
+ * WT_WRITE_BARRIER --
+ *	MSVC implementation of WT_WRITE_BARRIER.
+ */
+static inline void
+WT_WRITE_BARRIER(void)
+{
+    _mm_sfence();
+}

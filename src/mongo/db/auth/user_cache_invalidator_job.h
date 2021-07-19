@@ -1,56 +1,77 @@
-/*    Copyright 2013 10gen Inc.
+/**
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
+#pragma once
 
 #include "mongo/bson/oid.h"
-#include "mongo/util/background.h"
-
-#include <string>
+#include "mongo/bson/timestamp.h"
+#include "mongo/db/service_context.h"
+#include "mongo/util/periodic_runner.h"
 
 namespace mongo {
 
-    class AuthorizationManager;
+class AuthorizationManager;
+class OperationContext;
+
+/**
+ * Background job that runs only in mongos and periodically checks in with the config servers
+ * to determine whether any authorization information has changed, and if so causes the
+ * AuthorizationManager to throw out its in-memory cache of User objects (which contains the
+ * users' credentials, roles, privileges, etc).
+ */
+class UserCacheInvalidator {
+public:
+    using OIDorTimestamp = stdx::variant<OID, Timestamp>;
+
+    UserCacheInvalidator(AuthorizationManager* authzManager);
 
     /**
-     * Background job that runs only in mongos and periodically checks in with the config servers
-     * to determine whether any authorization information has changed, and if so causes the
-     * AuthorizationManager to throw out its in-memory cache of User objects (which contains the
-     * users' credentials, roles, privileges, etc).
+     * Create a new UserCacheInvalidator as a decorator on the service context
+     * and start the background job.
      */
-    class UserCacheInvalidator : public BackgroundJob {
-    public:
-        explicit UserCacheInvalidator(AuthorizationManager* authzManager);
+    static void start(ServiceContext* serviceCtx, OperationContext* opCtx);
 
-    protected:
-        virtual std::string name() const;
-        virtual void run();
+    /**
+     * Set the period of the background job. This should only be used internally (by the
+     * setParameter).
+     */
+    void setPeriod(Milliseconds period);
 
-    private:
-        AuthorizationManager* _authzManager;
-        OID _previousCacheGeneration;
-    };
+private:
+    void initialize(OperationContext* opCtx);
+    void run();
 
-} // namespace mongo
+    std::unique_ptr<PeriodicJobAnchor> _job;
+
+    AuthorizationManager* const _authzManager;
+    OIDorTimestamp _previousGeneration;
+};
+
+Status userCacheInvalidationIntervalSecsNotify(const int& newValue);
+
+}  // namespace mongo

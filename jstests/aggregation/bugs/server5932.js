@@ -1,4 +1,19 @@
-// server-5932 Cursor-based aggregation
+/**
+ * server-5932 Cursor-based aggregation
+ *
+ * @tags: [
+ *   # The result set produced by this test is large, so when wrapped in a $facet, the maximum
+ *   # intermediate document size would be exceeded.
+ *   do_not_wrap_aggregations_in_facets,
+ *   # This test will not work with causal consistency because an aggregate and its subsequent
+ *   # getMores act as one operation, which means that there are no guarantees that future cursor
+ *   # commands will read any writes which occur in between cursor commands.
+ *   does_not_support_causal_consistency,
+ * ]
+ */
+
+(function() {
+"use strict";
 
 var t = db.server5932;
 t.drop();
@@ -22,7 +37,7 @@ function makeCursor(cmdOut, followupBatchSize) {
     assert.neq(cmdOut.cursor.id, undefined);
     assert(cmdOut.cursor.id instanceof NumberLong);
     assert(cmdOut.cursor.firstBatch instanceof Array);
-    return new DBCommandCursor(db.getMongo(), cmdOut, followupBatchSize);
+    return new DBCommandCursor(db, cmdOut, followupBatchSize);
 }
 
 // both batch sizes are optional
@@ -44,7 +59,7 @@ var bigArray = [];
 for (var i = 0; i < 1000; i++)
     bigArray.push(i);
 
-var bigStr = Array(1001).toString(); // 1000 bytes of ','
+var bigStr = Array(1001).toString();  // 1000 bytes of ','
 
 for (var i = 0; i < 100; i++)
     t.insert({_id: i, bigArray: bigArray, bigStr: bigStr});
@@ -54,35 +69,40 @@ for (var i = 0; i < 100; i++)
 //
 
 // successfully handles results > 16MB (bigArray.length * bytes in bigStr * t.count() == 100MB)
-var cursor = aggCursor([{$unwind:'$bigArray'}]); // default settings
+var cursor = aggCursor([{$unwind: '$bigArray'}]);  // default settings
 assert.eq(cursor.itcount(), bigArray.length * t.count());
-var cursor = aggCursor([{$unwind:'$bigArray'}], 0); // empty first batch
+var cursor = aggCursor([{$unwind: '$bigArray'}], 0);  // empty first batch
 assert.eq(cursor.itcount(), bigArray.length * t.count());
-var cursor = aggCursor([{$unwind:'$bigArray'}], 5, 5); // many small batches
+var cursor = aggCursor([{$unwind: '$bigArray'}], 5, 5);  // many small batches
 assert.eq(cursor.itcount(), bigArray.length * t.count());
 
 // empty result set results in cursor.id == 0 unless batchSize is 0;
-var res = t.runCommand(buildAggCmd([{$match: {noSuchField: {$exists:true}}}]));
+var res = t.runCommand(buildAggCmd([{$match: {noSuchField: {$exists: true}}}]));
 assert.eq(res.cursor.firstBatch, []);
 assert.eq(res.cursor.id, 0);
-var res = t.runCommand(buildAggCmd([{$match: {noSuchField: {$exists:true}}}], 0));
+var res = t.runCommand(buildAggCmd([{$match: {noSuchField: {$exists: true}}}], 0));
 assert.eq(res.cursor.firstBatch, []);
 assert.neq(res.cursor.id, 0);
 assert.eq(makeCursor(res).itcount(), 0);
 
 // parse errors are caught before first batch, regardless of size
-var res = t.runCommand(buildAggCmd([{$noSuchStage:1}], 0));
+var res = t.runCommand(buildAggCmd([{$noSuchStage: 1}], 0));
 assert.commandFailed(res);
 
 // data dependent errors can get ok:1 but fail in getMore if they don't fail in first batch
-var res = t.runCommand(buildAggCmd([{$project:{cantAddString: {$add:[1, '$bigStr']}}}], 1));
+var res = t.runCommand(buildAggCmd([{$project: {cantAddString: {$add: [1, '$bigStr']}}}], 1));
 assert.commandFailed(res);
-var res = t.runCommand(buildAggCmd([{$project:{cantAddString: {$add:[1, '$bigStr']}}}], 0));
+var res = t.runCommand(buildAggCmd([{$project: {cantAddString: {$add: [1, '$bigStr']}}}], 0));
 assert.commandWorked(res);
-assert.throws(function() { makeCursor(res).itcount(); });
+assert.throws(function() {
+    makeCursor(res).itcount();
+});
 
 // error if collection dropped after first batch
-var cursor = aggCursor([{$unwind:'$bigArray'}], 0);
+var cursor = aggCursor([{$unwind: '$bigArray'}], 0);
 t.drop();
-assert.throws(function() { cursor.itcount(); });
+assert.throws(function() {
+    cursor.itcount();
+});
+})();
 // DON'T ADD NEW TEST TO THIS FILE AFTER THIS ONE (unless you reseed the data)

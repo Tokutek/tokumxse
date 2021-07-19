@@ -1,7 +1,7 @@
 // Tests for RegExp.escape
 
 (function() {
-  var TEST_STRINGS = [
+var TEST_STRINGS = [
     "[db]",
     "{ab}",
     "<c2>",
@@ -16,12 +16,11 @@
     "\t| |\n\r",
     "Mongo-db",
     "[{(<>)}]!@#%^&*+\\"
-  ];
+];
 
-  TEST_STRINGS.forEach(function (str) {
+TEST_STRINGS.forEach(function(str) {
     var escaped = RegExp.escape(str);
     var regex = new RegExp(escaped);
     assert(regex.test(str), "Wrong escape for " + str);
-  });
+});
 })();
-

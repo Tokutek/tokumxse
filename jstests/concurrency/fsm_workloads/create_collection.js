@@ -5,10 +5,8 @@
  *
  * Repeatedly creates a collection.
  */
-load('jstests/concurrency/fsm_workload_helpers/drop_utils.js'); // for dropCollections
 
 var $config = (function() {
-
     var data = {
         // Use the workload name as a prefix for the collection name,
         // since the workload name is assumed to be unique.
@@ -16,7 +14,6 @@ var $config = (function() {
     };
 
     var states = (function() {
-
         function uniqueCollectionName(prefix, tid, num) {
             return prefix + tid + '_' + num;
         }
@@ -32,22 +29,10 @@ var $config = (function() {
             assertAlways.commandWorked(db.createCollection(myCollName));
         }
 
-        return {
-            init: init,
-            create: create
-        };
-
+        return {init: init, create: create};
     })();
 
-    var transitions = {
-        init: { create: 1 },
-        create: { create: 1 }
-    };
-
-    function teardown(db, collName, cluster) {
-        var pattern = new RegExp('^' + this.prefix + '\\d+_\\d+$');
-        dropCollections(db, pattern);
-    }
+    var transitions = {init: {create: 1}, create: {create: 1}};
 
     return {
         threadCount: 5,
@@ -55,7 +40,5 @@ var $config = (function() {
         data: data,
         states: states,
         transitions: transitions,
-        teardown: teardown
     };
-
 })();

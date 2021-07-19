@@ -1,34 +1,34 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2018-present MongoDB, Inc.
  *
- *    This program is free software: you can redistribute it and/or  modify
- *    it under the terms of the GNU Affero General Public License, version 3,
- *    as published by the Free Software Foundation.
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
  *
  *    This program is distributed in the hope that it will be useful,
  *    but WITHOUT ANY WARRANTY; without even the implied warranty of
  *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU Affero General Public License for more details.
+ *    Server Side Public License for more details.
  *
- *    You should have received a copy of the GNU Affero General Public License
- *    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
  *
  *    As a special exception, the copyright holders give permission to link the
  *    code of portions of this program with the OpenSSL library under certain
  *    conditions as described in each individual source file and distribute
  *    linked combinations including the program with the OpenSSL library. You
- *    must comply with the GNU Affero General Public License in all respects
- *    for all of the code used other than as permitted herein. If you modify
- *    file(s) with this exception, you may extend this exception to your
- *    version of the file(s), but you are not obligated to do so. If you do not
- *    wish to do so, delete this exception statement from your version. If you
- *    delete this exception statement from all source files in the program,
- *    then also delete it in the license file.
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
  */
 
 #include "mongo/platform/basic.h"
 
-#include "mongo/base/init.h"
 #include "mongo/client/connpool.h"
 #include "mongo/db/auth/action_type.h"
 #include "mongo/db/auth/authorization_session.h"
@@ -36,162 +36,160 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/field_parser.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/s/chunk_manager.h"
-#include "mongo/s/config.h"
+#include "mongo/s/catalog/sharding_catalog_client.h"
+#include "mongo/s/catalog_cache.h"
+#include "mongo/s/client/shard_registry.h"
 #include "mongo/s/grid.h"
-#include "mongo/s/shard.h"
 
 namespace mongo {
 
-    using std::string;
-    using std::stringstream;
-    using std::vector;
+using std::string;
+using std::vector;
 
-    /**
-     * Mongos-side command for merging chunks, passes command to appropriate shard.
-     */
-    class ClusterMergeChunksCommand : public Command {
-    public:
-        ClusterMergeChunksCommand() : Command("mergeChunks") {}
+namespace {
 
-        virtual void help(stringstream& h) const {
-            h << "Merge Chunks command\n"
-              << "usage: { mergeChunks : <ns>, bounds : [ <min key>, <max key> ] }";
+/**
+ * Mongos-side command for merging chunks, passes command to appropriate shard.
+ */
+class ClusterMergeChunksCommand : public ErrmsgCommandDeprecated {
+public:
+    ClusterMergeChunksCommand() : ErrmsgCommandDeprecated("mergeChunks") {}
+
+    std::string help() const override {
+        return "Merge Chunks command\n"
+               "usage: { mergeChunks : <ns>, bounds : [ <min key>, <max key> ] }";
+    }
+
+    Status checkAuthForCommand(Client* client,
+                               const std::string& dbname,
+                               const BSONObj& cmdObj) const override {
+        if (!AuthorizationSession::get(client)->isAuthorizedForActionsOnResource(
+                ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
+                ActionType::splitChunk)) {
+            return Status(ErrorCodes::Unauthorized, "Unauthorized");
         }
-
-        virtual Status checkAuthForCommand(ClientBasic* client,
-                                           const std::string& dbname,
-                                           const BSONObj& cmdObj) {
-            if (!client->getAuthorizationSession()->isAuthorizedForActionsOnResource(
-                    ResourcePattern::forExactNamespace(NamespaceString(parseNs(dbname, cmdObj))),
-                    ActionType::splitChunk)) {
-                return Status(ErrorCodes::Unauthorized, "Unauthorized");
-            }
-            return Status::OK();
-        }
-
-        virtual std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const {
-            return parseNsFullyQualified(dbname, cmdObj);
-        }
-
-        virtual bool adminOnly() const { return true; }
-        virtual bool slaveOk() const { return false; }
-        virtual bool isWriteCommandForConfigServer() const { return false; }
-
-        // Required
-        static BSONField<string> nsField;
-        static BSONField<vector<BSONObj> > boundsField;
-
-        // Used to send sharding state
-        static BSONField<string> shardNameField;
-        static BSONField<string> configField;
-
-        // TODO: This refresh logic should be consolidated
-        ChunkManagerPtr refreshChunkCache(const NamespaceString& nss) {
-
-            DBConfigPtr config = grid.getDBConfig(nss.ns());
-            if (!config->isSharded(nss))
-                return ChunkManagerPtr();
-
-            // Refreshes chunks as a side-effect
-            return config->getChunkManagerIfExists(nss, true);
-        }
-
-
-        bool run(OperationContext* txn, const string& dbname,
-                  BSONObj& cmdObj,
-                  int,
-                  string& errmsg,
-                  BSONObjBuilder& result,
-                  bool ) {
-
-            string ns = parseNs(dbname, cmdObj);
-
-            if ( ns.size() == 0 ) {
-                errmsg = "no namespace specified";
-                return false;
-            }
-
-            vector<BSONObj> bounds;
-            if ( !FieldParser::extract( cmdObj, boundsField, &bounds, &errmsg ) ) {
-                return false;
-            }
-
-            if ( bounds.size() == 0 ) {
-                errmsg = "no bounds were specified";
-                return false;
-            }
-
-            if ( bounds.size() != 2 ) {
-                errmsg = "only a min and max bound may be specified";
-                return false;
-            }
-
-            BSONObj minKey = bounds[0];
-            BSONObj maxKey = bounds[1];
-
-            if ( minKey.isEmpty() ) {
-                errmsg = "no min key specified";
-                return false;
-            }
-
-            if ( maxKey.isEmpty() ) {
-                errmsg = "no max key specified";
-                return false;
-            }
-
-            // This refreshes the chunk metadata if stale.
-            ChunkManagerPtr manager = refreshChunkCache(NamespaceString(ns));
-
-            if (!manager) {
-                errmsg = (string) "collection " + ns + " is not sharded, cannot merge chunks";
-                return false;
-            }
-
-            if (!manager->getShardKeyPattern().isShardKey(minKey)
-                || !manager->getShardKeyPattern().isShardKey(maxKey)) {
-                errmsg = stream() << "shard key bounds " << "[" << minKey << "," << maxKey << ")"
-                                  << " are not valid for shard key pattern "
-                                  << manager->getShardKeyPattern().toBSON();
-                return false;
-            }
-
-            minKey = manager->getShardKeyPattern().normalizeShardKey(minKey);
-            maxKey = manager->getShardKeyPattern().normalizeShardKey(maxKey);
-
-            ChunkPtr firstChunk = manager->findIntersectingChunk(minKey);
-            verify(firstChunk);
-            Shard shard = firstChunk->getShard();
-
-            BSONObjBuilder remoteCmdObjB;
-            remoteCmdObjB.append( cmdObj[ ClusterMergeChunksCommand::nsField() ] );
-            remoteCmdObjB.append( cmdObj[ ClusterMergeChunksCommand::boundsField() ] );
-            remoteCmdObjB.append( ClusterMergeChunksCommand::configField(),
-                                  configServer.getPrimary().getAddress().toString() );
-            remoteCmdObjB.append( ClusterMergeChunksCommand::shardNameField(),
-                                  shard.getName() );
-
-            BSONObj remoteResult;
-            // Throws, but handled at level above.  Don't want to rewrap to preserve exception
-            // formatting.
-            ScopedDbConnection conn( shard.getAddress() );
-            bool ok = conn->runCommand( "admin", remoteCmdObjB.obj(), remoteResult );
-            conn.done();
-
-            result.appendElements( remoteResult );
-            return ok;
-        }
-    };
-
-    BSONField<string> ClusterMergeChunksCommand::nsField( "mergeChunks" );
-    BSONField<vector<BSONObj> > ClusterMergeChunksCommand::boundsField( "bounds" );
-
-    BSONField<string> ClusterMergeChunksCommand::configField( "config" );
-    BSONField<string> ClusterMergeChunksCommand::shardNameField( "shardName" );
-
-    MONGO_INITIALIZER(InitMergeChunksPassCommand)(InitializerContext* context) {
-        // Leaked intentionally: a Command registers itself when constructed.
-        new ClusterMergeChunksCommand();
         return Status::OK();
     }
-}
+
+    std::string parseNs(const std::string& dbname, const BSONObj& cmdObj) const override {
+        return CommandHelpers::parseNsFullyQualified(cmdObj);
+    }
+
+    bool adminOnly() const override {
+        return true;
+    }
+
+    AllowedOnSecondary secondaryAllowed(ServiceContext*) const override {
+        return AllowedOnSecondary::kNever;
+    }
+
+    bool supportsWriteConcern(const BSONObj& cmd) const override {
+        return false;
+    }
+
+    // Required
+    static BSONField<string> nsField;
+    static BSONField<vector<BSONObj>> boundsField;
+
+    // Used to send sharding state
+    static BSONField<string> shardNameField;
+    static BSONField<string> configField;
+
+
+    bool errmsgRun(OperationContext* opCtx,
+                   const string& dbname,
+                   const BSONObj& cmdObj,
+                   string& errmsg,
+                   BSONObjBuilder& result) override {
+        const NamespaceString nss(parseNs(dbname, cmdObj));
+
+        const auto cm = uassertStatusOK(
+            Grid::get(opCtx)->catalogCache()->getShardedCollectionRoutingInfoWithRefresh(opCtx,
+                                                                                         nss));
+
+        vector<BSONObj> bounds;
+        if (!FieldParser::extract(cmdObj, boundsField, &bounds, &errmsg)) {
+            return false;
+        }
+
+        if (bounds.size() == 0) {
+            errmsg = "no bounds were specified";
+            return false;
+        }
+
+        if (bounds.size() != 2) {
+            errmsg = "only a min and max bound may be specified";
+            return false;
+        }
+
+        BSONObj minKey = bounds[0];
+        BSONObj maxKey = bounds[1];
+
+        if (minKey.isEmpty()) {
+            errmsg = "no min key specified";
+            return false;
+        }
+
+        if (maxKey.isEmpty()) {
+            errmsg = "no max key specified";
+            return false;
+        }
+
+        if (!cm.getShardKeyPattern().isShardKey(minKey) ||
+            !cm.getShardKeyPattern().isShardKey(maxKey)) {
+            errmsg = str::stream()
+                << "shard key bounds "
+                << "[" << minKey << "," << maxKey << ")"
+                << " are not valid for shard key pattern " << cm.getShardKeyPattern().toBSON();
+            return false;
+        }
+
+        minKey = cm.getShardKeyPattern().normalizeShardKey(minKey);
+        maxKey = cm.getShardKeyPattern().normalizeShardKey(maxKey);
+
+        const auto firstChunk = cm.findIntersectingChunkWithSimpleCollation(minKey);
+
+        BSONObjBuilder remoteCmdObjB;
+        remoteCmdObjB.append(cmdObj[ClusterMergeChunksCommand::nsField()]);
+        remoteCmdObjB.append(cmdObj[ClusterMergeChunksCommand::boundsField()]);
+        remoteCmdObjB.append(
+            ClusterMergeChunksCommand::configField(),
+            Grid::get(opCtx)->shardRegistry()->getConfigServerConnectionString().toString());
+        remoteCmdObjB.append(ClusterMergeChunksCommand::shardNameField(),
+                             firstChunk.getShardId().toString());
+        remoteCmdObjB.append("epoch", cm.getVersion().epoch());
+
+        BSONObj remoteResult;
+
+        // Throws, but handled at level above.  Don't want to rewrap to preserve exception
+        // formatting.
+        auto shard = uassertStatusOK(
+            Grid::get(opCtx)->shardRegistry()->getShard(opCtx, firstChunk.getShardId()));
+
+        auto response = uassertStatusOK(shard->runCommandWithFixedRetryAttempts(
+            opCtx,
+            ReadPreferenceSetting{ReadPreference::PrimaryOnly},
+            "admin",
+            remoteCmdObjB.obj(),
+            Shard::RetryPolicy::kNotIdempotent));
+        uassertStatusOK(response.commandStatus);
+
+        Grid::get(opCtx)
+            ->catalogCache()
+            ->invalidateShardOrEntireCollectionEntryForShardedCollection(
+                nss, boost::none, firstChunk.getShardId());
+
+        CommandHelpers::filterCommandReplyForPassthrough(response.response, &result);
+        return true;
+    }
+
+} clusterMergeChunksCommand;
+
+BSONField<string> ClusterMergeChunksCommand::nsField("mergeChunks");
+BSONField<vector<BSONObj>> ClusterMergeChunksCommand::boundsField("bounds");
+
+BSONField<string> ClusterMergeChunksCommand::configField("config");
+BSONField<string> ClusterMergeChunksCommand::shardNameField("shardName");
+
+}  // namespace
+}  // namespace mongo

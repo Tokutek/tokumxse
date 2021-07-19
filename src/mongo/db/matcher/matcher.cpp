@@ -1,63 +1,59 @@
-// matcher.cpp
-
 /**
-*    Copyright (C) 2013 10gen Inc.
-*
-*    This program is free software: you can redistribute it and/or  modify
-*    it under the terms of the GNU Affero General Public License, version 3,
-*    as published by the Free Software Foundation.
-*
-*    This program is distributed in the hope that it will be useful,
-*    but WITHOUT ANY WARRANTY; without even the implied warranty of
-*    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-*    GNU Affero General Public License for more details.
-*
-*    You should have received a copy of the GNU Affero General Public License
-*    along with this program.  If not, see <http://www.gnu.org/licenses/>.
-*
-*    As a special exception, the copyright holders give permission to link the
-*    code of portions of this program with the OpenSSL library under certain
-*    conditions as described in each individual source file and distribute
-*    linked combinations including the program with the OpenSSL library. You
-*    must comply with the GNU Affero General Public License in all respects for
-*    all of the code used other than as permitted herein. If you modify file(s)
-*    with this exception, you may extend this exception to your version of the
-*    file(s), but you are not obligated to do so. If you do not wish to do so,
-*    delete this exception statement from your version. If you delete this
-*    exception statement from all source files in the program, then also delete
-*    it in the license file.
-*/
+ *    Copyright (C) 2018-present MongoDB, Inc.
+ *
+ *    This program is free software: you can redistribute it and/or modify
+ *    it under the terms of the Server Side Public License, version 1,
+ *    as published by MongoDB, Inc.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    Server Side Public License for more details.
+ *
+ *    You should have received a copy of the Server Side Public License
+ *    along with this program. If not, see
+ *    <http://www.mongodb.com/licensing/server-side-public-license>.
+ *
+ *    As a special exception, the copyright holders give permission to link the
+ *    code of portions of this program with the OpenSSL library under certain
+ *    conditions as described in each individual source file and distribute
+ *    linked combinations including the program with the OpenSSL library. You
+ *    must comply with the Server Side Public License in all respects for
+ *    all of the code used other than as permitted herein. If you modify file(s)
+ *    with this exception, you may extend this exception to your version of the
+ *    file(s), but you are not obligated to do so. If you do not wish to do so,
+ *    delete this exception statement from your version. If you delete this
+ *    exception statement from all source files in the program, then also delete
+ *    it in the license file.
+ */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/base/init.h"
+#include "mongo/db/exec/working_set.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/matcher/expression_parser.h"
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/matcher/path.h"
-#include "mongo/db/exec/working_set.h"
-#include "mongo/util/mongoutils/str.h"
 #include "mongo/util/stacktrace.h"
+#include "mongo/util/str.h"
 
 namespace mongo {
 
-    Matcher::Matcher(const BSONObj& pattern, 
-                     const MatchExpressionParser::WhereCallback& whereCallback)
-        : _pattern(pattern) {
+Matcher::Matcher(const BSONObj& pattern,
+                 const boost::intrusive_ptr<ExpressionContext>& expCtx,
+                 const ExtensionsCallback& extensionsCallback,
+                 const MatchExpressionParser::AllowedFeatureSet allowedFeatures)
+    : _pattern(pattern) {
+    _expression = uassertStatusOK(
+        MatchExpressionParser::parse(pattern, expCtx, extensionsCallback, allowedFeatures));
+}
 
-        StatusWithMatchExpression result = MatchExpressionParser::parse(pattern, whereCallback);
-        uassert( 16810,
-                 mongoutils::str::stream() << "bad query: " << result.getStatus().toString(),
-                 result.isOK() );
+bool Matcher::matches(const BSONObj& doc, MatchDetails* details) const {
+    if (!_expression)
+        return true;
 
-        _expression.reset( result.getValue() );
-    }
-
-    bool Matcher::matches(const BSONObj& doc, MatchDetails* details ) const {
-        if ( !_expression )
-            return true;
-
-        return _expression->matchesBSON( doc, details );
-    }
+    return _expression->matchesBSON(doc, details);
+}
 
 }  // namespace mongo

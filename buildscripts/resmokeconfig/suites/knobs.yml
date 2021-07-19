@@ -1,0 +1,19 @@
+test_kind: js_test
+
+selector:
+  roots:
+  - jstests/knobs/knobs.js
+
+executor:
+  config:
+    shell_options:
+      readMode: commands
+  fixture:
+    class: MongoDFixture
+    mongod_options:
+      set_parameters:
+        enableTestCommands: 1
+        cursorTimeoutMillis: 9
+        internalQueryPlannerEnableIndexIntersection: false
+        ttlMonitorEnabled: false
+        ttlMonitorSleepSecs: 7
